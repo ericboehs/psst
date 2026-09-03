@@ -163,7 +163,11 @@ impl App {
             order: Vec::new(),
             sel: 0,
             filter: String::new(),
-            group: Group::Flat,
+            group: match config.group_default() {
+                "project" => Group::Project,
+                "flat" => Group::Flat,
+                _ => Group::Day,
+            },
             sort: Sort::Activity,
             status: String::new(),
             config,

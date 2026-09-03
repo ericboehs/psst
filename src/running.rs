@@ -5,14 +5,17 @@
 //! Instead we:
 //!   1. find pi-like processes via `ps`,
 //!   2. resolve each process's cwd via `lsof`,
-//!   3. find its tmux session/window by walking the parent chain to a tmux pane pid,
-//!   4. pin a session file: exact when the cmdline carries `--session`,
+//!   3. find its tmux session/window via the inherited `TMUX_PANE` env var
+//!      (exact), falling back to walking the parent chain to a tmux pane pid,
+//!   4. pin a session file: exact when the cmdline carries `--session`;
+//!      with `-c`/`--continue` the newest session in that cwd (even if idle);
 //!      otherwise the most recently written session in that cwd within the
-//!      active window (default 120s).
+//!      active window (default 120s). Parallel agents in one project claim
+//!      distinct files (newest-first).
 
 use crate::scan::SessionMeta;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,6 +32,8 @@ pub struct PiProc {
     pub cmd: String,
     /// `--session <arg>` from the cmdline, if present.
     pub session_arg: Option<String>,
+    /// `-c` / `--continue` on the cmdline: owns the newest session in cwd.
+    pub continue_flag: bool,
     /// tmux target resolved via parent chain.
     pub tmux: Option<TmuxTarget>,
 }
@@ -46,7 +51,7 @@ pub fn looks_like_pi(cmd: &str) -> bool {
     let arg0 = cmd.split_whitespace().next().unwrap_or("");
     let base = arg0.rsplit('/').next().unwrap_or(arg0);
     base == "pi"
-        || cmd.contains("pi-coding-agent")
+        || cmd.contains("pi-coding-agent/")
         || cmd.contains("/.bin/pi ")
         || cmd.ends_with("/.bin/pi")
         || cmd.contains("shims/pi ")
@@ -77,31 +82,36 @@ pub fn detect() -> Vec<PiProc> {
         table.insert(pid, (ppid, cmd.trim().to_string()));
     }
 
-    // tmux pane_pid -> (session, window_index)
+    // tmux panes: pane_pid (shell) -> target, pane_id ("%N") -> target
     let mut panes: HashMap<u32, TmuxTarget> = HashMap::new();
+    let mut panes_by_id: HashMap<String, TmuxTarget> = HashMap::new();
     if let Ok(o) = std::process::Command::new("tmux")
-        .args(["list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}"])
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_pid}\t#{pane_id}\t#{session_name}\t#{window_index}",
+        ])
         .output()
     {
         if o.status.success() {
             for line in String::from_utf8_lossy(&o.stdout).lines() {
                 let parts: Vec<&str> = line.split('\t').collect();
-                if parts.len() < 3 {
+                if parts.len() < 4 {
                     continue;
                 }
                 if let (Ok(ppid), Ok(win)) =
-                    (parts[0].trim().parse::<u32>(), parts[2].trim().parse::<u32>())
+                    (parts[0].trim().parse::<u32>(), parts[3].trim().parse::<u32>())
                 {
                     // #{pane_pid} is the pane's shell pid; pi spawned from that
                     // shell has ppid == pane_pid. (If the pane command exec'd
                     // pi directly, pane_pid == pi pid, handled below.)
-                    panes.insert(
-                        ppid,
-                        TmuxTarget {
-                            session: parts[1].to_string(),
-                            window: Some(win),
-                        },
-                    );
+                    let t = TmuxTarget {
+                        session: parts[2].to_string(),
+                        window: Some(win),
+                    };
+                    panes.insert(ppid, t.clone());
+                    panes_by_id.insert(parts[1].to_string(), t);
                 }
             }
         }
@@ -112,17 +122,21 @@ pub fn detect() -> Vec<PiProc> {
             continue;
         }
         let cwd = proc_cwd(*pid);
-        // Walk up a few levels (pi -> shell -> ...) looking for a tmux pane.
-        let mut tmux = None;
-        let mut cur = *ppid;
-        for _ in 0..5 {
-            if let Some(t) = panes.get(&cur) {
-                tmux = Some(t.clone());
-                break;
-            }
-            match table.get(&cur) {
-                Some((next_ppid, _)) if *next_ppid != 0 && *next_ppid != cur => cur = *next_ppid,
-                _ => break,
+        // Exact pane via TMUX_PANE inherited from the pane environment
+        // (survives shim/exec chains that defeat parent walking).
+        let mut tmux = proc_tmux_pane(*pid).and_then(|pane| panes_by_id.get(&pane).cloned());
+        // Fallback: walk up a few levels (pi -> shell -> ...) to a pane shell.
+        if tmux.is_none() {
+            let mut cur = *ppid;
+            for _ in 0..5 {
+                if let Some(t) = panes.get(&cur) {
+                    tmux = Some(t.clone());
+                    break;
+                }
+                match table.get(&cur) {
+                    Some((next_ppid, _)) if *next_ppid != 0 && *next_ppid != cur => cur = *next_ppid,
+                    _ => break,
+                }
             }
         }
         // Also match the process's own pid directly (pi exec'd as pane command).
@@ -137,16 +151,35 @@ pub fn detect() -> Vec<PiProc> {
             .zip(cmd.split_whitespace().skip(2))
             .find(|(flag, _)| *flag == "--session")
             .map(|(_, val)| val.to_string());
+        let continue_flag = cmd
+            .split_whitespace()
+            .skip(1)
+            .any(|t| t == "-c" || t == "--continue");
         procs.push(PiProc {
             pid: *pid,
             ppid: *ppid,
             cwd,
             cmd: cmd.clone(),
             session_arg,
+            continue_flag,
             tmux,
         });
     }
     procs
+}
+
+/// Read TMUX_PANE from a process environment (macOS/Linux `ps eww`).
+fn proc_tmux_pane(pid: u32) -> Option<String> {
+    let o = std::process::Command::new("ps")
+        .args(["eww", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&o.stdout)
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix("TMUX_PANE=").map(|v| v.to_string()))
 }
 
 fn proc_cwd(pid: u32) -> Option<PathBuf> {
@@ -178,6 +211,7 @@ pub fn map_running(
         return hits;
     }
     let now = chrono::Utc::now().timestamp();
+    let mut claimed: HashSet<PathBuf> = HashSet::new();
 
     // sessions by cwd for the cwd+recency heuristic
     let mut by_cwd: HashMap<&str, Vec<&SessionMeta>> = HashMap::new();
@@ -205,31 +239,67 @@ pub fn map_running(
                 by_id.get(arg.as_str()).copied()
             };
             if let Some(s) = found {
-                hits.entry(s.path.clone()).or_insert_with(|| RunningHit {
-                    pid: p.pid,
-                    tmux: p.tmux.clone(),
-                    direct: true,
-                });
+                if !claimed.contains(&s.path) {
+                    claimed.insert(s.path.clone());
+                    hits.insert(
+                        s.path.clone(),
+                        RunningHit {
+                            pid: p.pid,
+                            tmux: p.tmux.clone(),
+                            direct: true,
+                        },
+                    );
+                }
                 continue;
             }
         }
-        // 2. cwd + recent mtime
+        // 2. cwd-based pinning. `-c`/`--continue` owns the newest session in
+        //    that cwd regardless of age (an idle pi at a prompt still owns it);
+        //    otherwise require a recent write. Claimed files are skipped so
+        //    parallel agents in one project map to distinct sessions.
         if let Some(cwd) = &p.cwd {
             let cwd_str = cwd.to_string_lossy();
             if let Some(candidates) = by_cwd.get(cwd_str.as_ref()) {
-                if let Some(s) = candidates.first() {
-                    if now - s.mtime <= active_secs {
-                        hits
-                            .entry(s.path.clone())
-                            .or_insert_with(|| RunningHit {
+                let pick = if p.continue_flag {
+                    candidates.first().copied()
+                } else {
+                    candidates
+                        .iter()
+                        .find(|s| now - s.mtime <= active_secs)
+                        .copied()
+                };
+                if let Some(s) = pick {
+                    if !claimed.contains(&s.path) {
+                        claimed.insert(s.path.clone());
+                        hits.insert(
+                            s.path.clone(),
+                            RunningHit {
                                 pid: p.pid,
                                 tmux: p.tmux.clone(),
                                 direct: false,
-                            });
+                            },
+                        );
                     }
                 }
             }
         }
     }
     hits
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pi_process_detection() {
+        assert!(looks_like_pi("/Users/ericboehs/.local/share/mise/shims/pi"));
+        assert!(looks_like_pi("pi --session /tmp/x.jsonl"));
+        assert!(looks_like_pi(
+            "node /Users/x/.local/share/mise/installs/npm-earendil-works-pi-coding-agent/0.84.4/node_modules/.bin/pi"
+        ));
+        assert!(looks_like_pi("node /x/node_modules/.bin/pi"));
+        assert!(!looks_like_pi("vim src/main.rs"));
+        assert!(!looks_like_pi("rg -r pi something"));
+        assert!(!looks_like_pi("grep pi-coding-agent README.md"));
+    }
 }

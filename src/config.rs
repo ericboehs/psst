@@ -9,6 +9,10 @@
 //! # a session counts as "running" if a pi process shares its cwd and the
 //! # file was written within this many seconds
 //! active_secs = 120
+//!
+//! [ui]
+//! # grouping on launch: "day" (default), "project", or "flat"
+//! group = "day"
 //! ```
 
 use serde::Deserialize;
@@ -20,6 +24,8 @@ struct FileConfig {
     resume: Option<ResumeCfg>,
     #[serde(default)]
     detection: Option<DetectCfg>,
+    #[serde(default)]
+    ui: Option<UiCfg>,
 }
 
 #[derive(Deserialize)]
@@ -34,9 +40,16 @@ struct DetectCfg {
     active_secs: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct UiCfg {
+    #[serde(default)]
+    group: Option<String>,
+}
+
 pub struct Config {
     resume_command: String,
     active_secs: i64,
+    group: String,
 }
 
 impl Default for Config {
@@ -44,6 +57,7 @@ impl Default for Config {
         Config {
             resume_command: "pi --session {file}".to_string(),
             active_secs: 120,
+            group: "day".to_string(),
         }
     }
 }
@@ -71,6 +85,11 @@ impl Config {
                 cfg.active_secs = secs as i64;
             }
         }
+        if let Some(ui) = fc.ui {
+            if let Some(g) = ui.group {
+                cfg.group = g;
+            }
+        }
         cfg
     }
 
@@ -80,5 +99,10 @@ impl Config {
 
     pub fn active_secs(&self) -> i64 {
         self.active_secs
+    }
+
+    /// Launch grouping: "day" (default), "project", or "flat".
+    pub fn group_default(&self) -> &str {
+        &self.group
     }
 }

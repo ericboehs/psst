@@ -65,13 +65,16 @@ rows keep the active sort's order.
   and branch points (entries with >1 children). Respects `PI_CODING_AGENT_DIR`.
 - **Running detection** (zero-config, per design): pi appends via
   `open/write/close`, so `lsof` only catches files mid-write. Instead psst
-  matches pi-like processes (via `ps`), resolves their cwd (`lsof`), finds
-  their tmux pane by walking the parent chain to a `pane_pid`, and pins the
-  newest session file written in that cwd within the active window
-  (default 120s). A `--session` on the cmdline pins exactly.
-- **Open**: running sessions switch/attach to their tmux target; idle sessions
-  spawn a new tmux window (or detached session when outside tmux) running the
-  resume command in the session's project cwd.
+  matches pi-like processes (via `ps`), resolves their tmux pane from the
+  inherited `TMUX_PANE` env var (falling back to a parent-chain walk to
+  `pane_pid`), and pins a session file: exactly when the cmdline carries
+  `--session`; the newest session in the process cwd when it carries
+  `-c`/`--continue` (even if idle); otherwise the newest file written in that
+  cwd within the active window (default 120s). Parallel agents in one project
+  claim distinct files (newest-first), so each maps to its own tmux window.
+- **Open**: running sessions switch/attach to their tmux target (window, not
+  just session); idle sessions spawn a new tmux window (or detached session
+  when outside tmux) running the resume command in the session's project cwd.
 - **Cache**: parsed metadata is cached at `~/.cache/psst/cache.json`, keyed by
   path+mtime+size, so rescans only reparse changed files.
 
@@ -84,6 +87,10 @@ command = 'pi --session {file}'
 
 [detection]
 active_secs = 120
+
+[ui]
+# grouping on launch: "day" (default), "project", or "flat"
+group = "day"
 ```
 
 If you launch pi through mise or a wrapper, point `command` at it, e.g.
