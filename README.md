@@ -9,6 +9,7 @@ archive *and* showing which agents are running right now.
 ● tmux-agent-restore-work   tmux-agent…  claude-son…  $0.842   312m  [agents:3]
 ○ psst                      psst         -            $0       2s
 ⎇ wiki-session-sync         dotfiles     gpt-5        $0.104   14d
+▾ Today  12 sessions · $3.42 · last 2s
 ▾ ~/Code/github.com/ericboehs/dotfiles  47 sessions · $12.31 · last 2s
 ```
 
@@ -43,13 +44,17 @@ psst --debug-running  # print detected pi processes + tmux targets
 | type | filter (all terms must match across title/prompt/project/model) |
 | `↑`/`↓` or `k`/`j`, PgUp/PgDn | navigate |
 | `Enter` | **open**: attach to the running tmux session, or spawn `pi --session <file>` in a new tmux window |
-| `Tab` | toggle flat ↔ grouped-by-project |
+| `Tab` | cycle grouping: flat → project → day (newest day first; "Today"/"Yesterday"/date headers) |
 | `Ctrl+S` | cycle sort: activity → tmux → cost |
 | `r` / `R` | rescan (cache-aware) / full rescan |
 | `Esc` | clear filter (quit if empty) |
 | `q` | quit |
 
 The list auto-refreshes every 10s.
+
+Group headers (project and day modes) show session count, total cost, and the
+newest activity in the group. Day buckets use local dates; within a group,
+rows keep the active sort's order.
 
 ## How it works
 

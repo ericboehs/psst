@@ -39,6 +39,30 @@ impl Sort {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Group {
+    Flat,
+    Project,
+    Day,
+}
+
+impl Group {
+    fn label(self) -> &'static str {
+        match self {
+            Group::Flat => "flat",
+            Group::Project => "project",
+            Group::Day => "day",
+        }
+    }
+    fn next(self) -> Group {
+        match self {
+            Group::Flat => Group::Project,
+            Group::Project => Group::Day,
+            Group::Day => Group::Flat,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum OpenAction {
     /// Switch/attach to an existing tmux session (`session[:window]`).
@@ -59,7 +83,7 @@ pub struct App {
     pub order: Vec<usize>,
     pub sel: usize,
     pub filter: String,
-    pub grouped: bool,
+    pub group: Group,
     pub sort: Sort,
     pub config: Config,
     pub status: String,
@@ -139,7 +163,7 @@ impl App {
             order: Vec::new(),
             sel: 0,
             filter: String::new(),
-            grouped: false,
+            group: Group::Flat,
             sort: Sort::Activity,
             status: String::new(),
             config,
@@ -339,63 +363,90 @@ impl App {
         let w = w.max(80);
         let mut items = Vec::new();
 
-        if !self.grouped {
-            for &i in &self.order {
-                items.push(Item {
-                    session: Some(i),
-                    line: self.row_line(i, w),
-                });
+        match self.group {
+            Group::Flat => {
+                for &i in &self.order {
+                    items.push(Item {
+                        session: Some(i),
+                        line: self.row_line(i, w),
+                    });
+                }
             }
-            return items;
-        }
-
-        // group by cwd; groups ordered by most recent activity
-        let mut group_of: HashMap<String, Vec<usize>> = HashMap::new();
-        for &i in &self.order {
-            group_of
-                .entry(self.sessions[i].cwd.clone())
-                .or_default()
-                .push(i);
-        }
-        let mut groups: Vec<(String, Vec<usize>)> = group_of.into_iter().collect();
-        groups.sort_by_key(|(_, v)| {
-            std::cmp::Reverse(
-                v.iter()
-                    .filter_map(|&i| self.sessions[i].last_activity)
-                    .max()
-                    .unwrap_or(0),
-            )
-        });
-
-        for (cwd, members) in groups {
-            let cost: f64 = members.iter().map(|&i| self.sessions[i].cost_total).sum();
-            let newest = members
-                .iter()
-                .filter_map(|&i| self.sessions[i].last_activity)
-                .max()
-                .unwrap_or(0);
-            let header = format!(
-                "▾ {}  {} sessions · {} · last {}",
-                trunc(&cwd, (w / 2).max(30)),
-                members.len(),
-                fmt_cost(cost),
-                fmt_age(now() - newest)
-            );
-            items.push(Item {
-                session: None,
-                line: Line::from(Span::styled(
-                    header,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )),
-            });
-            for i in members {
-                items.push(Item {
-                    session: Some(i),
-                    line: self.row_line(i, w),
+            Group::Project => {
+                // bucket by cwd; groups ordered by most recent activity.
+                // Members keep `order` sequence (i.e. the active sort).
+                let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
+                for &i in &self.order {
+                    buckets
+                        .entry(self.sessions[i].cwd.clone())
+                        .or_default()
+                        .push(i);
+                }
+                let mut groups: Vec<(String, Vec<usize>)> = buckets.into_iter().collect();
+                groups.sort_by_key(|(_, v)| {
+                    std::cmp::Reverse(
+                        v.iter()
+                            .filter_map(|&i| self.sessions[i].last_activity)
+                            .max()
+                            .unwrap_or(0),
+                    )
                 });
+                for (label, members) in groups {
+                    self.push_group(&mut items, label, members, w);
+                }
+            }
+            Group::Day => {
+                // bucket by local date of last activity; newest day first
+                let today = chrono::Local::now().date_naive();
+                let mut buckets: HashMap<chrono::NaiveDate, Vec<usize>> = HashMap::new();
+                for &i in &self.order {
+                    let ts = self.sessions[i].last_activity.unwrap_or(0);
+                    let date = chrono::DateTime::from_timestamp(ts, 0)
+                        .unwrap_or_default()
+                        .with_timezone(&chrono::Local)
+                        .date_naive();
+                    buckets.entry(date).or_default().push(i);
+                }
+                let mut dates: Vec<chrono::NaiveDate> = buckets.keys().copied().collect();
+                dates.sort_by(|a, b| b.cmp(a));
+                for date in dates {
+                    let members = buckets.remove(&date).unwrap_or_default();
+                    let label = day_label(date, today);
+                    self.push_group(&mut items, label, members, w);
+                }
             }
         }
         items
+    }
+
+    /// Header row + member rows for one group.
+    fn push_group(&self, items: &mut Vec<Item>, label: String, members: Vec<usize>, w: usize) {
+        let cost: f64 = members.iter().map(|&i| self.sessions[i].cost_total).sum();
+        let newest = members
+            .iter()
+            .filter_map(|&i| self.sessions[i].last_activity)
+            .max()
+            .unwrap_or(0);
+        let header = format!(
+            "▾ {}  {} sessions · {} · last {}",
+            trunc(&label, (w / 2).max(30)),
+            members.len(),
+            fmt_cost(cost),
+            fmt_age(now() - newest)
+        );
+        items.push(Item {
+            session: None,
+            line: Line::from(Span::styled(
+                header,
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )),
+        });
+        for i in members {
+            items.push(Item {
+                session: Some(i),
+                line: self.row_line(i, w),
+            });
+        }
     }
 }
 
@@ -497,7 +548,7 @@ fn ui(f: &mut Frame, app: &App, items: &[Item], list_state: &mut ListState) {
             app.running.len(),
             fmt_cost(total_cost),
             app.sort.label(),
-            if app.grouped { "project" } else { "flat" }
+            app.group.label()
         )),
     ];
     f.render_widget(Paragraph::new(Line::from(header_spans)), header);
@@ -596,7 +647,7 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                     (KeyCode::PageUp, _) => app.move_sel(-10),
                     (KeyCode::Home, _) => app.sel = 0,
                     (KeyCode::End, _) => app.sel = app.order.len().saturating_sub(1),
-                    (KeyCode::Tab, _) => app.grouped = !app.grouped,
+                    (KeyCode::Tab, _) => app.group = app.group.next(),
                     (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                         app.sort = app.sort.next();
                         app.apply_filter_sort();
@@ -648,4 +699,38 @@ fn sync_selection(items: &[Item], app: &App, state: &mut ListState) {
         }
     }
     state.select(Some(found));
+}
+
+/// Human label for a day bucket, relative to `today`.
+fn day_label(date: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
+    if date == today {
+        "Today".to_string()
+    } else if date == today - chrono::Duration::days(1) {
+        "Yesterday".to_string()
+    } else {
+        date.format("%a %b %-d %Y").to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn day_labels() {
+        let today = chrono::NaiveDate::from_ymd_opt(2025, 6, 2).unwrap();
+        assert_eq!(day_label(today, today), "Today");
+        assert_eq!(
+            day_label(today - chrono::Duration::days(1), today),
+            "Yesterday"
+        );
+        assert_eq!(
+            day_label(today - chrono::Duration::days(2), today),
+            "Sat May 31 2025"
+        );
+        assert_eq!(
+            day_label(chrono::NaiveDate::from_ymd_opt(2025, 1, 5).unwrap(), today),
+            "Sun Jan 5 2025"
+        );
+    }
 }
