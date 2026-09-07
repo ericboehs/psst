@@ -61,17 +61,12 @@ fn print_list(sessions: &[SessionMeta], hits: &std::collections::HashMap<PathBuf
         let title = hit
             .and_then(|h| h.peer_name.clone())
             .unwrap_or_else(|| s.title());
-        let summary = hit
-            .and_then(|h| h.summary.as_deref())
-            .map(|sum| format!("  {}", crate::list_helpers::trunc(sum, 50)))
-            .unwrap_or_default();
         println!(
-            "{} {:<50} {:<28} {:>5}{}",
+            "{} {:<50} {:<28} {:>5}",
             run,
             crate::list_helpers::trunc(&title, 48),
             crate::list_helpers::trunc(&project_base(&s.cwd), 26),
             crate::list_helpers::fmt_age(age),
-            summary,
         );
     }
 }

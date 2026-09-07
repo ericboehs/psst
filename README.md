@@ -15,9 +15,6 @@ archive *and* showing which agents are running right now.
 
 - `●` green dot = a live pi process is attached (cwd match + recent write;
   exact when the process cmdline carries `--session`)
-- running rows show a second green line with the agent's live activity summary
-  (published by pi-agent-link to `~/.cache/agent-link/summaries/`; filterable,
-  also shown as `activity:` in the detail pane and appended in `--list`)
 - `[agents:3]` = the tmux session/window the running agent lives in
 - `⎇` = session was forked from a parent (`/fork`, `/clone`)
 
@@ -57,7 +54,7 @@ psst --debug-running  # print detected pi processes + tmux targets
 | `↑`/`↓` or `k`/`j`, PgUp/PgDn | navigate (j/k only when search is not focused) |
 | `Enter` | **open**: attach to the running tmux session, or spawn `pi --session <file>` in a new tmux window |
 | `d` | toggle the bottom detail pane (off by default) |
-| `p` | hide/show prompt text in list titles and the last-message line |
+| `p` | hide/show prompt text in list titles |
 | `r` / `R` | rescan (cache-aware) / full rescan |
 | `Esc` | clear filter (quit if empty) |
 | `q` | quit |

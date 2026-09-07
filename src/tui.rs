@@ -122,8 +122,6 @@ pub struct App {
 }
 
 /// One rendered row: a session (index into `sessions`) or a group header.
-/// A running session with a live summary renders as two lines (Claude
-/// agent-view style: title row + indented activity line).
 struct Item {
     session: Option<usize>,
     lines: Vec<Line<'static>>,
@@ -262,15 +260,13 @@ impl App {
                 if f.is_empty() {
                     return true;
                 }
-                let summary = hit.and_then(|h| h.summary.as_deref()).unwrap_or("");
                 let peer = hit.and_then(|h| h.peer_name.as_deref()).unwrap_or("");
                 let hay = format!(
-                    "{} {} {} {} {} {} {}",
+                    "{} {} {} {} {} {}",
                     display_title(s, hit, self.show_prompts),
                     s.first_prompt.as_deref().unwrap_or(""),
                     s.cwd,
                     s.model.as_deref().unwrap_or(""),
-                    summary,
                     peer,
                     if hit.is_some() { "active running" } else { "" }
                 )
@@ -416,21 +412,8 @@ impl App {
         ])
     }
 
-    /// Lines for one session row: the title row, plus an indented live
-    /// activity line when the session is running and the registry has a summary.
     fn member_lines(&self, i: usize, w: usize) -> Vec<Line<'static>> {
-        let mut lines = vec![self.row_line(i, w)];
-        if self.show_prompts {
-            if let Some(hit) = self.running.get(&self.sessions[i].path) {
-                if let Some(sum) = &hit.summary {
-                    lines.push(Line::from(Span::styled(
-                        format!("    {}", trunc(sum, w.saturating_sub(6))),
-                        Style::default().fg(Color::Green),
-                    )));
-                }
-            }
-        }
-        lines
+        vec![self.row_line(i, w)]
     }
 
     fn build_items(&self, w: usize) -> Vec<Item> {
@@ -608,9 +591,6 @@ fn detail_text(s: &SessionMeta, hit: Option<&RunningHit>, cfg: &Config) -> Strin
                 if h.direct { "exact" } else { "heuristic" },
                 status
             ));
-            if let Some(sum) = &h.summary {
-                v.push(format!("activity: {}", sum));
-            }
         }
         None => v.push("state:    ○ idle".to_string()),
     }
