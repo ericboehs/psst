@@ -50,13 +50,14 @@ psst --debug-running  # print detected pi processes + tmux targets
 | Key | Action |
 |-----|--------|
 | `/` | focus search (then type anything, including `j`/`k`; Esc unfocuses). Running sessions also match `active`. |
+| `f` | cycle list filter: all → named → tmux |
+| `g` or `Tab` | cycle grouping: flat → project → day |
+| `s` or `Ctrl+S` | cycle sort: activity → tmux |
 | `a` | toggle active-only (sessions with a live pi process) |
 | `↑`/`↓` or `k`/`j`, PgUp/PgDn | navigate (j/k only when search is not focused) |
 | `Enter` | **open**: attach to the running tmux session, or spawn `pi --session <file>` in a new tmux window |
-| `Tab` | cycle grouping: flat → project → day (newest day first; "Today"/"Yesterday"/date headers) |
-| `Ctrl+S` | cycle sort: activity → tmux |
-| `Ctrl+D` | toggle the bottom detail pane (off by default) |
-| `Ctrl+P` | hide/show prompt text in list titles and the last-message line |
+| `d` | toggle the bottom detail pane (off by default) |
+| `p` | hide/show prompt text in list titles and the last-message line |
 | `r` / `R` | rescan (cache-aware) / full rescan |
 | `Esc` | clear filter (quit if empty) |
 | `q` | quit |

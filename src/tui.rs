@@ -61,6 +61,30 @@ impl Group {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ViewFilter {
+    All,
+    Named,
+    Tmux,
+}
+
+impl ViewFilter {
+    fn label(self) -> &'static str {
+        match self {
+            ViewFilter::All => "all",
+            ViewFilter::Named => "named",
+            ViewFilter::Tmux => "tmux",
+        }
+    }
+    fn next(self) -> ViewFilter {
+        match self {
+            ViewFilter::All => ViewFilter::Named,
+            ViewFilter::Named => ViewFilter::Tmux,
+            ViewFilter::Tmux => ViewFilter::All,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum OpenAction {
     /// Switch/attach to an existing tmux session (`session[:window]`).
@@ -93,6 +117,8 @@ pub struct App {
     pub search_focus: bool,
     /// When true, only sessions with a live pi process are listed.
     pub active_only: bool,
+    /// f cycles all → named → tmux.
+    pub view_filter: ViewFilter,
 }
 
 /// One rendered row: a session (index into `sessions`) or a group header.
@@ -181,6 +207,7 @@ impl App {
             show_prompts: false,
             search_focus: false,
             active_only: false,
+            view_filter: ViewFilter::All,
             config,
         };
         app.refresh(false);
@@ -216,6 +243,21 @@ impl App {
                 let hit = self.running.get(&s.path);
                 if self.active_only && hit.is_none() {
                     return false;
+                }
+                match self.view_filter {
+                    ViewFilter::All => {}
+                    ViewFilter::Named => {
+                        let named = s.name.is_some()
+                            || hit.and_then(|h| h.peer_name.as_deref()).is_some();
+                        if !named {
+                            return false;
+                        }
+                    }
+                    ViewFilter::Tmux => {
+                        if hit.and_then(|h| h.tmux.as_ref()).is_none() {
+                            return false;
+                        }
+                    }
                 }
                 if f.is_empty() {
                     return true;
@@ -603,11 +645,12 @@ fn ui(f: &mut Frame, app: &App, items: &[Item], list_state: &mut ListState) {
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            " {} sessions · {} running · sort:{} group:{}{}",
+            " {} sessions · {} running · sort:{} group:{} filter:{}{}",
             app.sessions.len(),
             app.running.len(),
             app.sort.label(),
             app.group.label(),
+            app.view_filter.label(),
             if app.active_only { " · active" } else { "" }
         )),
     ];
@@ -649,7 +692,7 @@ fn ui(f: &mut Frame, app: &App, items: &[Item], list_state: &mut ListState) {
         } else {
             Block::new()
         })
-        .highlight_style(Style::default().bg(Color::DarkGray))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
 
     if app.detail {
@@ -676,7 +719,7 @@ fn ui(f: &mut Frame, app: &App, items: &[Item], list_state: &mut ListState) {
     }
 
     let mut footer_spans = vec![Span::styled(
-        " /=search  a=active  j/k  tab=group ^S=sort ^D=detail ^P=prompts enter=open r=rescan esc=clear q=quit",
+        " /=search  f=filter g=group s=sort a=active d=detail p=prompts  j/k  enter=open r=rescan esc q",
         Style::default().fg(Color::DarkGray),
     )];
     if !app.status.is_empty() {
@@ -779,6 +822,31 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                             "active only".into()
                         } else {
                             "showing all".into()
+                        };
+                    }
+                    (KeyCode::Char('f'), _) => {
+                        app.view_filter = app.view_filter.next();
+                        app.apply_filter_sort();
+                        app.status = format!("filter:{}", app.view_filter.label());
+                    }
+                    (KeyCode::Char('g'), _) => {
+                        app.group = app.group.next();
+                        app.status = format!("group:{}", app.group.label());
+                    }
+                    (KeyCode::Char('s'), _) => {
+                        app.sort = app.sort.next();
+                        app.apply_filter_sort();
+                        app.status = format!("sort:{}", app.sort.label());
+                    }
+                    (KeyCode::Char('d'), _) => {
+                        app.detail = !app.detail;
+                    }
+                    (KeyCode::Char('p'), _) => {
+                        app.show_prompts = !app.show_prompts;
+                        app.status = if app.show_prompts {
+                            "prompts shown".into()
+                        } else {
+                            "prompts hidden".into()
                         };
                     }
                     (KeyCode::Char('j'), _) => app.move_sel(1),
