@@ -30,6 +30,9 @@ pub struct SessionMeta {
     pub name: Option<String>,
     /// Text of the first user message.
     pub first_prompt: Option<String>,
+    /// Text of the latest user message (not a slash command).
+    #[serde(default)]
+    pub last_prompt: Option<String>,
     /// Latest model seen (assistant message or `model_change`).
     pub model: Option<String>,
     /// Sum of `usage.cost.total` across assistant messages and toolResult nested usage.
@@ -161,6 +164,7 @@ pub fn parse_file(path: &Path) -> Result<SessionMeta> {
         last_user: None,
         name: None,
         first_prompt: None,
+        last_prompt: None,
         model: None,
         cost_total: 0.0,
         tokens_in: 0,
@@ -213,13 +217,20 @@ pub fn parse_file(path: &Path) -> Result<SessionMeta> {
                 let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
                 match role {
                     "user" => {
+                        let text =
+                            content_text(msg.get("content").unwrap_or(&serde_json::Value::Null));
                         if meta.first_prompt.is_none() {
-                            meta.first_prompt =
-                                content_text(msg.get("content").unwrap_or(&serde_json::Value::Null));
+                            meta.first_prompt = text.clone();
                         }
                         if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()).and_then(parse_epoch) {
-                            if meta.last_user.is_none() || ts > meta.last_user.unwrap_or(0) {
+                            if meta.last_user.is_none() || ts >= meta.last_user.unwrap_or(0) {
                                 meta.last_user = Some(ts);
+                                if let Some(t) = text.as_deref() {
+                                    let t = t.trim();
+                                    if !t.is_empty() && !t.starts_with('/') {
+                                        meta.last_prompt = Some(t.to_string());
+                                    }
+                                }
                             }
                         }
                     }
@@ -320,7 +331,11 @@ pub fn scan(root: &Path, force: bool) -> anyhow::Result<Vec<SessionMeta>> {
                 if entry.mtime == mtime && entry.size == size {
                     // Reparse once after last_user was added so activity sort
                     // isn't stuck on None until the file next changes.
-                    if entry.meta.last_user.is_some() || entry.meta.messages == 0 {
+                    let missing_last = entry.meta.last_prompt.is_none()
+                        && entry.meta.first_prompt.is_some();
+                    if (entry.meta.last_user.is_some() || entry.meta.messages == 0)
+                        && !missing_last
+                    {
                         out.push(entry.meta.clone());
                         continue;
                     }
@@ -347,4 +362,50 @@ pub fn scan(root: &Path, force: bool) -> anyhow::Result<Vec<SessionMeta>> {
         save_cache(&cache);
     }
     Ok(out)
+}
+
+fn canon(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Directory `psst .` (or `psst <dir>`) should list: git root if any, else the dir.
+pub fn resolve_scope(dir: &Path) -> PathBuf {
+    let start = if dir == Path::new(".") {
+        std::env::current_dir().unwrap_or_else(|_| dir.to_path_buf())
+    } else {
+        dir.to_path_buf()
+    };
+    let mut p = canon(&start);
+    let orig = p.clone();
+    loop {
+        if p.join(".git").exists() {
+            return p;
+        }
+        if !p.pop() {
+            return orig;
+        }
+    }
+}
+
+/// True when the session belongs to `scope` (exact cwd or a subdirectory of it).
+pub fn in_scope(session_cwd: &str, scope: &Path) -> bool {
+    let s = canon(Path::new(session_cwd));
+    let scope = canon(scope);
+    s == scope || s.starts_with(&scope)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_scope_matches_exact_and_children() {
+        let tmp = std::env::temp_dir().join(format!("psst-scope-{}", std::process::id()));
+        let child = tmp.join("src");
+        std::fs::create_dir_all(&child).unwrap();
+        assert!(in_scope(&tmp.to_string_lossy(), &tmp));
+        assert!(in_scope(&child.to_string_lossy(), &tmp));
+        assert!(!in_scope("/tmp/other-project", &tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

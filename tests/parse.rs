@@ -37,6 +37,7 @@ fn parses_header_name_model_cost_and_branches() {
         meta.first_prompt.as_deref(),
         Some("Hello, can you help me refactor the auth module?")
     );
+    assert_eq!(meta.last_prompt.as_deref(), Some("actually approach B"));
     // model_change is the latest model
     assert_eq!(meta.model.as_deref(), Some("gpt-4o"));
     assert!((meta.cost_total - 0.003).abs() < 1e-9);

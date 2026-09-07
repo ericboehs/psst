@@ -23,6 +23,9 @@ use std::path::PathBuf;
 pub struct TmuxTarget {
     pub session: String,
     pub window: Option<u32>,
+    /// Window still has `@special_activity` (tmux-attention); cleared on focus.
+    #[serde(default)]
+    pub attention: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,6 +57,65 @@ pub struct RunningHit {
     pub status: Option<String>,
     /// Live peer name from the cache (`pi-dotfiles-2`), assigned by pi-agent-link.
     pub peer_name: Option<String>,
+}
+
+/// Row glyph: ○ idle, ◎ waiting (looked at), ● waiting unread / working.
+///
+/// JetBrains Mono Nerd Font has no ◐ (U+25D0); the terminal would fall back
+/// to another font and the column would not line up. ●/◎/○ all exist in JBM
+/// with the same advance and bounding box. Unread uses the same solid disc as
+/// working (tmux `@special_activity` until the pane is focused).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveMark {
+    Idle,
+    Waiting,
+    Unread,
+    Prompt,
+    Working,
+}
+
+impl LiveMark {
+    pub fn glyph(self) -> &'static str {
+        match self {
+            LiveMark::Idle => "○",
+            LiveMark::Waiting => "◎",
+            LiveMark::Unread | LiveMark::Prompt | LiveMark::Working => "●",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LiveMark::Idle => "idle",
+            LiveMark::Waiting => "waiting",
+            LiveMark::Unread => "unread",
+            LiveMark::Prompt => "prompt",
+            LiveMark::Working => "working",
+        }
+    }
+}
+
+fn is_prompt_status(st: &str) -> bool {
+    matches!(st, "tool:ask" | "tool:confirm" | "tool:input")
+}
+
+/// Running + ask/confirm/input → prompt; thinking/other tools → working;
+/// tmux `@special_activity` → unread; otherwise waiting on you.
+pub fn live_mark(hit: Option<&RunningHit>) -> LiveMark {
+    match hit {
+        None => LiveMark::Idle,
+        Some(h) => {
+            let st = h.status.as_deref().unwrap_or("");
+            if is_prompt_status(st) {
+                LiveMark::Prompt
+            } else if st == "thinking" || st.starts_with("tool") {
+                LiveMark::Working
+            } else if h.tmux.as_ref().is_some_and(|t| t.attention) {
+                LiveMark::Unread
+            } else {
+                LiveMark::Waiting
+            }
+        }
+    }
 }
 
 /// Parse `ps -o etime=` (`[[dd-]hh:]mm:ss`) into elapsed seconds.
@@ -123,7 +185,7 @@ pub fn detect() -> Vec<PiProc> {
             "list-panes",
             "-a",
             "-F",
-            "#{pane_pid}\t#{pane_id}\t#{session_name}\t#{window_index}",
+            "#{pane_pid}\t#{pane_id}\t#{session_name}\t#{window_index}\t#{@special_activity}",
         ])
         .output()
     {
@@ -139,9 +201,11 @@ pub fn detect() -> Vec<PiProc> {
                     // #{pane_pid} is the pane's shell pid; pi spawned from that
                     // shell has ppid == pane_pid. (If the pane command exec'd
                     // pi directly, pane_pid == pi pid, handled below.)
+                    let attention = parts.get(4).map(|s| s.trim() == "on").unwrap_or(false);
                     let t = TmuxTarget {
                         session: parts[2].to_string(),
                         window: Some(win),
+                        attention,
                     };
                     panes.insert(ppid, t.clone());
                     panes_by_id.insert(parts[1].to_string(), t);
@@ -621,6 +685,40 @@ mod tests {
         assert_eq!(first_free_name("pi-dotfiles", &taken), "pi-dotfiles-2");
         taken.insert("pi-dotfiles-2".into());
         assert_eq!(first_free_name("pi-dotfiles", &taken), "pi-dotfiles-3");
+    }
+
+    #[test]
+    fn live_mark_from_status() {
+        assert_eq!(live_mark(None), LiveMark::Idle);
+        let idle = RunningHit {
+            pid: 1,
+            tmux: None,
+            direct: true,
+            summary: None,
+            status: Some("idle".into()),
+            peer_name: None,
+        };
+        assert_eq!(live_mark(Some(&idle)), LiveMark::Waiting);
+        let mut thinking = idle.clone();
+        thinking.status = Some("thinking".into());
+        assert_eq!(live_mark(Some(&thinking)), LiveMark::Working);
+        thinking.status = Some("tool:bash".into());
+        assert_eq!(live_mark(Some(&thinking)), LiveMark::Working);
+        thinking.status = None;
+        assert_eq!(live_mark(Some(&thinking)), LiveMark::Waiting);
+        thinking.tmux = Some(TmuxTarget {
+            session: "agents".into(),
+            window: Some(3),
+            attention: true,
+        });
+        assert_eq!(live_mark(Some(&thinking)), LiveMark::Unread);
+        thinking.status = Some("thinking".into());
+        assert_eq!(live_mark(Some(&thinking)), LiveMark::Working);
+        thinking.status = Some("tool:ask".into());
+        assert_eq!(live_mark(Some(&thinking)), LiveMark::Prompt);
+        thinking.tmux = None;
+        thinking.status = Some("tool:confirm".into());
+        assert_eq!(live_mark(Some(&thinking)), LiveMark::Prompt);
     }
 
     #[test]

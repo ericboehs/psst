@@ -8,67 +8,126 @@
 //!     in a new tmux window
 
 use psst::config;
-use psst::running::{self, detect, map_running};
-use psst::scan::{scan, sessions_root, SessionMeta};
+use psst::running::{self, detect, live_mark, map_running};
+use psst::scan::{in_scope, resolve_scope, scan, sessions_root, SessionMeta};
 use psst::tui;
 
 use anyhow::{bail, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 struct Args {
     list: bool,
+    json: bool,
     refresh: bool,
     debug_running: bool,
+    scope: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
     let mut args = Args {
         list: false,
+        json: false,
         refresh: false,
         debug_running: false,
+        scope: None,
     };
-    let it = std::env::args().skip(1);
-        for a in it {
+    for a in std::env::args().skip(1) {
         match a.as_str() {
             "--list" => args.list = true,
+            "--json" => args.json = true,
             "--refresh" => args.refresh = true,
             "--debug-running" => args.debug_running = true,
             "-h" | "--help" => {
                 println!(
                     "psst — pi session tui\n\n\
-                     usage: psst [--list] [--refresh] [--debug-running]\n\n\
-                     no flags opens the TUI. keys: /=search f=filter g=group s=sort d=detail p=prompts j/k enter=open q=quit\n\
+                     usage: psst [.] [--list] [--json] [--refresh] [--debug-running]\n\n\
+                     .                 only this project (git root, else cwd)\n\
+                     --list            plain table\n\
+                     --json            JSON array (implies list)\n\
+                     --refresh         rebuild the metadata cache\n\
+                     --debug-running   dump detected pi processes\n\n\
+                     no flags opens the TUI. keys: /=search f=filter g=group s=sort d=detail p=prompts j/k J/K=group enter=open q=quit\n\
                      config: ~/.config/psst/config.toml"
                 );
                 std::process::exit(0);
             }
-            other => bail!("unknown argument: {} (try --help)", other),
+            other => {
+                let p = PathBuf::from(other);
+                if other == "." || p.is_dir() {
+                    args.scope = Some(resolve_scope(&p));
+                } else {
+                    bail!("unknown argument: {} (try --help)", other);
+                }
+            }
         }
     }
     Ok(args)
 }
 
-fn print_list(sessions: &[SessionMeta], hits: &std::collections::HashMap<PathBuf, running::RunningHit>) {
+fn scoped<'a>(sessions: &'a [SessionMeta], scope: Option<&Path>) -> Vec<&'a SessionMeta> {
+    sessions
+        .iter()
+        .filter(|s| scope.map(|sc| in_scope(&s.cwd, sc)).unwrap_or(true))
+        .collect()
+}
+
+fn print_list(sessions: &[&SessionMeta], hits: &std::collections::HashMap<PathBuf, running::RunningHit>) {
     println!(
         "{:<2} {:<50} {:<28} {:>7}",
         "", "title", "project", "age"
     );
     for s in sessions {
         let hit = hits.get(&s.path);
-        let run = if hit.is_some() { "* " } else { "  " };
+        let mark = live_mark(hit);
         let age = chrono::Utc::now().timestamp() - s.last_user_or_activity();
         let title = hit
             .and_then(|h| h.peer_name.clone())
             .unwrap_or_else(|| s.title());
         println!(
             "{} {:<50} {:<28} {:>5}",
-            run,
+            mark.glyph(),
             crate::list_helpers::trunc(&title, 48),
             crate::list_helpers::trunc(&project_base(&s.cwd), 26),
             crate::list_helpers::fmt_age(age),
         );
     }
+}
+
+fn print_json(sessions: &[&SessionMeta], hits: &std::collections::HashMap<PathBuf, running::RunningHit>) {
+    let now = chrono::Utc::now().timestamp();
+    let rows: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|s| {
+            let hit = hits.get(&s.path);
+            let mark = live_mark(hit);
+            serde_json::json!({
+                "path": s.path,
+                "id": s.id,
+                "cwd": s.cwd,
+                "name": s.name,
+                "title": hit.and_then(|h| h.peer_name.clone()).unwrap_or_else(|| s.title()),
+                "running": hit.is_some(),
+                "pid": hit.map(|h| h.pid),
+                "tmux": hit.and_then(|h| h.tmux.as_ref()).map(|t| {
+                    format!(
+                        "{}{}",
+                        t.session,
+                        t.window.map(|w| format!(":{}", w)).unwrap_or_default()
+                    )
+                }),
+                "status": hit.and_then(|h| h.status.clone()),
+                "mark": mark.as_str(),
+                "forked": s.parent_session.is_some(),
+                "last_user": s.last_user,
+                "last_activity": s.last_activity,
+                "age_secs": now - s.last_user_or_activity(),
+                "messages": s.messages,
+                "cost_total": s.cost_total,
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into()));
 }
 
 fn project_base(cwd: &str) -> String {
@@ -87,13 +146,18 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let shown = scoped(&sessions, args.scope.as_deref());
+    if args.json {
+        print_json(&shown, &hits);
+        return Ok(());
+    }
     if args.list {
-        print_list(&sessions, &hits);
+        print_list(&shown, &hits);
         return Ok(());
     }
 
     let cfg = config::Config::load();
-    let mut app = tui::App::new(sessions, cfg);
+    let mut app = tui::App::new(sessions, cfg, args.scope);
     match tui::run(&mut app)? {
         Some(action) => perform(action),
         None => Ok(()),

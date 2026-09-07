@@ -7,14 +7,17 @@ archive *and* showing which agents are running right now.
 
 ```
 ● tmux-agent-restore-work   tmux-agent…  312m  [agents:3]
-○ psst                      psst         2s
+◎ psst                      psst         2s
 ⎇ wiki-session-sync         dotfiles     14d
 ▾ Today  12 sessions · last 2s
 ▾ ~/Code/github.com/ericboehs/dotfiles  47 sessions · last 2s
 ```
 
-- `●` green dot = a live pi process is attached (cwd match + recent write;
-  exact when the process cmdline carries `--session`)
+- `●` yellow = live, working (`thinking` / `tool:…` from agent-link)
+- `●` red + bold title = blocking prompt (`ask` / confirm / input)
+- `●` cyan + bold title = unread (tmux `@special_activity`, not focused yet)
+- `◎` cyan = live, waiting, already looked at
+- `○` gray = not running
 - `[agents:3]` = the tmux session/window the running agent lives in
 - `⎇` = session was forked from a parent (`/fork`, `/clone`)
 
@@ -37,7 +40,9 @@ Rust via Homebrew is the only dependency. tmux is required for opening sessions.
 
 ```bash
 psst                  # TUI
+psst .                # TUI, only this project (git root, else cwd)
 psst --list           # plain table (pipe-friendly)
+psst --json           # JSON array (same rows as --list)
 psst --refresh        # rebuild the metadata cache from scratch
 psst --debug-running  # print detected pi processes + tmux targets
 ```
@@ -47,18 +52,21 @@ psst --debug-running  # print detected pi processes + tmux targets
 | Key | Action |
 |-----|--------|
 | `/` | focus search (then type anything, including `j`/`k`; Esc unfocuses). Running sessions also match `active`. |
-| `f` | cycle list filter: all → named → active → tmux |
+| `f` | cycle list filter: all → named → active |
 | `g` or `Tab` | cycle grouping: flat → project → day |
 | `s` or `Ctrl+S` | cycle sort: activity → tmux |
 | `↑`/`↓` or `k`/`j`, PgUp/PgDn | navigate (j/k only when search is not focused) |
+| `J` / `K` | next / previous group (day or project; no-op when flat) |
 | `Enter` | **open**: attach to the running tmux session, or spawn `pi --session <file>` in a new tmux window |
 | `d` | toggle the bottom detail pane (off by default) |
-| `p` | hide/show prompt text in list titles |
+| `p` | hide/show last user prompt on a second line under each row |
 | `r` / `R` | rescan (cache-aware) / full rescan |
 | `Esc` | clear filter (quit if empty) |
 | `q` | quit |
 
-The list auto-refreshes every 10s.
+Running detection ticks every 1s; the session archive rescans every 10s.
+Filter, grouping, sort, detail, prompts, and the selected row are restored
+the next time you open psst (`~/.cache/psst/ui-state.json`).
 
 Group headers (project and day modes) show session count, total cost, and the
 newest activity in the group. Day buckets use local dates; within a group,

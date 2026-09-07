@@ -1,10 +1,11 @@
 //! ratatui TUI: list -> filter -> inspect -> open (resume in tmux).
 
 use crate::config::Config;
-use crate::running::{detect, map_running, RunningHit};
-use crate::scan::{scan, sessions_root, SessionMeta};
+use crate::running::{detect, live_mark, map_running, LiveMark, RunningHit};
+use crate::scan::{in_scope, scan, sessions_root, SessionMeta};
 use anyhow::Result;
 use chrono::Timelike;
+use serde::{Deserialize, Serialize};
 use ratatui::{
     Frame,
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -35,6 +36,13 @@ impl Sort {
             Sort::Tmux => Sort::Activity,
         }
     }
+    fn from_label(s: &str) -> Option<Sort> {
+        match s {
+            "activity" => Some(Sort::Activity),
+            "tmux" => Some(Sort::Tmux),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -59,6 +67,14 @@ impl Group {
             Group::Day => Group::Flat,
         }
     }
+    fn from_label(s: &str) -> Option<Group> {
+        match s {
+            "flat" => Some(Group::Flat),
+            "project" => Some(Group::Project),
+            "day" => Some(Group::Day),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -66,7 +82,6 @@ pub enum ViewFilter {
     All,
     Named,
     Active,
-    Tmux,
 }
 
 impl ViewFilter {
@@ -75,15 +90,21 @@ impl ViewFilter {
             ViewFilter::All => "all",
             ViewFilter::Named => "named",
             ViewFilter::Active => "active",
-            ViewFilter::Tmux => "tmux",
         }
     }
     fn next(self) -> ViewFilter {
         match self {
             ViewFilter::All => ViewFilter::Named,
             ViewFilter::Named => ViewFilter::Active,
-            ViewFilter::Active => ViewFilter::Tmux,
-            ViewFilter::Tmux => ViewFilter::All,
+            ViewFilter::Active => ViewFilter::All,
+        }
+    }
+    fn from_label(s: &str) -> Option<ViewFilter> {
+        match s {
+            "all" => Some(ViewFilter::All),
+            "named" => Some(ViewFilter::Named),
+            "active" => Some(ViewFilter::Active),
+            _ => None,
         }
     }
 }
@@ -118,8 +139,12 @@ pub struct App {
     pub show_prompts: bool,
     /// `/` focuses the filter so j/k type into it instead of moving the selection.
     pub search_focus: bool,
-    /// f cycles all → named → active → tmux.
+    /// f cycles all → named → active.
     pub view_filter: ViewFilter,
+    /// `psst .` — only sessions whose cwd is this project.
+    pub cwd_scope: Option<PathBuf>,
+    /// Restored once after the first refresh from ui-state.json.
+    pending_sel: Option<PathBuf>,
 }
 
 /// One rendered row: a session (index into `sessions`) or a group header.
@@ -188,7 +213,7 @@ fn project_base(cwd: &str) -> String {
 }
 
 impl App {
-    pub fn new(sessions: Vec<SessionMeta>, config: Config) -> App {
+    pub fn new(sessions: Vec<SessionMeta>, config: Config, cwd_scope: Option<PathBuf>) -> App {
         let mut app = App {
             sessions,
             running: HashMap::new(),
@@ -206,8 +231,11 @@ impl App {
             show_prompts: false,
             search_focus: false,
             view_filter: ViewFilter::All,
+            cwd_scope,
+            pending_sel: None,
             config,
         };
+        app.load_ui_state();
         app.refresh(false);
         app
     }
@@ -225,6 +253,24 @@ impl App {
         let procs = detect();
         self.running = map_running(&procs, &self.sessions, self.config.active_secs());
         self.apply_filter_sort();
+        let restore = sel_path.or_else(|| self.pending_sel.take());
+        if let Some(p) = restore {
+            if let Some(pos) = self.order.iter().position(|&i| self.sessions[i].path == p) {
+                self.sel = pos;
+            }
+        }
+        self.clamp_sel();
+    }
+
+    /// Cheap tick: re-detect running processes without reparsing session files.
+    pub fn refresh_running(&mut self) {
+        let sel_path = self
+            .order
+            .get(self.sel)
+            .map(|&i| self.sessions[i].path.clone());
+        let procs = detect();
+        self.running = map_running(&procs, &self.sessions, self.config.active_secs());
+        self.apply_filter_sort();
         if let Some(p) = sel_path {
             if let Some(pos) = self.order.iter().position(|&i| self.sessions[i].path == p) {
                 self.sel = pos;
@@ -233,12 +279,60 @@ impl App {
         self.clamp_sel();
     }
 
+    fn load_ui_state(&mut self) {
+        let raw = std::fs::read_to_string(ui_state_path()).ok();
+        let Some(st) = raw.and_then(|s| serde_json::from_str::<UiState>(&s).ok()) else {
+            return;
+        };
+        if let Some(v) = ViewFilter::from_label(&st.view_filter) {
+            self.view_filter = v;
+        }
+        if let Some(g) = Group::from_label(&st.group) {
+            self.group = g;
+        }
+        if let Some(s) = Sort::from_label(&st.sort) {
+            self.sort = s;
+        }
+        self.show_prompts = st.show_prompts;
+        self.detail = st.detail;
+        self.pending_sel = st.selected.map(PathBuf::from);
+    }
+
+    pub fn save_ui_state(&self) {
+        let selected = self.order.get(self.sel).map(|&i| {
+            self.sessions[i]
+                .path
+                .to_string_lossy()
+                .into_owned()
+        });
+        let st = UiState {
+            view_filter: self.view_filter.label().to_string(),
+            group: self.group.label().to_string(),
+            sort: self.sort.label().to_string(),
+            show_prompts: self.show_prompts,
+            detail: self.detail,
+            selected,
+        };
+        let p = ui_state_path();
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&st) {
+            let _ = std::fs::write(p, json);
+        }
+    }
+
     fn apply_filter_sort(&mut self) {
         let f = self.filter.to_lowercase();
         let mut idx: Vec<usize> = (0..self.sessions.len())
             .filter(|&i| {
                 let s = &self.sessions[i];
                 let hit = self.running.get(&s.path);
+                if let Some(scope) = &self.cwd_scope {
+                    if !in_scope(&s.cwd, scope) {
+                        return false;
+                    }
+                }
                 match self.view_filter {
                     ViewFilter::All => {}
                     ViewFilter::Named => {
@@ -253,23 +347,21 @@ impl App {
                             return false;
                         }
                     }
-                    ViewFilter::Tmux => {
-                        if hit.and_then(|h| h.tmux.as_ref()).is_none() {
-                            return false;
-                        }
-                    }
                 }
                 if f.is_empty() {
                     return true;
                 }
                 let peer = hit.and_then(|h| h.peer_name.as_deref()).unwrap_or("");
+                let mark = live_mark(hit);
                 let hay = format!(
-                    "{} {} {} {} {} {}",
-                    display_title(s, hit, self.show_prompts),
+                    "{} {} {} {} {} {} {} {}",
+                    display_title(s, hit),
                     s.first_prompt.as_deref().unwrap_or(""),
+                    s.last_prompt.as_deref().unwrap_or(""),
                     s.cwd,
                     s.model.as_deref().unwrap_or(""),
                     peer,
+                    mark.as_str(),
                     if hit.is_some() { "active running" } else { "" }
                 )
                 .to_lowercase();
@@ -337,6 +429,70 @@ impl App {
         self.sel = cur.clamp(0, self.order.len() as i32 - 1) as usize;
     }
 
+    /// Positions in `order` of the first session in each visual group.
+    fn group_starts(&self) -> Vec<usize> {
+        if self.order.is_empty() {
+            return Vec::new();
+        }
+        match self.group {
+            Group::Flat => vec![0],
+            Group::Project => {
+                let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
+                for (pos, &i) in self.order.iter().enumerate() {
+                    buckets
+                        .entry(self.sessions[i].cwd.clone())
+                        .or_default()
+                        .push(pos);
+                }
+                let mut groups: Vec<(String, Vec<usize>)> = buckets.into_iter().collect();
+                groups.sort_by_key(|(_, v)| {
+                    std::cmp::Reverse(
+                        v.iter()
+                            .map(|&pos| self.sessions[self.order[pos]].last_user_or_activity())
+                            .max()
+                            .unwrap_or(0),
+                    )
+                });
+                groups.into_iter().filter_map(|(_, v)| v.first().copied()).collect()
+            }
+            Group::Day => {
+                let mut buckets: HashMap<chrono::NaiveDate, Vec<usize>> = HashMap::new();
+                for (pos, &i) in self.order.iter().enumerate() {
+                    let ts = self.sessions[i].last_user_or_activity();
+                    let date = chrono::DateTime::from_timestamp(ts, 0)
+                        .unwrap_or_default()
+                        .with_timezone(&chrono::Local)
+                        .date_naive();
+                    buckets.entry(date).or_default().push(pos);
+                }
+                let mut dates: Vec<chrono::NaiveDate> = buckets.keys().copied().collect();
+                dates.sort_by(|a, b| b.cmp(a));
+                dates
+                    .into_iter()
+                    .filter_map(|d| buckets.get(&d).and_then(|v| v.first().copied()))
+                    .collect()
+            }
+        }
+    }
+
+    /// J / K: next / previous group. K from mid-group snaps to that group's first row.
+    fn move_group(&mut self, dir: i32) {
+        let starts = self.group_starts();
+        if starts.is_empty() {
+            return;
+        }
+        let gi = starts.iter().rposition(|&st| st <= self.sel).unwrap_or(0);
+        if dir < 0 && starts[gi] < self.sel {
+            self.sel = starts[gi];
+            return;
+        }
+        let next = gi as i32 + dir;
+        if next < 0 || next >= starts.len() as i32 {
+            return;
+        }
+        self.sel = starts[next as usize];
+    }
+
     /// Build the open action for the selected session.
     pub fn open_selected(&self) -> Option<OpenAction> {
         let s = self.selected()?;
@@ -368,10 +524,17 @@ impl App {
     fn row_line(&self, i: usize, w: usize) -> Line<'static> {
         let s = &self.sessions[i];
         let hit = self.running.get(&s.path);
-        let dot = if hit.is_some() {
-            Span::styled("● ", Style::default().fg(Color::Green))
-        } else {
-            Span::styled("○ ", Style::default().fg(Color::DarkGray))
+        let mark = live_mark(hit);
+        let dot = match mark {
+            LiveMark::Working => Span::styled("● ", Style::default().fg(Color::Yellow)),
+            LiveMark::Prompt => {
+                Span::styled("● ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            }
+            LiveMark::Unread => {
+                Span::styled("● ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            }
+            LiveMark::Waiting => Span::styled("◎ ", Style::default().fg(Color::Cyan)),
+            LiveMark::Idle => Span::styled("○ ", Style::default().fg(Color::DarkGray)),
         };
         let fork = if s.parent_session.is_some() {
             Span::styled("⎇ ", Style::default().fg(Color::Yellow))
@@ -379,9 +542,10 @@ impl App {
             Span::raw("  ")
         };
         let title_w = (w / 2).max(32);
-        let label = display_title(s, hit, self.show_prompts);
+        let label = display_title(s, hit);
         let named = s.name.is_some() || hit.and_then(|h| h.peer_name.as_deref()).is_some();
-        let title = if named {
+        let attention = matches!(mark, LiveMark::Prompt | LiveMark::Unread);
+        let title = if named || attention {
             Span::styled(
                 pad(&label, title_w),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -415,7 +579,23 @@ impl App {
     }
 
     fn member_lines(&self, i: usize, w: usize) -> Vec<Line<'static>> {
-        vec![self.row_line(i, w)]
+        let mut lines = vec![self.row_line(i, w)];
+        if self.show_prompts {
+            if let Some(p) = self.sessions[i]
+                .last_prompt
+                .as_deref()
+                .or(self.sessions[i].first_prompt.as_deref())
+            {
+                let one_line = p.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !one_line.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", trunc(&one_line, w.saturating_sub(6))),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+        }
+        lines
     }
 
     fn build_items(&self, w: usize) -> Vec<Item> {
@@ -508,7 +688,7 @@ impl App {
 }
 
 /// Running sessions show the live peer name (`pi-dotfiles-2`); others use /name or prompt.
-fn display_title(s: &SessionMeta, hit: Option<&RunningHit>, show_prompts: bool) -> String {
+fn display_title(s: &SessionMeta, hit: Option<&RunningHit>) -> String {
     if let Some(n) = hit.and_then(|h| h.peer_name.as_deref()).filter(|n| !n.is_empty()) {
         return n.to_string();
     }
@@ -517,11 +697,6 @@ fn display_title(s: &SessionMeta, hit: Option<&RunningHit>, show_prompts: bool) 
     }
     if let Some(n) = &s.name {
         return n.clone();
-    }
-    if show_prompts {
-        if let Some(p) = &s.first_prompt {
-            return p.clone();
-        }
     }
     s.id.chars().take(8).collect()
 }
@@ -533,7 +708,7 @@ fn hay_contains(hay: &str, needle: &str) -> bool {
 
 fn detail_text(s: &SessionMeta, hit: Option<&RunningHit>, cfg: &Config) -> String {
     let mut v = Vec::new();
-    v.push(format!("title:    {}", display_title(s, hit, true)));
+    v.push(format!("title:    {}", display_title(s, hit)));
     if let Some(n) = hit.and_then(|h| h.peer_name.as_deref()) {
         if s.title() != n {
             v.push(format!("prompt:   {}", s.title()));
@@ -586,8 +761,11 @@ fn detail_text(s: &SessionMeta, hit: Option<&RunningHit>, cfg: &Config) -> Strin
                 .as_deref()
                 .map(|s| format!(" · {}", s))
                 .unwrap_or_default();
+            let mark = live_mark(Some(h));
             v.push(format!(
-                "state:    ● RUNNING pid {} @ {} ({}){}",
+                "state:    {} {} pid {} @ {} ({}){}",
+                mark.glyph(),
+                mark.as_str(),
                 h.pid,
                 t,
                 if h.direct { "exact" } else { "heuristic" },
@@ -621,20 +799,79 @@ fn ui(f: &mut Frame, app: &App, items: &[Item], list_state: &mut ListState) {
     ])
     .areas(area);
 
-    let header_spans = vec![
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut working = 0usize;
+    let mut attention = 0usize;
+    let mut idle = 0usize;
+    let mut has_prompt = false;
+    for &i in &app.order {
+        match live_mark(app.running.get(&app.sessions[i].path)) {
+            LiveMark::Working => working += 1,
+            LiveMark::Prompt => {
+                attention += 1;
+                has_prompt = true;
+            }
+            LiveMark::Unread => attention += 1,
+            LiveMark::Waiting => idle += 1,
+            LiveMark::Idle => {}
+        }
+    }
+    let mut header_spans = vec![
         Span::styled(
             " psst ",
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(
-            " {} sessions · {} running · sort:{} group:{} filter:{}",
-            app.sessions.len(),
-            app.running.len(),
-            app.sort.label(),
-            app.group.label(),
-            app.view_filter.label()
-        )),
+        Span::raw(format!(" {} sessions", app.order.len())),
     ];
+    if working > 0 {
+        header_spans.push(Span::styled(" · ", dim));
+        header_spans.push(Span::styled(
+            format!("{} running", working),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if attention > 0 {
+        header_spans.push(Span::styled(" · ", dim));
+        header_spans.push(Span::styled(
+            format!("{} attention", attention),
+            Style::default()
+                .fg(if has_prompt { Color::Red } else { Color::Cyan })
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if idle > 0 {
+        header_spans.push(Span::styled(" · ", dim));
+        header_spans.push(Span::styled(
+            format!("{} idle", idle),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    header_spans.extend([
+        Span::styled(" · ", dim),
+        Span::styled("sort:", dim),
+        Span::raw(app.sort.label()),
+        Span::styled(" · ", dim),
+        Span::styled("group:", dim),
+        Span::raw(app.group.label()),
+        Span::styled(" · ", dim),
+        Span::styled("filter:", dim),
+        Span::styled(
+            app.view_filter.label(),
+            if app.view_filter == ViewFilter::All {
+                dim
+            } else {
+                Style::default().fg(Color::Cyan)
+            },
+        ),
+    ]);
+    if let Some(p) = &app.cwd_scope {
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string());
+        header_spans.push(Span::styled(" · ", dim));
+        header_spans.push(Span::styled(name, Style::default().fg(Color::Cyan)));
+    }
     f.render_widget(Paragraph::new(Line::from(header_spans)), header);
 
     let slash = if app.search_focus {
@@ -663,18 +900,23 @@ fn ui(f: &mut Frame, app: &App, items: &[Item], list_state: &mut ListState) {
     ];
     f.render_widget(Paragraph::new(Line::from(filter_spans)), filterbar);
 
+    let target = app.order.get(app.sel).copied();
     let list_items: Vec<ListItem> = items
         .iter()
-        .map(|it| ListItem::new(Text::from(it.lines.clone())))
-        .collect();
-    let list = List::new(list_items)
-        .block(if app.detail {
-            Block::new().borders(Borders::BOTTOM)
-        } else {
-            Block::new()
+        .map(|it| {
+            let selected = it.session.is_some() && it.session == target;
+            ListItem::new(Text::from(if selected {
+                highlight_row(&it.lines)
+            } else {
+                it.lines.clone()
+            }))
         })
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▶ ");
+        .collect();
+    let list = List::new(list_items).block(if app.detail {
+        Block::new().borders(Borders::BOTTOM)
+    } else {
+        Block::new()
+    });
 
     if app.detail {
         let [list_area, detail_area] = Layout::vertical([
@@ -700,7 +942,7 @@ fn ui(f: &mut Frame, app: &App, items: &[Item], list_state: &mut ListState) {
     }
 
     let mut footer_spans = vec![Span::styled(
-        " /=search  f=filter g=group s=sort d=detail p=prompts  j/k  enter=open r=rescan esc q",
+        " /=search  f=filter g=group s=sort d=detail p=prompts  j/k J/K=group  enter=open r=rescan esc q",
         Style::default().fg(Color::DarkGray),
     )];
     if !app.status.is_empty() {
@@ -715,13 +957,18 @@ fn ui(f: &mut Frame, app: &App, items: &[Item], list_state: &mut ListState) {
 pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
     let mut terminal = ratatui::init();
     let mut list_state = ListState::default();
-    let mut last_refresh = std::time::Instant::now();
+    let mut last_full = std::time::Instant::now();
+    let mut last_running = std::time::Instant::now();
     let mut result: Option<OpenAction> = None;
 
     loop {
-        if last_refresh.elapsed() > std::time::Duration::from_secs(10) {
+        if last_full.elapsed() > std::time::Duration::from_secs(10) {
             app.refresh(false);
-            last_refresh = std::time::Instant::now();
+            last_full = std::time::Instant::now();
+            last_running = last_full;
+        } else if last_running.elapsed() > std::time::Duration::from_secs(1) {
+            app.refresh_running();
+            last_running = std::time::Instant::now();
         }
         let width = terminal.size()?.width as usize;
         let items = app.build_items(width);
@@ -821,6 +1068,10 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                             "prompts hidden".into()
                         };
                     }
+                    (KeyCode::Char('J'), _) => app.move_group(1),
+                    (KeyCode::Char('K'), _) => app.move_group(-1),
+                    (KeyCode::Char('j'), KeyModifiers::SHIFT) => app.move_group(1),
+                    (KeyCode::Char('k'), KeyModifiers::SHIFT) => app.move_group(-1),
                     (KeyCode::Char('j'), _) => app.move_sel(1),
                     (KeyCode::Char('k'), _) => app.move_sel(-1),
                     (KeyCode::Char('r'), _) => {
@@ -841,8 +1092,56 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
         }
     }
 
+    app.save_ui_state();
     ratatui::restore();
     Ok(result)
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct UiState {
+    #[serde(default)]
+    view_filter: String,
+    #[serde(default)]
+    group: String,
+    #[serde(default)]
+    sort: String,
+    #[serde(default)]
+    show_prompts: bool,
+    #[serde(default)]
+    detail: bool,
+    selected: Option<String>,
+}
+
+fn ui_state_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".cache/psst/ui-state.json")
+}
+
+/// Reverse-video the row except the status glyph, which keeps its own color.
+fn highlight_row(lines: &[Line<'static>]) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(li, line)| {
+            Line::from(
+                line.spans
+                    .iter()
+                    .enumerate()
+                    .map(|(si, sp)| {
+                        // Keep the status glyph's own color; reverse everything else,
+                        // including the prompt subtitle.
+                        if li == 0 && si == 0 {
+                            sp.clone()
+                        } else {
+                            sp.clone().patch_style(
+                                Style::default().add_modifier(Modifier::REVERSED),
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
 }
 
 /// Keep the ListState's selected item aligned with app.sel (which indexes `order`).
