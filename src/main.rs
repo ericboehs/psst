@@ -38,7 +38,7 @@ fn parse_args() -> Result<Args> {
                 println!(
                     "psst — pi session tui\n\n\
                      usage: psst [--list] [--refresh] [--debug-running]\n\n\
-                     no flags opens the TUI. keys: /=search f=filter g=group s=sort a=active d=detail p=prompts j/k enter=open q=quit\n\
+                     no flags opens the TUI. keys: /=search f=filter g=group s=sort d=detail p=prompts j/k enter=open q=quit\n\
                      config: ~/.config/psst/config.toml"
                 );
                 std::process::exit(0);

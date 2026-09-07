@@ -65,6 +65,7 @@ impl Group {
 pub enum ViewFilter {
     All,
     Named,
+    Active,
     Tmux,
 }
 
@@ -73,13 +74,15 @@ impl ViewFilter {
         match self {
             ViewFilter::All => "all",
             ViewFilter::Named => "named",
+            ViewFilter::Active => "active",
             ViewFilter::Tmux => "tmux",
         }
     }
     fn next(self) -> ViewFilter {
         match self {
             ViewFilter::All => ViewFilter::Named,
-            ViewFilter::Named => ViewFilter::Tmux,
+            ViewFilter::Named => ViewFilter::Active,
+            ViewFilter::Active => ViewFilter::Tmux,
             ViewFilter::Tmux => ViewFilter::All,
         }
     }
@@ -115,9 +118,7 @@ pub struct App {
     pub show_prompts: bool,
     /// `/` focuses the filter so j/k type into it instead of moving the selection.
     pub search_focus: bool,
-    /// When true, only sessions with a live pi process are listed.
-    pub active_only: bool,
-    /// f cycles all → named → tmux.
+    /// f cycles all → named → active → tmux.
     pub view_filter: ViewFilter,
 }
 
@@ -204,7 +205,6 @@ impl App {
             detail: config.detail_default(),
             show_prompts: false,
             search_focus: false,
-            active_only: false,
             view_filter: ViewFilter::All,
             config,
         };
@@ -239,15 +239,17 @@ impl App {
             .filter(|&i| {
                 let s = &self.sessions[i];
                 let hit = self.running.get(&s.path);
-                if self.active_only && hit.is_none() {
-                    return false;
-                }
                 match self.view_filter {
                     ViewFilter::All => {}
                     ViewFilter::Named => {
                         let named = s.name.is_some()
                             || hit.and_then(|h| h.peer_name.as_deref()).is_some();
                         if !named {
+                            return false;
+                        }
+                    }
+                    ViewFilter::Active => {
+                        if hit.is_none() {
                             return false;
                         }
                     }
@@ -625,13 +627,12 @@ fn ui(f: &mut Frame, app: &App, items: &[Item], list_state: &mut ListState) {
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            " {} sessions · {} running · sort:{} group:{} filter:{}{}",
+            " {} sessions · {} running · sort:{} group:{} filter:{}",
             app.sessions.len(),
             app.running.len(),
             app.sort.label(),
             app.group.label(),
-            app.view_filter.label(),
-            if app.active_only { " · active" } else { "" }
+            app.view_filter.label()
         )),
     ];
     f.render_widget(Paragraph::new(Line::from(header_spans)), header);
@@ -699,7 +700,7 @@ fn ui(f: &mut Frame, app: &App, items: &[Item], list_state: &mut ListState) {
     }
 
     let mut footer_spans = vec![Span::styled(
-        " /=search  f=filter g=group s=sort a=active d=detail p=prompts  j/k  enter=open r=rescan esc q",
+        " /=search  f=filter g=group s=sort d=detail p=prompts  j/k  enter=open r=rescan esc q",
         Style::default().fg(Color::DarkGray),
     )];
     if !app.status.is_empty() {
@@ -795,15 +796,6 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                         _ => {}
                     },
                     (KeyCode::Char('q'), _) => break,
-                    (KeyCode::Char('a'), _) => {
-                        app.active_only = !app.active_only;
-                        app.apply_filter_sort();
-                        app.status = if app.active_only {
-                            "active only".into()
-                        } else {
-                            "showing all".into()
-                        };
-                    }
                     (KeyCode::Char('f'), _) => {
                         app.view_filter = app.view_filter.next();
                         app.apply_filter_sort();
