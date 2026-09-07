@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::running::{detect, live_mark, map_running, LiveMark, RunningHit};
-use crate::scan::{in_scope, scan, sessions_root, SessionMeta};
+use crate::scan::{in_scope, recent_messages, scan, sessions_root, SessionMeta};
 use anyhow::Result;
 use chrono::Timelike;
 use serde::{Deserialize, Serialize};
@@ -145,6 +145,9 @@ pub struct App {
     pub cwd_scope: Option<PathBuf>,
     /// Restored once after the first refresh from ui-state.json.
     pending_sel: Option<PathBuf>,
+    /// Detail pane messages: (path, mtime, turns). Recomputed when the
+    /// selection moves or the file grows.
+    recent_cache: Option<(PathBuf, i64, Vec<(String, String)>)>,
 }
 
 /// One rendered row: a session (index into `sessions`) or a group header.
@@ -178,16 +181,6 @@ fn fmt_age(secs: i64) -> String {
         format!("{}d", s / 86_400)
     } else {
         format!("{}mo", s / (86_400 * 30))
-    }
-}
-
-fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{}M", n / 1_000_000)
-    } else if n >= 1_000 {
-        format!("{}k", n / 1_000)
-    } else {
-        format!("{}", n)
     }
 }
 
@@ -233,6 +226,7 @@ impl App {
             view_filter: ViewFilter::All,
             cwd_scope,
             pending_sel: None,
+            recent_cache: None,
             config,
         };
         app.load_ui_state();
@@ -260,6 +254,30 @@ impl App {
             }
         }
         self.clamp_sel();
+    }
+
+    /// Turns for the detail pane, cached by path+mtime so live sessions update.
+    fn recent_for_selected(&mut self) -> Vec<(String, String)> {
+        let (path, mtime) = match self.selected() {
+            Some(s) => {
+                let mt = std::fs::metadata(&s.path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                (s.path.clone(), mt)
+            }
+            None => return Vec::new(),
+        };
+        if let Some((p, m, msgs)) = &self.recent_cache {
+            if p == &path && *m == mtime {
+                return msgs.clone();
+            }
+        }
+        let msgs = recent_messages(&path, 6);
+        self.recent_cache = Some((path, mtime, msgs.clone()));
+        msgs
     }
 
     /// Cheap tick: re-detect running processes without reparsing session files.
@@ -706,42 +724,28 @@ fn hay_contains(hay: &str, needle: &str) -> bool {
     needle.split_whitespace().all(|t| hay.contains(t))
 }
 
-fn detail_text(s: &SessionMeta, hit: Option<&RunningHit>, cfg: &Config) -> String {
-    let mut v = Vec::new();
-    v.push(format!("title:    {}", display_title(s, hit)));
-    if let Some(n) = hit.and_then(|h| h.peer_name.as_deref()) {
-        if s.title() != n {
-            v.push(format!("prompt:   {}", s.title()));
-        }
-    }
-    v.push(format!("project:  {}", s.cwd));
-    v.push(format!("file:     {}", s.path.display()));
-    v.push(format!("id:       {}", s.id));
-    if let Some(c) = s.created {
-        if let Some(t) = chrono::DateTime::from_timestamp(c, 0) {
-            v.push(format!("created:  {}", t.format("%Y-%m-%d %H:%M")));
-        }
-    }
-    if let Some(a) = s.last_activity {
-        if let Some(t) = chrono::DateTime::from_timestamp(a, 0) {
-            v.push(format!(
-                "activity: {} ({} ago)",
-                t.format("%Y-%m-%d %H:%M"),
-                fmt_age(now() - a)
-            ));
-        }
-    }
-    v.push(format!(
-        "tokens:   {} in / {} out",
-        fmt_tokens(s.tokens_in),
-        fmt_tokens(s.tokens_out)
-    ));
-    v.push(format!(
-        "messages: {} ({} branch pts)",
-        s.messages, s.branches
-    ));
+fn detail_lines(
+    s: &SessionMeta,
+    hit: Option<&RunningHit>,
+    recent: &[(String, String)],
+) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let mut v = vec![
+        Line::from(vec![
+            Span::styled("title:   ", dim),
+            Span::styled(display_title(s, hit), bold),
+        ]),
+        Line::from(vec![
+            Span::styled("project: ", dim),
+            Span::raw(s.cwd.clone()),
+        ]),
+    ];
     if let Some(p) = &s.parent_session {
-        v.push(format!("fork of:  {}", p));
+        v.push(Line::from(vec![
+            Span::styled("fork of: ", dim),
+            Span::styled(p.clone(), Style::default().fg(Color::Yellow)),
+        ]));
     }
     match hit {
         Some(h) => {
@@ -762,34 +766,56 @@ fn detail_text(s: &SessionMeta, hit: Option<&RunningHit>, cfg: &Config) -> Strin
                 .map(|s| format!(" · {}", s))
                 .unwrap_or_default();
             let mark = live_mark(Some(h));
-            v.push(format!(
-                "state:    {} {} pid {} @ {} ({}){}",
-                mark.glyph(),
-                mark.as_str(),
-                h.pid,
-                t,
-                if h.direct { "exact" } else { "heuristic" },
-                status
-            ));
+            let (color, emphasis) = match mark {
+                LiveMark::Working => (Color::Yellow, true),
+                LiveMark::Prompt => (Color::Red, true),
+                LiveMark::Unread => (Color::Cyan, true),
+                LiveMark::Waiting => (Color::Cyan, false),
+                LiveMark::Idle => (Color::DarkGray, false),
+            };
+            let mut glyph = Style::default().fg(color);
+            if emphasis {
+                glyph = glyph.add_modifier(Modifier::BOLD);
+            }
+            v.push(Line::from(vec![
+                Span::styled("state:   ", dim),
+                Span::styled(mark.glyph(), glyph),
+                Span::raw(format!(
+                    " {} pid {} @ {} ({}){}",
+                    mark.as_str(),
+                    h.pid,
+                    t,
+                    if h.direct { "exact" } else { "heuristic" },
+                    status
+                )),
+            ]));
         }
-        None => v.push("state:    ○ idle".to_string()),
+        None => v.push(Line::from(vec![
+            Span::styled("state:   ", dim),
+            Span::styled("○ idle", dim),
+        ])),
     }
-    let preview = cfg
-        .resume_command()
-        .replace("{file}", &s.path.to_string_lossy())
-        .replace("{id}", &s.id)
-        .replace("{cwd}", &s.cwd);
-    v.push(String::new());
-    v.push(format!("resume:   {}", preview));
-    if let Some(p) = &s.first_prompt {
-        v.push(String::new());
-        v.push("first prompt:".to_string());
-        v.push(trunc(p, 200));
+    if !recent.is_empty() {
+        v.push(Line::from(""));
+        for (role, text) in recent {
+            let (who, color) = if role == "user" {
+                ("you", Color::Green)
+            } else {
+                ("agent", Color::Magenta)
+            };
+            v.push(Line::from(vec![
+                Span::styled(
+                    format!("{}: ", who),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(text.clone()),
+            ]));
+        }
     }
-    v.join("\n")
+    v
 }
 
-fn ui(f: &mut Frame, app: &App, items: &[Item], list_state: &mut ListState) {
+fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) {
     let area = f.area();
     let [header, filterbar, body, footer] = Layout::vertical([
         Constraint::Length(1),
@@ -925,9 +951,10 @@ fn ui(f: &mut Frame, app: &App, items: &[Item], list_state: &mut ListState) {
         ])
         .areas(body);
         f.render_stateful_widget(list, list_area, list_state);
+        let recent = app.recent_for_selected();
         if let Some(s) = app.selected() {
             let hit = app.running.get(&s.path);
-            let detail = Paragraph::new(detail_text(s, hit, &app.config))
+            let detail = Paragraph::new(detail_lines(s, hit, &recent))
                 .wrap(Wrap { trim: false })
                 .block(
                     Block::new()

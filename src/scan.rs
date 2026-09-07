@@ -394,6 +394,125 @@ pub fn in_scope(session_cwd: &str, scope: &Path) -> bool {
     s == scope || s.starts_with(&scope)
 }
 
+fn is_framed_delivery(t: &str) -> bool {
+    t.starts_with("[cross-agent") || t.starts_with("[reply from")
+}
+
+fn join_text_blocks(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(blocks) => {
+            let parts: Vec<&str> = blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(" "))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn tool_names(content: &serde_json::Value) -> Vec<&str> {
+    let mut names = Vec::new();
+    if let Some(blocks) = content.as_array() {
+        for b in blocks {
+            if b.get("type").and_then(|t| t.as_str()) != Some("toolCall") {
+                continue;
+            }
+            if let Some(n) = b.get("name").and_then(|x| x.as_str()) {
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Latest `n` turns as (role, single-line text), oldest first, for the detail
+/// pane. Skips slash commands, empty content, and framed cross-agent
+/// deliveries. A textless assistant turn (pure tool calls) collapses to
+/// `used tool:<names>` instead of vanishing; consecutive duplicates from
+/// parallel batches collapse (`used tool:edit ×2`).
+pub fn recent_messages(path: &Path, n: usize) -> Vec<(String, String)> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push = |role: &str, text: String| {
+        let one = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let one = one.trim().to_string();
+        if one.is_empty() || one.starts_with('/') || is_framed_delivery(&one) {
+            return;
+        }
+        let one = if one.chars().count() > 300 {
+            let mut s: String = one.chars().take(299).collect();
+            s.push('…');
+            s
+        } else {
+            one
+        };
+        if role == "assistant" && one.starts_with("used tool:") {
+            if let Some((lr, lt)) = out.last_mut() {
+                let tag = format!("{} \u{d7}", one);
+                if lr == "assistant" && (*lt == one || lt.starts_with(&tag)) {
+                    let n = lt
+                        .strip_prefix(&tag)
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .map(|x| x + 1)
+                        .unwrap_or(2);
+                    *lt = format!("{} \u{d7}{}", one, n);
+                    return;
+                }
+            }
+        }
+        out.push((role.to_string(), one));
+        while out.len() > n {
+            out.remove(0);
+        }
+    };
+    for line in raw.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("message") {
+            continue;
+        }
+        let Some(msg) = v.get("message") else {
+            continue;
+        };
+        let content = msg.get("content").unwrap_or(&serde_json::Value::Null);
+        match msg.get("role").and_then(|r| r.as_str()).unwrap_or("") {
+            "user" => {
+                if let Some(t) = join_text_blocks(content) {
+                    push("user", t);
+                }
+            }
+            "assistant" => {
+                let text = join_text_blocks(content)
+                    .filter(|t| !t.trim().is_empty())
+                    .or_else(|| {
+                        let names = tool_names(content);
+                        (!names.is_empty()).then(|| format!("used tool:{}", names.join(", ")))
+                    });
+                if let Some(t) = text {
+                    push("assistant", t);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

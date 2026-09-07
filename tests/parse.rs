@@ -1,4 +1,4 @@
-use psst::scan::parse_file;
+use psst::scan::{parse_file, recent_messages};
 use std::io::Write;
 
 /// Synthetic session file built from the documented v3 format
@@ -91,5 +91,32 @@ fn skips_malformed_lines() {
     assert_eq!(meta.cwd, "/tmp/proj-c");
     assert_eq!(meta.first_prompt.as_deref(), Some("still works"));
     assert_eq!(meta.messages, 1);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn recent_messages_skips_commands_and_names_tools() {
+    let path = fixture(
+        "recent.jsonl",
+        &[
+            r#"{"type":"session","version":3,"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","timestamp":"2025-06-04T09:00:00.000Z","cwd":"/tmp/proj-d"}"#,
+            r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2025-06-04T09:00:01.000Z","message":{"role":"user","content":"first question"}}"#,
+            r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2025-06-04T09:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"first answer"}],"timestamp":0}}"#,
+            r#"{"type":"message","id":"u2","parentId":"a1","timestamp":"2025-06-04T09:00:03.000Z","message":{"role":"user","content":"/name foo"}}"#,
+            r#"{"type":"message","id":"a2","parentId":"u2","timestamp":"2025-06-04T09:00:04.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{}}],"timestamp":0}}"#,
+            r#"{"type":"message","id":"a2b","parentId":"a2","timestamp":"2025-06-04T09:00:04.500Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c2","name":"bash","arguments":{}}],"timestamp":0}}"#,
+            r#"{"type":"message","id":"u3","parentId":"a2b","timestamp":"2025-06-04T09:00:05.000Z","message":{"role":"user","content":"latest question"}}"#,
+        ],
+    );
+    let got = recent_messages(&path, 6);
+    assert_eq!(
+        got,
+        vec![
+            ("user".to_string(), "first question".to_string()),
+            ("assistant".to_string(), "first answer".to_string()),
+            ("assistant".to_string(), "used tool:bash ×2".to_string()),
+            ("user".to_string(), "latest question".to_string()),
+        ]
+    );
     std::fs::remove_file(&path).ok();
 }
