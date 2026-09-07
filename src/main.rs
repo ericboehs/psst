@@ -47,7 +47,7 @@ fn parse_args() -> Result<Args> {
                      --json            JSON array (implies list)\n\
                      --refresh         rebuild the metadata cache\n\
                      --debug-running   dump detected pi processes\n\n\
-                     no flags opens the TUI. keys: /=search f=filter g=group s=sort d=detail p=prompts j/k J/K=group enter=open q=quit\n\
+                     no flags opens the TUI. /=search, ?=keys, enter=open\n\
                      config: ~/.config/psst/config.toml"
                 );
                 std::process::exit(0);

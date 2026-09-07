@@ -59,7 +59,7 @@ pub struct RunningHit {
     pub peer_name: Option<String>,
 }
 
-/// Row glyph: ○ idle, ◎ waiting (looked at), ● waiting unread / working.
+/// Row glyph: ○ exited, ◎ waiting (looked at), ● waiting unread / working.
 ///
 /// JetBrains Mono Nerd Font has no ◐ (U+25D0); the terminal would fall back
 /// to another font and the column would not line up. ●/◎/○ all exist in JBM
@@ -67,7 +67,7 @@ pub struct RunningHit {
 /// working (tmux `@special_activity` until the pane is focused).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveMark {
-    Idle,
+    Exited,
     Waiting,
     Unread,
     Prompt,
@@ -77,7 +77,7 @@ pub enum LiveMark {
 impl LiveMark {
     pub fn glyph(self) -> &'static str {
         match self {
-            LiveMark::Idle => "○",
+            LiveMark::Exited => "○",
             LiveMark::Waiting => "◎",
             LiveMark::Unread | LiveMark::Prompt | LiveMark::Working => "●",
         }
@@ -85,7 +85,7 @@ impl LiveMark {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            LiveMark::Idle => "idle",
+            LiveMark::Exited => "exited",
             LiveMark::Waiting => "waiting",
             LiveMark::Unread => "unread",
             LiveMark::Prompt => "prompt",
@@ -102,7 +102,7 @@ fn is_prompt_status(st: &str) -> bool {
 /// tmux `@special_activity` → unread; otherwise waiting on you.
 pub fn live_mark(hit: Option<&RunningHit>) -> LiveMark {
     match hit {
-        None => LiveMark::Idle,
+        None => LiveMark::Exited,
         Some(h) => {
             let st = h.status.as_deref().unwrap_or("");
             if is_prompt_status(st) {
@@ -689,7 +689,7 @@ mod tests {
 
     #[test]
     fn live_mark_from_status() {
-        assert_eq!(live_mark(None), LiveMark::Idle);
+        assert_eq!(live_mark(None), LiveMark::Exited);
         let idle = RunningHit {
             pid: 1,
             tmux: None,

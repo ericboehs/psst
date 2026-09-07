@@ -9,12 +9,12 @@ use serde::{Deserialize, Serialize};
 use ratatui::{
     Frame,
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Layout},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -145,6 +145,13 @@ pub struct App {
     pub cwd_scope: Option<PathBuf>,
     /// Restored once after the first refresh from ui-state.json.
     pending_sel: Option<PathBuf>,
+    /// Collapsed group keys (project cwd, or day label). h/l toggles.
+    pub collapsed: HashSet<String>,
+    /// Parked-on header key: j/k stop on headers, Enter toggles the fold.
+    /// Not persisted; cleared whenever the selection lands on a session.
+    header_park: Option<String>,
+    /// ? help overlay.
+    pub show_help: bool,
     /// Detail pane messages: (path, mtime, turns). Recomputed when the
     /// selection moves or the file grows.
     recent_cache: Option<(PathBuf, i64, Vec<(String, String)>)>,
@@ -154,6 +161,15 @@ pub struct App {
 struct Item {
     session: Option<usize>,
     lines: Vec<Line<'static>>,
+    /// Group key for headers (project cwd / day label); lets a parked
+    /// header highlight.
+    group_key: Option<String>,
+}
+
+/// One navigable row: a header, or a member (position in `order`).
+enum Row {
+    Header { key: String, first: usize },
+    Member(usize),
 }
 
 fn now() -> i64 {
@@ -205,6 +221,11 @@ fn project_base(cwd: &str) -> String {
     c.rsplit('/').next().unwrap_or(c).to_string()
 }
 
+/// Status-friendly group name: project basename, day label as-is.
+fn short_group(key: &str) -> String {
+    project_base(key)
+}
+
 impl App {
     pub fn new(sessions: Vec<SessionMeta>, config: Config, cwd_scope: Option<PathBuf>) -> App {
         let mut app = App {
@@ -227,6 +248,9 @@ impl App {
             cwd_scope,
             pending_sel: None,
             recent_cache: None,
+            collapsed: HashSet::new(),
+            header_park: None,
+            show_help: false,
             config,
         };
         app.load_ui_state();
@@ -314,6 +338,7 @@ impl App {
         self.show_prompts = st.show_prompts;
         self.detail = st.detail;
         self.pending_sel = st.selected.map(PathBuf::from);
+        self.collapsed = st.collapsed.into_iter().collect();
     }
 
     pub fn save_ui_state(&self) {
@@ -330,6 +355,7 @@ impl App {
             show_prompts: self.show_prompts,
             detail: self.detail,
             selected,
+            collapsed: self.collapsed.iter().cloned().collect(),
         };
         let p = ui_state_path();
         if let Some(dir) = p.parent() {
@@ -439,22 +465,120 @@ impl App {
         self.order.get(self.sel).map(|&i| &self.sessions[i])
     }
 
+    /// j/k walk visual rows: every header is a stop, folded groups show
+    /// header only. Parking on a header sets header_park (Enter toggles).
     fn move_sel(&mut self, delta: i32) {
-        if self.order.is_empty() {
+        let rows = self.visual_rows();
+        if rows.is_empty() {
             return;
         }
-        let cur = self.sel as i32 + delta;
-        self.sel = cur.clamp(0, self.order.len() as i32 - 1) as usize;
+        let cur = rows.iter().position(|r| match (r, &self.header_park) {
+            (Row::Header { key, .. }, Some(park)) => key == park,
+            (Row::Member(pos), None) => *pos == self.sel,
+            _ => false,
+        });
+        // Stale park (group filtered out) or hidden sel: resync from sel.
+        let cur = cur.or_else(|| {
+            self.header_park = None;
+            rows.iter().position(|r| matches!(r, Row::Member(pos) if *pos == self.sel))
+        });
+        let next = match cur {
+            Some(c) => (c as i32 + delta).clamp(0, rows.len() as i32 - 1) as usize,
+            None => {
+                if delta > 0 {
+                    0
+                } else {
+                    rows.len() - 1
+                }
+            }
+        };
+        match &rows[next] {
+            Row::Header { key, first } => {
+                self.header_park = Some(key.clone());
+                self.sel = *first;
+            }
+            Row::Member(pos) => {
+                self.header_park = None;
+                self.sel = *pos;
+            }
+        }
+    }
+
+    /// Bucket key of session `i` under the current grouping (empty when flat).
+    fn group_label(&self, i: usize) -> String {
+        match self.group {
+            Group::Flat => String::new(),
+            Group::Project => self.sessions[i].cwd.clone(),
+            Group::Day => {
+                let today = chrono::Local::now().date_naive();
+                let ts = self.sessions[i].last_user_or_activity();
+                let date = chrono::DateTime::from_timestamp(ts, 0)
+                    .unwrap_or_default()
+                    .with_timezone(&chrono::Local)
+                    .date_naive();
+                day_label(date, today)
+            }
+        }
+    }
+
+    /// h: fold the selected group and park on its header.
+    /// Ok(key) when something folded.
+    fn collapse_current(&mut self) -> Option<String> {
+        if self.group == Group::Flat || self.order.is_empty() {
+            return None;
+        }
+        let key = self.group_label(self.order[self.sel]);
+        if self.collapsed.insert(key.clone()) {
+            self.header_park = Some(key.clone());
+            Some(key)
+        } else {
+            None
+        }
+    }
+
+    /// l: unfold the selected group. True when something unfolded.
+    fn expand_current(&mut self) -> bool {
+        if self.group == Group::Flat || self.order.is_empty() {
+            return false;
+        }
+        let key = self.group_label(self.order[self.sel]);
+        self.collapsed.remove(&key)
+    }
+
+    /// H: fold every group and park on the selected one.
+    /// Returns group count (0 when flat).
+    fn collapse_all(&mut self) -> usize {
+        if self.group == Group::Flat || self.order.is_empty() {
+            return 0;
+        }
+        let mut keys = HashSet::new();
+        for &i in &self.order {
+            keys.insert(self.group_label(i));
+        }
+        let n = keys.len();
+        self.collapsed = keys;
+        self.header_park = Some(self.group_label(self.order[self.sel]));
+        n
+    }
+
+    /// L: unfold everything. Returns how many were folded.
+    fn expand_all(&mut self) -> usize {
+        let n = self.collapsed.len();
+        self.collapsed.clear();
+        n
     }
 
     /// Positions in `order` of the first session in each visual group.
-    fn group_starts(&self) -> Vec<usize> {
+    /// Groups in display order: (key, order-positions). Members keep the
+    /// active sort's sequence. Shared by rendering and keyboard navigation.
+    fn groups_in_order(&self) -> Vec<(String, Vec<usize>)> {
         if self.order.is_empty() {
             return Vec::new();
         }
         match self.group {
-            Group::Flat => vec![0],
+            Group::Flat => vec![(String::new(), (0..self.order.len()).collect())],
             Group::Project => {
+                // bucket by cwd; groups ordered by most recent activity.
                 let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
                 for (pos, &i) in self.order.iter().enumerate() {
                     buckets
@@ -471,9 +595,11 @@ impl App {
                             .unwrap_or(0),
                     )
                 });
-                groups.into_iter().filter_map(|(_, v)| v.first().copied()).collect()
+                groups
             }
             Group::Day => {
+                // bucket by local date of last activity; newest day first
+                let today = chrono::Local::now().date_naive();
                 let mut buckets: HashMap<chrono::NaiveDate, Vec<usize>> = HashMap::new();
                 for (pos, &i) in self.order.iter().enumerate() {
                     let ts = self.sessions[i].last_user_or_activity();
@@ -487,28 +613,67 @@ impl App {
                 dates.sort_by(|a, b| b.cmp(a));
                 dates
                     .into_iter()
-                    .filter_map(|d| buckets.get(&d).and_then(|v| v.first().copied()))
+                    .map(|d| {
+                        (
+                            day_label(d, today),
+                            buckets.remove(&d).unwrap_or_default(),
+                        )
+                    })
                     .collect()
             }
         }
     }
 
-    /// J / K: next / previous group. K from mid-group snaps to that group's first row.
+    /// Visual rows for j/k: every header is a stop, folded groups show
+    /// header only. Positions index `order`.
+    fn visual_rows(&self) -> Vec<Row> {
+        if self.group == Group::Flat {
+            return (0..self.order.len()).map(Row::Member).collect();
+        }
+        let mut rows = Vec::new();
+        for (key, members) in self.groups_in_order() {
+            let first = members.first().copied().unwrap_or(0);
+            let folded = self.collapsed.contains(&key);
+            rows.push(Row::Header { key, first });
+            if !folded {
+                rows.extend(members.into_iter().map(Row::Member));
+            }
+        }
+        rows
+    }
+
+    /// J / K jump between headers. K from a member snaps to its own
+    /// header first (row kept); K from a header goes to the previous one.
     fn move_group(&mut self, dir: i32) {
-        let starts = self.group_starts();
-        if starts.is_empty() {
+        if self.group == Group::Flat || self.order.is_empty() {
             return;
         }
-        let gi = starts.iter().rposition(|&st| st <= self.sel).unwrap_or(0);
-        if dir < 0 && starts[gi] < self.sel {
-            self.sel = starts[gi];
+        let groups = self.groups_in_order();
+        if groups.is_empty() {
             return;
         }
-        let next = gi as i32 + dir;
-        if next < 0 || next >= starts.len() as i32 {
+        let cur = match self.header_park.clone() {
+            Some(k) => groups.iter().position(|(key, _)| key == &k),
+            None => groups.iter().position(|(_, v)| v.contains(&self.sel)),
+        };
+        let next = match (cur, dir) {
+            (Some(g), d) if d > 0 => g as i32 + 1,
+            (Some(g), _) if self.header_park.is_some() => g as i32 - 1,
+            (Some(g), _) => g as i32,
+            (None, d) if d > 0 => 0,
+            (None, _) => return,
+        };
+        if next < 0 || (next as usize) >= groups.len() {
             return;
         }
-        self.sel = starts[next as usize];
+        let (key, members) = &groups[next as usize];
+        self.header_park = Some(key.clone());
+        // K-snapping to the current group keeps the row; jumps take the head.
+        if Some(next as usize) != cur {
+            if let Some(&first) = members.first() {
+                self.sel = first;
+            }
+        }
     }
 
     /// Build the open action for the selected session.
@@ -552,7 +717,7 @@ impl App {
                 Span::styled("● ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
             }
             LiveMark::Waiting => Span::styled("◎ ", Style::default().fg(Color::Cyan)),
-            LiveMark::Idle => Span::styled("○ ", Style::default().fg(Color::DarkGray)),
+            LiveMark::Exited => Span::styled("○ ", Style::default().fg(Color::DarkGray)),
         };
         let fork = if s.parent_session.is_some() {
             Span::styled("⎇ ", Style::default().fg(Color::Yellow))
@@ -626,49 +791,14 @@ impl App {
                     items.push(Item {
                         session: Some(i),
                         lines: self.member_lines(i, w),
+                        group_key: None,
                     });
                 }
             }
-            Group::Project => {
-                // bucket by cwd; groups ordered by most recent activity.
-                // Members keep `order` sequence (i.e. the active sort).
-                let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
-                for &i in &self.order {
-                    buckets
-                        .entry(self.sessions[i].cwd.clone())
-                        .or_default()
-                        .push(i);
-                }
-                let mut groups: Vec<(String, Vec<usize>)> = buckets.into_iter().collect();
-                groups.sort_by_key(|(_, v)| {
-                    std::cmp::Reverse(
-                        v.iter()
-                            .map(|&i| self.sessions[i].last_user_or_activity())
-                            .max()
-                            .unwrap_or(0),
-                    )
-                });
-                for (label, members) in groups {
-                    self.push_group(&mut items, label, members, w);
-                }
-            }
-            Group::Day => {
-                // bucket by local date of last activity; newest day first
-                let today = chrono::Local::now().date_naive();
-                let mut buckets: HashMap<chrono::NaiveDate, Vec<usize>> = HashMap::new();
-                for &i in &self.order {
-                    let ts = self.sessions[i].last_user_or_activity();
-                    let date = chrono::DateTime::from_timestamp(ts, 0)
-                        .unwrap_or_default()
-                        .with_timezone(&chrono::Local)
-                        .date_naive();
-                    buckets.entry(date).or_default().push(i);
-                }
-                let mut dates: Vec<chrono::NaiveDate> = buckets.keys().copied().collect();
-                dates.sort_by(|a, b| b.cmp(a));
-                for date in dates {
-                    let members = buckets.remove(&date).unwrap_or_default();
-                    let label = day_label(date, today);
+            Group::Project | Group::Day => {
+                for (label, positions) in self.groups_in_order() {
+                    let members: Vec<usize> =
+                        positions.iter().map(|&pos| self.order[pos]).collect();
                     self.push_group(&mut items, label, members, w);
                 }
             }
@@ -683,8 +813,10 @@ impl App {
             .map(|&i| self.sessions[i].last_user_or_activity())
             .max()
             .unwrap_or(0);
+        let folded = self.collapsed.contains(&label);
         let header = format!(
-            "▾ {}  {} sessions · last {}",
+            "{} {}  {} sessions · last {}",
+            if folded { "▸" } else { "▾" },
             trunc(&label, (w / 2).max(30)),
             members.len(),
             fmt_age(now() - newest)
@@ -695,11 +827,16 @@ impl App {
                 header,
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ))],
+            group_key: Some(label),
         });
+        if folded {
+            return;
+        }
         for i in members {
             items.push(Item {
                 session: Some(i),
                 lines: self.member_lines(i, w),
+                group_key: None,
             });
         }
     }
@@ -771,7 +908,7 @@ fn detail_lines(
                 LiveMark::Prompt => (Color::Red, true),
                 LiveMark::Unread => (Color::Cyan, true),
                 LiveMark::Waiting => (Color::Cyan, false),
-                LiveMark::Idle => (Color::DarkGray, false),
+                LiveMark::Exited => (Color::DarkGray, false),
             };
             let mut glyph = Style::default().fg(color);
             if emphasis {
@@ -792,7 +929,7 @@ fn detail_lines(
         }
         None => v.push(Line::from(vec![
             Span::styled("state:   ", dim),
-            Span::styled("○ idle", dim),
+            Span::styled("○ exited", dim),
         ])),
     }
     if !recent.is_empty() {
@@ -839,7 +976,7 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
             }
             LiveMark::Unread => attention += 1,
             LiveMark::Waiting => idle += 1,
-            LiveMark::Idle => {}
+            LiveMark::Exited => {}
         }
     }
     let mut header_spans = vec![
@@ -900,11 +1037,20 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
     }
     f.render_widget(Paragraph::new(Line::from(header_spans)), header);
 
-    let slash = if app.search_focus {
-        Span::styled("/", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+    if !app.search_focus && app.filter.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "/ to search",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            filterbar,
+        );
     } else {
-        Span::styled("/", Style::default().fg(Color::DarkGray))
-    };
+        let slash = if app.search_focus {
+            Span::styled("/", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled("/", Style::default().fg(Color::DarkGray))
+        };
     let query = if app.search_focus {
         Span::styled(
             format!("{}▏", app.filter),
@@ -925,24 +1071,27 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
         ),
     ];
     f.render_widget(Paragraph::new(Line::from(filter_spans)), filterbar);
+    }
 
     let target = app.order.get(app.sel).copied();
+    let parked = app.header_park.clone();
     let list_items: Vec<ListItem> = items
         .iter()
         .map(|it| {
-            let selected = it.session.is_some() && it.session == target;
+            let selected = match it.session {
+                Some(_) => it.session == target && parked.is_none(),
+                None => parked
+                    .as_deref()
+                    .is_some_and(|k| it.group_key.as_deref() == Some(k)),
+            };
             ListItem::new(Text::from(if selected {
-                highlight_row(&it.lines)
+                highlight_row(&it.lines, it.session.is_none())
             } else {
                 it.lines.clone()
             }))
         })
         .collect();
-    let list = List::new(list_items).block(if app.detail {
-        Block::new().borders(Borders::BOTTOM)
-    } else {
-        Block::new()
-    });
+    let list = List::new(list_items).block(Block::new());
 
     if app.detail {
         let [list_area, detail_area] = Layout::vertical([
@@ -959,7 +1108,8 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
                 .block(
                     Block::new()
                         .borders(Borders::TOP)
-                        .title(" detail ")
+                        .title(" details ")
+                        .title_alignment(Alignment::Center)
                         .title_style(Style::default().fg(Color::Cyan)),
                 );
             f.render_widget(detail, detail_area);
@@ -968,8 +1118,21 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
         f.render_stateful_widget(list, body, list_state);
     }
 
+    if app.show_help {
+        let lines = help_lines();
+        let area = centered(body, 46, lines.len() as u16 + 2);
+        let help = Paragraph::new(lines).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" keys ")
+                .title_style(Style::default().fg(Color::Cyan)),
+        );
+        f.render_widget(Clear, area);
+        f.render_widget(help, area);
+    }
+
     let mut footer_spans = vec![Span::styled(
-        " /=search  f=filter g=group s=sort d=detail p=prompts  j/k J/K=group  enter=open r=rescan esc q",
+        " / to search · ? keys · enter=open · q quit",
         Style::default().fg(Color::DarkGray),
     )];
     if !app.status.is_empty() {
@@ -1008,6 +1171,16 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                if app.show_help {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+                        (KeyCode::Char('?'), _)
+                        | (KeyCode::Esc, _)
+                        | (KeyCode::Char('q'), _) => app.show_help = false,
+                        _ => {}
+                    }
+                    continue;
+                }
                 // Global: Esc, arrows, tab, ctrl chords work in both modes.
                 match (key.code, key.modifiers) {
                     (KeyCode::Esc, _) => {
@@ -1029,7 +1202,10 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                     (KeyCode::PageUp, _) => app.move_sel(-10),
                     (KeyCode::Home, _) => app.sel = 0,
                     (KeyCode::End, _) => app.sel = app.order.len().saturating_sub(1),
-                    (KeyCode::Tab, _) => app.group = app.group.next(),
+                    (KeyCode::Tab, _) => {
+                        app.group = app.group.next();
+                        app.header_park = None;
+                    }
                     (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                         app.sort = app.sort.next();
                         app.apply_filter_sort();
@@ -1045,13 +1221,30 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                             "prompts hidden".into()
                         };
                     }
-                    (KeyCode::Enter, _) => match app.open_selected() {
-                        Some(a) => {
-                            result = Some(a);
-                            break;
+                    (KeyCode::Enter, _) => {
+                        let header_key = list_state
+                            .selected()
+                            .and_then(|pos| items.get(pos))
+                            .filter(|it| it.session.is_none())
+                            .and_then(|it| it.group_key.clone());
+                        match header_key {
+                            Some(k) => {
+                                if app.collapsed.remove(&k) {
+                                    app.status = "unfolded".into();
+                                } else {
+                                    app.collapsed.insert(k.clone());
+                                    app.status = format!("folded {}", short_group(&k));
+                                }
+                            }
+                            None => match app.open_selected() {
+                                Some(a) => {
+                                    result = Some(a);
+                                    break;
+                                }
+                                None => app.status = "nothing selected".into(),
+                            },
                         }
-                        None => app.status = "nothing selected".into(),
-                    },
+                    }
                     (KeyCode::Char('/'), m) if m == KeyModifiers::NONE && !app.search_focus => {
                         app.search_focus = true;
                     }
@@ -1070,6 +1263,7 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                         _ => {}
                     },
                     (KeyCode::Char('q'), _) => break,
+                    (KeyCode::Char('?'), _) => app.show_help = !app.show_help,
                     (KeyCode::Char('f'), _) => {
                         app.view_filter = app.view_filter.next();
                         app.apply_filter_sort();
@@ -1077,6 +1271,8 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                     }
                     (KeyCode::Char('g'), _) => {
                         app.group = app.group.next();
+                        // parked headers belong to the old grouping
+                        app.header_park = None;
                         app.status = format!("group:{}", app.group.label());
                     }
                     (KeyCode::Char('s'), _) => {
@@ -1101,6 +1297,41 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                     (KeyCode::Char('k'), KeyModifiers::SHIFT) => app.move_group(-1),
                     (KeyCode::Char('j'), _) => app.move_sel(1),
                     (KeyCode::Char('k'), _) => app.move_sel(-1),
+                    (KeyCode::Char('h'), _) => match app.collapse_current() {
+                        Some(key) => app.status = format!("folded {}", short_group(&key)),
+                        None => {
+                            app.status = if app.group == Group::Flat {
+                                "nothing to fold (flat)".into()
+                            } else {
+                                "already folded".into()
+                            }
+                        }
+                    },
+                    (KeyCode::Char('l'), _) => {
+                        app.status = if app.group == Group::Flat {
+                            "nothing to fold (flat)".into()
+                        } else if app.expand_current() {
+                            "unfolded".into()
+                        } else {
+                            "already unfolded".into()
+                        }
+                    }
+                    (KeyCode::Char('H'), _) => {
+                        let n = app.collapse_all();
+                        app.status = if app.group == Group::Flat {
+                            "nothing to fold (flat)".into()
+                        } else {
+                            format!("folded {} groups", n)
+                        }
+                    }
+                    (KeyCode::Char('L'), _) => {
+                        let n = app.expand_all();
+                        app.status = if n > 0 {
+                            format!("unfolded {} groups", n)
+                        } else {
+                            "nothing folded".into()
+                        }
+                    }
                     (KeyCode::Char('r'), _) => {
                         app.refresh(false);
                         app.status = "rescanned".into();
@@ -1137,6 +1368,8 @@ struct UiState {
     #[serde(default)]
     detail: bool,
     selected: Option<String>,
+    #[serde(default)]
+    collapsed: Vec<String>,
 }
 
 fn ui_state_path() -> PathBuf {
@@ -1145,7 +1378,8 @@ fn ui_state_path() -> PathBuf {
 }
 
 /// Reverse-video the row except the status glyph, which keeps its own color.
-fn highlight_row(lines: &[Line<'static>]) -> Vec<Line<'static>> {
+/// Headers (no glyph) reverse fully so a parked selection still reads.
+fn highlight_row(lines: &[Line<'static>], full: bool) -> Vec<Line<'static>> {
     lines
         .iter()
         .enumerate()
@@ -1155,9 +1389,7 @@ fn highlight_row(lines: &[Line<'static>]) -> Vec<Line<'static>> {
                     .iter()
                     .enumerate()
                     .map(|(si, sp)| {
-                        // Keep the status glyph's own color; reverse everything else,
-                        // including the prompt subtitle.
-                        if li == 0 && si == 0 {
+                        if !full && li == 0 && si == 0 {
                             sp.clone()
                         } else {
                             sp.clone().patch_style(
@@ -1172,18 +1404,87 @@ fn highlight_row(lines: &[Line<'static>]) -> Vec<Line<'static>> {
 }
 
 /// Keep the ListState's selected item aligned with app.sel (which indexes `order`).
-fn sync_selection(items: &[Item], app: &App, state: &mut ListState) {
+fn sync_selection(items: &[Item], app: &mut App, state: &mut ListState) {
+    // Parked on a header: highlight it, clearing a stale park.
+    if let Some(park) = app.header_park.clone() {
+        for (item_pos, item) in items.iter().enumerate() {
+            if item.group_key.as_deref() == Some(park.as_str()) {
+                state.select(Some(item_pos));
+                return;
+            }
+        }
+        app.header_park = None;
+    }
     let target_session = app.order.get(app.sel).copied();
-    let mut found = 0usize;
     for (item_pos, item) in items.iter().enumerate() {
-        if let Some(si) = item.session {
-            if Some(si) == target_session {
-                found = item_pos;
-                break;
+        if item.session.is_some() && item.session == target_session {
+            state.select(Some(item_pos));
+            return;
+        }
+    }
+    // Selection landed inside a folded group (filter narrowed the list):
+    // park on its header instead of jumping to the top.
+    if let Some(t) = target_session {
+        if t < app.sessions.len() {
+            let key = app.group_label(t);
+            if app.collapsed.contains(&key) {
+                app.header_park = Some(key.clone());
+                for (item_pos, item) in items.iter().enumerate() {
+                    if item.group_key.as_deref() == Some(key.as_str()) {
+                        state.select(Some(item_pos));
+                        return;
+                    }
+                }
+                app.header_park = None;
             }
         }
     }
-    state.select(Some(found));
+    state.select(Some(0));
+}
+
+/// Centered rect of (w, h) inside `r` for the help overlay.
+fn centered(r: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(r.width);
+    let h = h.min(r.height);
+    Rect::new(
+        r.x + r.width.saturating_sub(w) / 2,
+        r.y + r.height.saturating_sub(h) / 2,
+        w,
+        h,
+    )
+}
+
+fn help_lines() -> Vec<Line<'static>> {
+    let key = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    let row = |k: &str, d: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!("  {:<12}", k), key),
+            Span::raw(d.to_string()),
+        ])
+    };
+    vec![
+        row("/", "search (type anything, Esc unfocuses)"),
+        row("f", "filter: all → named → active"),
+        row("g / Tab", "group: flat → project → day"),
+        row("s", "sort: activity → tmux"),
+        row("j / k", "move"),
+        row("J / K", "next / previous group"),
+        row("h / l", "fold / unfold group"),
+        row("H / L", "fold / unfold all groups"),
+        row("d", "detail pane"),
+        row("p", "last-prompt subtitles"),
+        row("r / R", "rescan / full rescan"),
+        row("enter", "open in tmux"),
+        row("esc", "clear filter / close / quit"),
+        row("q", "quit"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  ? / esc closes",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]
 }
 
 /// Human label for a day bucket, relative to `today`.
@@ -1217,5 +1518,218 @@ mod tests {
             day_label(chrono::NaiveDate::from_ymd_opt(2025, 1, 5).unwrap(), today),
             "Sun Jan 5 2025"
         );
+    }
+
+    fn fake_session(name: &str, cwd: &str, ts: i64) -> SessionMeta {
+        SessionMeta {
+            path: PathBuf::from(format!("/tmp/{}.jsonl", name)),
+            id: name.to_string(),
+            cwd: cwd.to_string(),
+            created: Some(ts),
+            last_activity: Some(ts),
+            last_user: Some(ts),
+            name: Some(name.to_string()),
+            first_prompt: None,
+            last_prompt: None,
+            model: None,
+            cost_total: 0.0,
+            tokens_in: 0,
+            tokens_out: 0,
+            messages: 1,
+            branches: 0,
+            parent_session: None,
+            mtime: ts,
+            size: 100,
+        }
+    }
+
+    fn fold_app() -> App {
+        App {
+            sessions: vec![
+                fake_session("a1", "/proj/a", 1000),
+                fake_session("a2", "/proj/a", 2000),
+                fake_session("b1", "/proj/b", 1500),
+                fake_session("c1", "/proj/c", 1200),
+            ],
+            running: HashMap::new(),
+            order: Vec::new(),
+            sel: 0,
+            filter: String::new(),
+            group: Group::Project,
+            sort: Sort::Activity,
+            config: Config::default(),
+            status: String::new(),
+            detail: false,
+            show_prompts: false,
+            search_focus: false,
+            view_filter: ViewFilter::All,
+            cwd_scope: None,
+            pending_sel: None,
+            recent_cache: None,
+            collapsed: HashSet::new(),
+            header_park: None,
+            show_help: false,
+        }
+    }
+
+    fn visible_members(app: &App) -> usize {
+        app.build_items(100)
+            .iter()
+            .filter(|it| it.session.is_some())
+            .count()
+    }
+
+    #[test]
+    fn filter_cycles_all_named_active() {
+        let mut f = ViewFilter::All;
+        f = f.next();
+        assert_eq!(f, ViewFilter::Named);
+        f = f.next();
+        assert_eq!(f, ViewFilter::Active);
+        f = f.next();
+        assert_eq!(f, ViewFilter::All);
+        // the dropped tmux filter reads back as nothing (old state -> All)
+        assert_eq!(ViewFilter::from_label("tmux"), None);
+    }
+
+    #[test]
+    fn fold_current_hides_members_and_moves_selection() {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        // activity desc: a2(2000), b1(1500), c1(1200), a1(1000)
+        assert_eq!(visible_members(&app), 4);
+        assert_eq!(app.collapse_current().as_deref(), Some("/proj/a"));
+        // folding parks on the header
+        assert_eq!(app.header_park.as_deref(), Some("/proj/a"));
+        assert_eq!(visible_members(&app), 2);
+        // header flips to the folded arrow
+        let items = app.build_items(100);
+        assert!(items[0].lines[0]
+            .spans
+            .iter()
+            .any(|sp| sp.content.contains('\u{25b8}')));
+        // j walks rows: next header, member, header, parked tail
+        app.move_sel(1);
+        assert_eq!(app.header_park.as_deref(), Some("/proj/b"));
+        assert_eq!(app.order[app.sel], 2);
+        app.move_sel(1);
+        assert_eq!(app.header_park, None);
+        assert_eq!(app.order[app.sel], 2);
+        app.move_sel(1);
+        assert_eq!(app.header_park.as_deref(), Some("/proj/c"));
+        // k walks back; headers stop both ways
+        app.move_sel(-1);
+        assert_eq!(app.header_park, None);
+        assert_eq!(app.order[app.sel], 2);
+        app.move_sel(-1);
+        assert_eq!(app.header_park.as_deref(), Some("/proj/b"));
+        // unfold from the parked spot, twice is a no-op
+        app.sel = 0;
+        assert!(app.expand_current());
+        assert!(!app.expand_current());
+        assert_eq!(visible_members(&app), 4);
+    }
+
+    #[test]
+    fn fold_all_and_unfold_all() {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        assert_eq!(app.collapse_all(), 3);
+        assert_eq!(visible_members(&app), 0);
+        // headers still render, one per group
+        assert_eq!(app.build_items(100).len(), 3);
+        assert_eq!(app.expand_all(), 3);
+        assert_eq!(app.expand_all(), 0);
+        assert_eq!(visible_members(&app), 4);
+    }
+
+    #[test]
+    fn group_jump_lands_on_headers() {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        // order a2(0), b1(1), c1(2), a1(3); display groups A, B, C
+        app.move_group(1);
+        assert_eq!(app.header_park.as_deref(), Some("/proj/b"));
+        assert_eq!(app.sel, 1);
+        app.move_group(1);
+        assert_eq!(app.header_park.as_deref(), Some("/proj/c"));
+        assert_eq!(app.sel, 2);
+        // K steps back a header at a time
+        app.move_group(-1);
+        assert_eq!(app.header_park.as_deref(), Some("/proj/b"));
+        assert_eq!(app.sel, 1);
+        // K from a member snaps to its own header, keeping the row
+        app.header_park = None;
+        app.sel = 3;
+        app.move_group(-1);
+        assert_eq!(app.header_park.as_deref(), Some("/proj/a"));
+        assert_eq!(app.sel, 3);
+        // K from the first group's header goes nowhere
+        app.sel = 0;
+        app.move_group(-1);
+        assert_eq!(app.header_park.as_deref(), Some("/proj/a"));
+        assert_eq!(app.sel, 0);
+    }
+
+    #[test]
+    fn folded_header_highlights_and_carries_key() {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        app.collapse_all();
+        let items = app.build_items(100);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].group_key.as_deref(), Some("/proj/a"));
+        // sel=0 sits on a2 inside folded /proj/a: first header highlights
+        let mut state = ListState::default();
+        sync_selection(&items, &mut app, &mut state);
+        assert_eq!(state.selected(), Some(0));
+    }
+
+    #[test]
+    fn open_headers_are_stops() {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        // rows: H_a, a2, a1, H_b, b1, H_c, c1 — nothing folded
+        app.move_sel(1);
+        assert_eq!(app.order[app.sel], 0);
+        assert_eq!(app.header_park, None);
+        app.move_sel(1);
+        assert_eq!(app.header_park.as_deref(), Some("/proj/b"));
+        assert_eq!(app.order[app.sel], 2);
+        app.move_sel(1);
+        assert_eq!(app.header_park, None);
+        assert_eq!(app.order[app.sel], 2);
+    }
+
+    fn reversed(sp: &Span) -> bool {
+        sp.style.add_modifier.contains(Modifier::REVERSED)
+    }
+
+    #[test]
+    fn highlight_keeps_glyph_but_reverses_headers() {
+        let row = Line::from(vec![Span::raw("● "), Span::raw("title")]);
+        let out = highlight_row(&[row], false);
+        assert!(!reversed(&out[0].spans[0]));
+        assert!(reversed(&out[0].spans[1]));
+        let head = Line::from(Span::raw("▾ Today"));
+        let out = highlight_row(&[head], true);
+        assert!(reversed(&out[0].spans[0]));
+    }
+
+    #[test]
+    fn uistate_round_trips_collapsed() {
+        let st = UiState {
+            view_filter: "named".to_string(),
+            group: "project".to_string(),
+            sort: "activity".to_string(),
+            show_prompts: true,
+            detail: false,
+            selected: None,
+            collapsed: vec!["/proj/a".to_string()],
+        };
+        let raw = serde_json::to_string(&st).unwrap();
+        let back: UiState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.collapsed, vec!["/proj/a".to_string()]);
+        assert_eq!(back.view_filter, "named");
     }
 }

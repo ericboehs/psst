@@ -55,9 +55,12 @@ psst --debug-running  # print detected pi processes + tmux targets
 | `f` | cycle list filter: all → named → active |
 | `g` or `Tab` | cycle grouping: flat → project → day |
 | `s` or `Ctrl+S` | cycle sort: activity → tmux |
-| `↑`/`↓` or `k`/`j`, PgUp/PgDn | navigate (j/k only when search is not focused) |
+| `↑`/`↓` or `k`/`j`, PgUp/PgDn | navigate rows — group headers are stops too (j/k only when search is not focused) |
 | `J` / `K` | next / previous group (day or project; no-op when flat) |
-| `Enter` | **open**: attach to the running tmux session, or spawn `pi --session <file>` in a new tmux window |
+| `h` / `l` | fold / unfold the current group |
+| `H` / `L` | fold / unfold all groups |
+| `?` | shortcut overlay (also in the TUI footer) |
+| `Enter` | **open**: attach to the running tmux session, or spawn `pi --session <file>` in a new tmux window (on a header: toggle fold) |
 | `d` | toggle the bottom detail pane (off by default) |
 | `p` | hide/show last user prompt on a second line under each row |
 | `r` / `R` | rescan (cache-aware) / full rescan |
