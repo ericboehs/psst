@@ -23,6 +23,9 @@ pub struct SessionMeta {
     pub created: Option<i64>,
     /// Latest entry timestamp (last write to the file).
     pub last_activity: Option<i64>,
+    /// Latest user-message timestamp (when you last sent something).
+    #[serde(default)]
+    pub last_user: Option<i64>,
     /// Latest `session_info` display name (`/name`).
     pub name: Option<String>,
     /// Text of the first user message.
@@ -45,6 +48,11 @@ pub struct SessionMeta {
 }
 
 impl SessionMeta {
+    /// When you last sent a message, falling back to any activity.
+    pub fn last_user_or_activity(&self) -> i64 {
+        self.last_user.or(self.last_activity).unwrap_or(0)
+    }
+
     /// Best human title: session name, else first prompt, else file name.
     pub fn title(&self) -> String {
         if let Some(n) = &self.name {
@@ -150,6 +158,7 @@ pub fn parse_file(path: &Path) -> Result<SessionMeta> {
         cwd: String::new(),
         created: None,
         last_activity: None,
+        last_user: None,
         name: None,
         first_prompt: None,
         model: None,
@@ -207,6 +216,11 @@ pub fn parse_file(path: &Path) -> Result<SessionMeta> {
                         if meta.first_prompt.is_none() {
                             meta.first_prompt =
                                 content_text(msg.get("content").unwrap_or(&serde_json::Value::Null));
+                        }
+                        if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()).and_then(parse_epoch) {
+                            if meta.last_user.is_none() || ts > meta.last_user.unwrap_or(0) {
+                                meta.last_user = Some(ts);
+                            }
                         }
                     }
                     "assistant" => {
@@ -304,8 +318,12 @@ pub fn scan(root: &Path, force: bool) -> anyhow::Result<Vec<SessionMeta>> {
 
             if let Some(entry) = cache.0.get(&key) {
                 if entry.mtime == mtime && entry.size == size {
-                    out.push(entry.meta.clone());
-                    continue;
+                    // Reparse once after last_user was added so activity sort
+                    // isn't stuck on None until the file next changes.
+                    if entry.meta.last_user.is_some() || entry.meta.messages == 0 {
+                        out.push(entry.meta.clone());
+                        continue;
+                    }
                 }
             }
             match parse_file(&path) {

@@ -13,6 +13,8 @@
 //! [ui]
 //! # grouping on launch: "day" (default), "project", or "flat"
 //! group = "day"
+//! # show the right-hand detail pane on launch (default: false; toggle with Ctrl+D)
+//! detail = false
 //! ```
 
 use serde::Deserialize;
@@ -44,12 +46,15 @@ struct DetectCfg {
 struct UiCfg {
     #[serde(default)]
     group: Option<String>,
+    #[serde(default)]
+    detail: Option<bool>,
 }
 
 pub struct Config {
     resume_command: String,
     active_secs: i64,
     group: String,
+    detail: bool,
 }
 
 impl Default for Config {
@@ -58,6 +63,7 @@ impl Default for Config {
             resume_command: "pi --session {file}".to_string(),
             active_secs: 120,
             group: "day".to_string(),
+            detail: false,
         }
     }
 }
@@ -89,6 +95,9 @@ impl Config {
             if let Some(g) = ui.group {
                 cfg.group = g;
             }
+            if let Some(d) = ui.detail {
+                cfg.detail = d;
+            }
         }
         cfg
     }
@@ -104,5 +113,10 @@ impl Config {
     /// Launch grouping: "day" (default), "project", or "flat".
     pub fn group_default(&self) -> &str {
         &self.group
+    }
+
+    /// Whether the right-hand detail pane is shown on launch (default: false).
+    pub fn detail_default(&self) -> bool {
+        self.detail
     }
 }

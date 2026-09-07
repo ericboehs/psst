@@ -38,7 +38,7 @@ fn parse_args() -> Result<Args> {
                 println!(
                     "psst — pi session tui\n\n\
                      usage: psst [--list] [--refresh] [--debug-running]\n\n\
-                     no flags opens the TUI. keys: type=filter tab=group ^S=sort enter=open q=quit\n\
+                     no flags opens the TUI. keys: /=search a=active j/k tab=group ^S=sort ^D=detail ^P=prompts enter=open q=quit\n\
                      config: ~/.config/psst/config.toml"
                 );
                 std::process::exit(0);
@@ -51,29 +51,29 @@ fn parse_args() -> Result<Args> {
 
 fn print_list(sessions: &[SessionMeta], hits: &std::collections::HashMap<PathBuf, running::RunningHit>) {
     println!(
-        "{:<2} {:<50} {:<28} {:<18} {:>9} {:>7}",
-        "", "title", "project", "model", "cost", "age"
+        "{:<2} {:<50} {:<28} {:>7}",
+        "", "title", "project", "age"
     );
     for s in sessions {
-        let run = if sessions_running(s, hits) { "* " } else { "  " };
-        let age = s
-            .last_activity
-            .map(|a| chrono::Utc::now().timestamp() - a)
-            .unwrap_or(0);
+        let hit = hits.get(&s.path);
+        let run = if hit.is_some() { "* " } else { "  " };
+        let age = chrono::Utc::now().timestamp() - s.last_user_or_activity();
+        let title = hit
+            .and_then(|h| h.peer_name.clone())
+            .unwrap_or_else(|| s.title());
+        let summary = hit
+            .and_then(|h| h.summary.as_deref())
+            .map(|sum| format!("  {}", crate::list_helpers::trunc(sum, 50)))
+            .unwrap_or_default();
         println!(
-            "{} {:<50} {:<28} {:<18} {:>8} {:>5}",
+            "{} {:<50} {:<28} {:>5}{}",
             run,
-            crate::list_helpers::trunc(&s.title(), 48),
+            crate::list_helpers::trunc(&title, 48),
             crate::list_helpers::trunc(&project_base(&s.cwd), 26),
-            crate::list_helpers::trunc(s.model.as_deref().unwrap_or("-"), 16),
-            format!("{:.4}", s.cost_total),
             crate::list_helpers::fmt_age(age),
+            summary,
         );
     }
-}
-
-fn sessions_running(s: &SessionMeta, hits: &std::collections::HashMap<PathBuf, running::RunningHit>) -> bool {
-    hits.contains_key(&s.path)
 }
 
 fn project_base(cwd: &str) -> String {

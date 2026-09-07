@@ -8,10 +8,11 @@
 //!   3. find its tmux session/window via the inherited `TMUX_PANE` env var
 //!      (exact), falling back to walking the parent chain to a tmux pane pid,
 //!   4. pin a session file: exact when the cmdline carries `--session`;
-//!      with `-c`/`--continue` the newest session in that cwd (even if idle);
-//!      otherwise the most recently written session in that cwd within the
-//!      active window (default 120s). Parallel agents in one project claim
-//!      distinct files (newest-first).
+//!      otherwise the session whose `created` timestamp matches the process
+//!      start (a bare `pi` writes its header at launch); falling back to the
+//!      newest unclaimed session in that cwd. Idle agents at a prompt do not
+//!      write, so there is no recency gate — a live process is enough.
+//!      Parallel agents in one project claim distinct files (newest-first).
 
 use crate::scan::SessionMeta;
 use serde::Serialize;
@@ -34,6 +35,8 @@ pub struct PiProc {
     pub session_arg: Option<String>,
     /// `-c` / `--continue` on the cmdline: owns the newest session in cwd.
     pub continue_flag: bool,
+    /// Epoch seconds when the process started (`now - etime`), if known.
+    pub started_at: Option<i64>,
     /// tmux target resolved via parent chain.
     pub tmux: Option<TmuxTarget>,
 }
@@ -44,6 +47,33 @@ pub struct RunningHit {
     pub tmux: Option<TmuxTarget>,
     /// true when matched exactly via `--session`; false = cwd + recent-mtime heuristic.
     pub direct: bool,
+    /// Live activity summary from the shared agent-link cache
+    /// (~/.cache/agent-link/summaries/<pid>.json, written by pi-agent-link).
+    pub summary: Option<String>,
+    /// Cache status (idle / thinking / tool:<name>).
+    pub status: Option<String>,
+    /// Live peer name from the cache (`pi-dotfiles-2`), assigned by pi-agent-link.
+    pub peer_name: Option<String>,
+}
+
+/// Parse `ps -o etime=` (`[[dd-]hh:]mm:ss`) into elapsed seconds.
+fn parse_etime(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (days, rest) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<i64>().ok()?, r),
+        None => (0, s),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let (h, m, sec) = match parts.as_slice() {
+        [m, sec] => (0, m.parse::<i64>().ok()?, sec.parse::<i64>().ok()?),
+        [h, m, sec] => (
+            h.parse::<i64>().ok()?,
+            m.parse::<i64>().ok()?,
+            sec.parse::<i64>().ok()?,
+        ),
+        _ => return None,
+    };
+    Some(days * 86400 + h * 3600 + m * 60 + sec)
 }
 
 /// Heuristic: does this command line look like the pi coding agent?
@@ -63,23 +93,26 @@ pub fn detect() -> Vec<PiProc> {
     let mut procs = Vec::new();
 
     let ps = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,command="])
+        .args(["-axo", "pid=,ppid=,etime=,command="])
         .output();
     let ps_out = match ps {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
         _ => return procs,
     };
 
-    // pid -> (ppid, cmd)
-    let mut table: HashMap<u32, (u32, String)> = HashMap::new();
+    // pid -> (ppid, cmd, started_at)
+    let now = chrono::Utc::now().timestamp();
+    let mut table: HashMap<u32, (u32, String, Option<i64>)> = HashMap::new();
     for line in ps_out.lines() {
-        let mut it = line.trim().splitn(3, char::is_whitespace);
-        let (Some(p), Some(pp), Some(cmd)) = (it.next(), it.next(), it.next()) else {
+        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        if parts.len() < 4 {
             continue;
-        };
-        let Ok(pid) = p.trim().parse::<u32>() else { continue };
-        let Ok(ppid) = pp.trim().parse::<u32>() else { continue };
-        table.insert(pid, (ppid, cmd.trim().to_string()));
+        }
+        let Ok(pid) = parts[0].parse::<u32>() else { continue };
+        let Ok(ppid) = parts[1].parse::<u32>() else { continue };
+        let started_at = parse_etime(parts[2]).map(|secs| now - secs);
+        let cmd = parts[3..].join(" ");
+        table.insert(pid, (ppid, cmd, started_at));
     }
 
     // tmux panes: pane_pid (shell) -> target, pane_id ("%N") -> target
@@ -117,7 +150,7 @@ pub fn detect() -> Vec<PiProc> {
         }
     }
 
-    for (pid, (ppid, cmd)) in &table {
+    for (pid, (ppid, cmd, started_at)) in &table {
         if !looks_like_pi(cmd) {
             continue;
         }
@@ -134,7 +167,9 @@ pub fn detect() -> Vec<PiProc> {
                     break;
                 }
                 match table.get(&cur) {
-                    Some((next_ppid, _)) if *next_ppid != 0 && *next_ppid != cur => cur = *next_ppid,
+                    Some((next_ppid, _, _)) if *next_ppid != 0 && *next_ppid != cur => {
+                        cur = *next_ppid
+                    }
                     _ => break,
                 }
             }
@@ -162,6 +197,7 @@ pub fn detect() -> Vec<PiProc> {
             cmd: cmd.clone(),
             session_arg,
             continue_flag,
+            started_at: *started_at,
             tmux,
         });
     }
@@ -200,6 +236,185 @@ fn proc_cwd(pid: u32) -> Option<PathBuf> {
     None
 }
 
+/// Shared activity-summary cache. pi-agent-link mirrors each live pi session's
+/// name/status/summary here because psst must not read ~/.claude (guarded on
+/// this machine). Layout root must match the extension:
+/// `$XDG_CACHE_HOME/agent-link/summaries` (else `~/.cache/...`), one
+/// `<pid>.json` per session: { pid, name, cwd, status, summary, updatedAt }.
+fn summary_cache_dir() -> Option<PathBuf> {
+    if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
+        if !x.is_empty() {
+            return Some(
+                PathBuf::from(x).join("agent-link").join("summaries"),
+            );
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        PathBuf::from(home)
+            .join(".cache")
+            .join("agent-link")
+            .join("summaries"),
+    )
+}
+
+/// (summary, status) for the detected pids, from the shared activity cache.
+#[derive(Debug, Clone, PartialEq)]
+struct CacheFields {
+    name: Option<String>,
+    summary: Option<String>,
+    status: Option<String>,
+}
+
+/// Unique peer name from `~/.claude/sessions/<pid>.json` (pi-agent-link writes
+/// this even when the summary cache is missing, e.g. a session started before
+/// the cache existed).
+fn registry_peer_names(pids: &[u32]) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return out,
+    };
+    let dir = PathBuf::from(home).join(".claude").join("sessions");
+    for pid in pids {
+        let raw = match std::fs::read_to_string(dir.join(format!("{}.json", pid))) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+        if let Some(n) = v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            out.insert(*pid, n);
+        }
+    }
+    out
+}
+
+fn peer_slug(cwd: &str) -> String {
+    let base = cwd.trim_end_matches('/').rsplit('/').next().unwrap_or("pi");
+    let slug: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(32)
+        .collect();
+    format!("pi-{}", if slug.is_empty() { "pi".into() } else { slug })
+}
+
+fn first_free_name(base: &str, taken: &HashSet<String>) -> String {
+    if !taken.contains(base) {
+        return base.to_string();
+    }
+    for n in 2..=99 {
+        let candidate = format!("{}-{}", base, n);
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+    }
+    format!("{}-x", base)
+}
+
+fn fill_missing_peer_names(
+    hits: &mut HashMap<PathBuf, RunningHit>,
+    procs: &[PiProc],
+    sessions: &[SessionMeta],
+) {
+    let cwd_by_path: HashMap<&PathBuf, &str> =
+        sessions.iter().map(|s| (&s.path, s.cwd.as_str())).collect();
+    let start_by_pid: HashMap<u32, i64> = procs
+        .iter()
+        .filter_map(|p| p.started_at.map(|t| (p.pid, t)))
+        .collect();
+    let mut taken: HashSet<String> = hits
+        .values()
+        .filter_map(|h| h.peer_name.clone())
+        .collect();
+    let mut unnamed: Vec<PathBuf> = hits
+        .iter()
+        .filter(|(_, h)| h.peer_name.as_ref().map_or(true, |n| n.is_empty()))
+        .map(|(p, _)| p.clone())
+        .collect();
+    unnamed.sort_by_key(|path| {
+        hits.get(path)
+            .and_then(|h| start_by_pid.get(&h.pid).copied())
+            .unwrap_or(0)
+    });
+    for path in unnamed {
+        let cwd = cwd_by_path.get(&path).copied().unwrap_or("");
+        let name = first_free_name(&peer_slug(cwd), &taken);
+        taken.insert(name.clone());
+        if let Some(h) = hits.get_mut(&path) {
+            h.peer_name = Some(name);
+        }
+    }
+}
+
+fn summary_cache_lookup(pids: &[u32]) -> HashMap<u32, CacheFields> {
+    let mut out: HashMap<u32, CacheFields> = HashMap::new();
+    let dir = match summary_cache_dir() {
+        Some(d) => d,
+        None => return out,
+    };
+    for pid in pids {
+        let raw = match std::fs::read_to_string(dir.join(format!("{}.json", pid))) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+        let get = |k: &str| {
+            v.get(k)
+                .and_then(|x| x.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        out.insert(
+            *pid,
+            CacheFields {
+                name: get("name"),
+                summary: get("summary"),
+                status: get("status"),
+            },
+        );
+    }
+    out
+}
+
+/// Reap cache files whose pid is no longer alive. Files fresher than 120s are
+/// kept: a just-started pi may not appear in our ps snapshot yet.
+fn prune_summary_cache(live: &HashSet<u32>) {
+    let dir = match summary_cache_dir() {
+        Some(d) => d,
+        None => return,
+    };
+    let now = chrono::Utc::now().timestamp();
+    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    for f in rd.flatten() {
+        let name = f.file_name().to_string_lossy().to_string();
+        let Some(pid_str) = name.strip_suffix(".json") else { continue };
+        let Ok(fpid) = pid_str.parse::<u32>() else { continue };
+        if live.contains(&fpid) {
+            continue;
+        }
+        let updated: i64 = std::fs::read_to_string(f.path())
+            .ok()
+            .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+            .and_then(|v| v.get("updatedAt").and_then(|u| u.as_i64()))
+            .unwrap_or(0);
+        if now - updated > 120 {
+            let _ = std::fs::remove_file(f.path());
+        }
+    }
+}
+
 /// Map detected processes to concrete session files.
 pub fn map_running(
     procs: &[PiProc],
@@ -210,7 +425,6 @@ pub fn map_running(
     if procs.is_empty() {
         return hits;
     }
-    let now = chrono::Utc::now().timestamp();
     let mut claimed: HashSet<PathBuf> = HashSet::new();
 
     // sessions by cwd for the cwd+recency heuristic
@@ -230,6 +444,30 @@ pub fn map_running(
         by_id.insert(s.id.as_str(), s);
     }
 
+    let claim = |hits: &mut HashMap<PathBuf, RunningHit>,
+                 claimed: &mut HashSet<PathBuf>,
+                 s: &SessionMeta,
+                 p: &PiProc,
+                 direct: bool| {
+        if claimed.contains(&s.path) {
+            return false;
+        }
+        claimed.insert(s.path.clone());
+        hits.insert(
+            s.path.clone(),
+            RunningHit {
+                pid: p.pid,
+                tmux: p.tmux.clone(),
+                direct,
+                summary: None,
+                status: None,
+                peer_name: None,
+            },
+        );
+        true
+    };
+
+    let mut unmatched: Vec<&PiProc> = Vec::new();
     for p in procs {
         // 1. exact match from --session arg
         if let Some(arg) = &p.session_arg {
@@ -239,56 +477,159 @@ pub fn map_running(
                 by_id.get(arg.as_str()).copied()
             };
             if let Some(s) = found {
-                if !claimed.contains(&s.path) {
-                    claimed.insert(s.path.clone());
-                    hits.insert(
-                        s.path.clone(),
-                        RunningHit {
-                            pid: p.pid,
-                            tmux: p.tmux.clone(),
-                            direct: true,
-                        },
-                    );
-                }
+                claim(&mut hits, &mut claimed, s, p, true);
                 continue;
             }
         }
-        // 2. cwd-based pinning. `-c`/`--continue` owns the newest session in
-        //    that cwd regardless of age (an idle pi at a prompt still owns it);
-        //    otherwise require a recent write. Claimed files are skipped so
-        //    parallel agents in one project map to distinct sessions.
+        unmatched.push(p);
+    }
+
+    // 2. pair a live process with the session it created at launch (bare `pi`).
+    let mut still: Vec<&PiProc> = Vec::new();
+    for p in unmatched {
+        let mut paired = false;
+        if let (Some(cwd), Some(start)) = (&p.cwd, p.started_at) {
+            let cwd_str = cwd.to_string_lossy();
+            if let Some(candidates) = by_cwd.get(cwd_str.as_ref()) {
+                let mut best: Option<(&SessionMeta, i64)> = None;
+                for s in candidates {
+                    if claimed.contains(&s.path) {
+                        continue;
+                    }
+                    let Some(created) = s.created else { continue };
+                    let delta = (created - start).abs();
+                    if delta > active_secs {
+                        continue;
+                    }
+                    if best.map_or(true, |(_, d)| delta < d) {
+                        best = Some((s, delta));
+                    }
+                }
+                if let Some((s, _)) = best {
+                    claim(&mut hits, &mut claimed, s, p, false);
+                    paired = true;
+                }
+            }
+        }
+        if !paired {
+            still.push(p);
+        }
+    }
+
+    // 3. leftover processes (idle, `-c`, unmatched start times): newest
+    //    unclaimed session in that cwd. No recency gate — a live pid is enough.
+    for p in still {
         if let Some(cwd) = &p.cwd {
             let cwd_str = cwd.to_string_lossy();
             if let Some(candidates) = by_cwd.get(cwd_str.as_ref()) {
-                let pick = if p.continue_flag {
-                    candidates.first().copied()
-                } else {
-                    candidates
-                        .iter()
-                        .find(|s| now - s.mtime <= active_secs)
-                        .copied()
-                };
-                if let Some(s) = pick {
-                    if !claimed.contains(&s.path) {
-                        claimed.insert(s.path.clone());
-                        hits.insert(
-                            s.path.clone(),
-                            RunningHit {
-                                pid: p.pid,
-                                tmux: p.tmux.clone(),
-                                direct: false,
-                            },
-                        );
-                    }
+                if let Some(s) = candidates.iter().find(|s| !claimed.contains(&s.path)).copied() {
+                    claim(&mut hits, &mut claimed, s, p, p.continue_flag);
                 }
             }
         }
     }
+
+    // Attach live activity summaries / names. Prefer the cache (written by
+    // current pi-agent-link); fall back to Claude's registry entry, which
+    // older in-memory sessions still update with their unique peer name.
+    let pids: Vec<u32> = hits.values().map(|h| h.pid).collect();
+    let cache = summary_cache_lookup(&pids);
+    let registry = registry_peer_names(&pids);
+    for h in hits.values_mut() {
+        if let Some(c) = cache.get(&h.pid) {
+            h.summary = c.summary.clone();
+            h.status = c.status.clone();
+            h.peer_name = c.name.clone();
+        }
+        if h.peer_name.is_none() {
+            h.peer_name = registry.get(&h.pid).cloned();
+        }
+    }
+    // Last resort: mint unique pi-<cwd> names in start-time order so two live
+    // agents in one repo don't both show up as "pi-dotfiles".
+    fill_missing_peer_names(&mut hits, procs, sessions);
+    // Reap cache files for sessions that are gone.
+    prune_summary_cache(&procs.iter().map(|p| p.pid).collect());
     hits
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_cache_lookup_and_prune() {
+        // Point HOME at a throwaway dir so the test never touches real caches.
+        let tmp = std::env::temp_dir().join(format!("psst-test-{}", std::process::id()));
+        let dir = tmp.join(".cache").join("agent-link").join("summaries");
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &tmp);
+
+        // Fake entries: one live-ish (pid we query), one stale, one fresh-but-dead.
+        let now = chrono::Utc::now().timestamp();
+        let live_pid = 424242u32;
+        std::fs::write(
+            dir.join(format!("{}.json", live_pid)),
+            serde_json::json!({
+                "pid": live_pid, "name": "pi-x", "status": "thinking",
+                "summary": "▸ do the thing", "updatedAt": now,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("111.json"),
+            serde_json::json!({ "summary": "old", "updatedAt": now - 9999 }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("222.json"),
+            serde_json::json!({ "summary": "new", "updatedAt": now }).to_string(),
+        )
+        .unwrap();
+
+        let got = summary_cache_lookup(&[live_pid, 999999]);
+        assert_eq!(
+            got.get(&live_pid),
+            Some(&CacheFields {
+                name: Some("pi-x".to_string()),
+                summary: Some("▸ do the thing".to_string()),
+                status: Some("thinking".to_string()),
+            })
+        );
+        assert!(!got.contains_key(&999999));
+
+        // Prune: stale 111.json goes, fresh 222.json stays despite dead pid.
+        let mut live = HashSet::new();
+        live.insert(live_pid);
+        prune_summary_cache(&live);
+        assert!(dir.join(format!("{}.json", live_pid)).exists());
+        assert!(!dir.join("111.json").exists());
+        assert!(dir.join("222.json").exists());
+
+        if let Some(h) = prev_home {
+            std::env::set_var("HOME", h);
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn peer_names_suffix_unclaimed() {
+        assert_eq!(peer_slug("/Users/x/Code/github.com/ericboehs/dotfiles"), "pi-dotfiles");
+        let mut taken = HashSet::new();
+        taken.insert("pi-dotfiles".into());
+        assert_eq!(first_free_name("pi-dotfiles", &taken), "pi-dotfiles-2");
+        taken.insert("pi-dotfiles-2".into());
+        assert_eq!(first_free_name("pi-dotfiles", &taken), "pi-dotfiles-3");
+    }
+
+    #[test]
+    fn etime_parses() {
+        assert_eq!(parse_etime("05:22"), Some(5 * 60 + 22));
+        assert_eq!(parse_etime("01:02:03"), Some(3600 + 120 + 3));
+        assert_eq!(parse_etime("2-03:04:05"), Some(2 * 86400 + 3 * 3600 + 4 * 60 + 5));
+        assert_eq!(parse_etime("bogus"), None);
+    }
 
     #[test]
     fn pi_process_detection() {

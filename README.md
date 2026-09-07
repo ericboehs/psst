@@ -6,15 +6,18 @@ TUI. Built because nothing combined both halves: mining the full session
 archive *and* showing which agents are running right now.
 
 ```
-● tmux-agent-restore-work   tmux-agent…  claude-son…  $0.842   312m  [agents:3]
-○ psst                      psst         -            $0       2s
-⎇ wiki-session-sync         dotfiles     gpt-5        $0.104   14d
-▾ Today  12 sessions · $3.42 · last 2s
-▾ ~/Code/github.com/ericboehs/dotfiles  47 sessions · $12.31 · last 2s
+● tmux-agent-restore-work   tmux-agent…  312m  [agents:3]
+○ psst                      psst         2s
+⎇ wiki-session-sync         dotfiles     14d
+▾ Today  12 sessions · last 2s
+▾ ~/Code/github.com/ericboehs/dotfiles  47 sessions · last 2s
 ```
 
 - `●` green dot = a live pi process is attached (cwd match + recent write;
   exact when the process cmdline carries `--session`)
+- running rows show a second green line with the agent's live activity summary
+  (published by pi-agent-link to `~/.cache/agent-link/summaries/`; filterable,
+  also shown as `activity:` in the detail pane and appended in `--list`)
 - `[agents:3]` = the tmux session/window the running agent lives in
 - `⎇` = session was forked from a parent (`/fork`, `/clone`)
 
@@ -23,7 +26,12 @@ archive *and* showing which agents are running right now.
 ```bash
 cd ~/Code/github.com/ericboehs/psst
 cargo build --release
-cp target/release/psst ~/.local/bin/
+# Install via rename (NOT cp over the old file): overwriting the binary in
+# place leaves macOS's taskgated signature cache stale and the new binary
+# dies with "zsh: killed" (SIGKILL, Taskgated Invalid Signature). Re-sign
+# after install for the same reason.
+cp target/release/psst /tmp/psst.new && mv -f /tmp/psst.new ~/.local/bin/psst
+codesign --force --sign - ~/.local/bin/psst
 ```
 
 Rust via Homebrew is the only dependency. tmux is required for opening sessions.
@@ -41,11 +49,14 @@ psst --debug-running  # print detected pi processes + tmux targets
 
 | Key | Action |
 |-----|--------|
-| type | filter (all terms must match across title/prompt/project/model) |
-| `↑`/`↓` or `k`/`j`, PgUp/PgDn | navigate |
+| `/` | focus search (then type anything, including `j`/`k`; Esc unfocuses). Running sessions also match `active`. |
+| `a` | toggle active-only (sessions with a live pi process) |
+| `↑`/`↓` or `k`/`j`, PgUp/PgDn | navigate (j/k only when search is not focused) |
 | `Enter` | **open**: attach to the running tmux session, or spawn `pi --session <file>` in a new tmux window |
 | `Tab` | cycle grouping: flat → project → day (newest day first; "Today"/"Yesterday"/date headers) |
-| `Ctrl+S` | cycle sort: activity → tmux → cost |
+| `Ctrl+S` | cycle sort: activity → tmux |
+| `Ctrl+D` | toggle the bottom detail pane (off by default) |
+| `Ctrl+P` | hide/show prompt text in list titles and the last-message line |
 | `r` / `R` | rescan (cache-aware) / full rescan |
 | `Esc` | clear filter (quit if empty) |
 | `q` | quit |

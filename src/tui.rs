@@ -4,12 +4,13 @@ use crate::config::Config;
 use crate::running::{detect, map_running, RunningHit};
 use crate::scan::{scan, sessions_root, SessionMeta};
 use anyhow::Result;
+use chrono::Timelike;
 use ratatui::{
     Frame,
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::collections::HashMap;
@@ -19,7 +20,6 @@ use std::path::PathBuf;
 pub enum Sort {
     Activity,
     Tmux,
-    Cost,
 }
 
 impl Sort {
@@ -27,14 +27,12 @@ impl Sort {
         match self {
             Sort::Activity => "activity",
             Sort::Tmux => "tmux",
-            Sort::Cost => "cost",
         }
     }
     fn next(self) -> Sort {
         match self {
             Sort::Activity => Sort::Tmux,
-            Sort::Tmux => Sort::Cost,
-            Sort::Cost => Sort::Activity,
+            Sort::Tmux => Sort::Activity,
         }
     }
 }
@@ -87,16 +85,35 @@ pub struct App {
     pub sort: Sort,
     pub config: Config,
     pub status: String,
+    /// Right-hand detail pane. Off by default so the list can use full width.
+    pub detail: bool,
+    /// When false, list titles skip first-prompt text and the ▸ last-message line.
+    pub show_prompts: bool,
+    /// `/` focuses the filter so j/k type into it instead of moving the selection.
+    pub search_focus: bool,
+    /// When true, only sessions with a live pi process are listed.
+    pub active_only: bool,
 }
 
 /// One rendered row: a session (index into `sessions`) or a group header.
+/// A running session with a live summary renders as two lines (Claude
+/// agent-view style: title row + indented activity line).
 struct Item {
     session: Option<usize>,
-    line: Line<'static>,
+    lines: Vec<Line<'static>>,
 }
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+fn fmt_clock(ts: i64) -> String {
+    let Some(t) = chrono::DateTime::from_timestamp(ts, 0) else {
+        return "?".into();
+    };
+    let t = t.with_timezone(&chrono::Local);
+    let (is_pm, hour) = t.hour12();
+    format!("{}:{:02}{}", hour, t.minute(), if is_pm { "p" } else { "a" })
 }
 
 fn fmt_age(secs: i64) -> String {
@@ -111,16 +128,6 @@ fn fmt_age(secs: i64) -> String {
         format!("{}d", s / 86_400)
     } else {
         format!("{}mo", s / (86_400 * 30))
-    }
-}
-
-fn fmt_cost(c: f64) -> String {
-    if c <= 0.0 {
-        "$0".into()
-    } else if c < 1.0 {
-        format!("${:.3}", c)
-    } else {
-        format!("${:.2}", c)
     }
 }
 
@@ -170,6 +177,10 @@ impl App {
             },
             sort: Sort::Activity,
             status: String::new(),
+            detail: config.detail_default(),
+            show_prompts: false,
+            search_focus: false,
+            active_only: false,
             config,
         };
         app.refresh(false);
@@ -201,16 +212,25 @@ impl App {
         let f = self.filter.to_lowercase();
         let mut idx: Vec<usize> = (0..self.sessions.len())
             .filter(|&i| {
+                let s = &self.sessions[i];
+                let hit = self.running.get(&s.path);
+                if self.active_only && hit.is_none() {
+                    return false;
+                }
                 if f.is_empty() {
                     return true;
                 }
-                let s = &self.sessions[i];
+                let summary = hit.and_then(|h| h.summary.as_deref()).unwrap_or("");
+                let peer = hit.and_then(|h| h.peer_name.as_deref()).unwrap_or("");
                 let hay = format!(
-                    "{} {} {} {}",
-                    s.title(),
+                    "{} {} {} {} {} {} {}",
+                    display_title(s, hit, self.show_prompts),
                     s.first_prompt.as_deref().unwrap_or(""),
                     s.cwd,
-                    s.model.as_deref().unwrap_or("")
+                    s.model.as_deref().unwrap_or(""),
+                    summary,
+                    peer,
+                    if hit.is_some() { "active running" } else { "" }
                 )
                 .to_lowercase();
                 hay_contains(&hay, &f)
@@ -220,15 +240,7 @@ impl App {
         match self.sort {
             Sort::Activity => {
                 idx.sort_by_key(|&i| {
-                    std::cmp::Reverse(self.sessions[i].last_activity.unwrap_or(0))
-                });
-            }
-            Sort::Cost => {
-                idx.sort_by(|&a, &b| {
-                    self.sessions[b]
-                        .cost_total
-                        .partial_cmp(&self.sessions[a].cost_total)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    std::cmp::Reverse(self.sessions[i].last_user_or_activity())
                 });
             }
             Sort::Tmux => {
@@ -244,7 +256,7 @@ impl App {
                                         .unwrap_or_default(),
                                     h.tmux.as_ref().and_then(|t| t.window).unwrap_or(0),
                                     std::cmp::Reverse(
-                                        self.sessions[i].last_activity.unwrap_or(0),
+                                        self.sessions[i].last_user_or_activity(),
                                     ),
                                 ),
                                 None => (
@@ -252,7 +264,7 @@ impl App {
                                     String::new(),
                                     0,
                                     std::cmp::Reverse(
-                                        self.sessions[i].last_activity.unwrap_or(0),
+                                        self.sessions[i].last_user_or_activity(),
                                     ),
                                 ),
                             }
@@ -326,26 +338,26 @@ impl App {
         } else {
             Span::raw("  ")
         };
-        let title_w = (w * 5 / 16).max(24);
-        let title = if s.name.is_some() {
+        let title_w = (w / 2).max(32);
+        let label = display_title(s, hit, self.show_prompts);
+        let named = s.name.is_some() || hit.and_then(|h| h.peer_name.as_deref()).is_some();
+        let title = if named {
             Span::styled(
-                pad(&s.title(), title_w),
+                pad(&label, title_w),
                 Style::default().add_modifier(Modifier::BOLD),
             )
         } else {
-            Span::raw(pad(&s.title(), title_w))
+            Span::raw(pad(&label, title_w))
         };
-        let proj = Span::raw(pad(&project_base(&s.cwd), (w / 8).max(10)));
-        let model = Span::raw(pad(s.model.as_deref().unwrap_or(""), (w / 8).max(10)));
-        let cost = Span::styled(
-            pad(&fmt_cost(s.cost_total), 7),
-            Style::default().fg(Color::Magenta),
-        );
-        let msgs = Span::raw(pad(&format!("{}m", s.messages), 6));
-        let age = Span::styled(
-            pad(&fmt_age(now() - s.last_activity.unwrap_or(0)), 4),
-            Style::default().fg(Color::DarkGray),
-        );
+        let proj = Span::raw(pad(&project_base(&s.cwd), (w / 6).max(10)));
+        // Don't paint age DarkGray: highlight_style keeps span fg, so DarkGray-on-DarkGray
+        // made last-activity invisible on the selected row.
+        let ts = s.last_user_or_activity();
+        let age = Span::raw(if self.group == Group::Day {
+            pad(&fmt_clock(ts), 7)
+        } else {
+            pad(&fmt_age(now() - ts), 5)
+        });
         let tmux = match hit.and_then(|h| h.tmux.as_ref()) {
             Some(t) => Span::styled(
                 format!(
@@ -358,9 +370,25 @@ impl App {
             None => Span::raw(""),
         };
         Line::from(vec![
-            dot, fork, title, Span::raw(" "), proj, Span::raw(" "), model, Span::raw(" "),
-            cost, Span::raw(" "), msgs, Span::raw(" "), age, tmux,
+            dot, fork, title, Span::raw(" "), proj, Span::raw(" "), age, tmux,
         ])
+    }
+
+    /// Lines for one session row: the title row, plus an indented live
+    /// activity line when the session is running and the registry has a summary.
+    fn member_lines(&self, i: usize, w: usize) -> Vec<Line<'static>> {
+        let mut lines = vec![self.row_line(i, w)];
+        if self.show_prompts {
+            if let Some(hit) = self.running.get(&self.sessions[i].path) {
+                if let Some(sum) = &hit.summary {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", trunc(sum, w.saturating_sub(6))),
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+            }
+        }
+        lines
     }
 
     fn build_items(&self, w: usize) -> Vec<Item> {
@@ -372,7 +400,7 @@ impl App {
                 for &i in &self.order {
                     items.push(Item {
                         session: Some(i),
-                        line: self.row_line(i, w),
+                        lines: self.member_lines(i, w),
                     });
                 }
             }
@@ -390,7 +418,7 @@ impl App {
                 groups.sort_by_key(|(_, v)| {
                     std::cmp::Reverse(
                         v.iter()
-                            .filter_map(|&i| self.sessions[i].last_activity)
+                            .map(|&i| self.sessions[i].last_user_or_activity())
                             .max()
                             .unwrap_or(0),
                     )
@@ -404,7 +432,7 @@ impl App {
                 let today = chrono::Local::now().date_naive();
                 let mut buckets: HashMap<chrono::NaiveDate, Vec<usize>> = HashMap::new();
                 for &i in &self.order {
-                    let ts = self.sessions[i].last_activity.unwrap_or(0);
+                    let ts = self.sessions[i].last_user_or_activity();
                     let date = chrono::DateTime::from_timestamp(ts, 0)
                         .unwrap_or_default()
                         .with_timezone(&chrono::Local)
@@ -425,33 +453,50 @@ impl App {
 
     /// Header row + member rows for one group.
     fn push_group(&self, items: &mut Vec<Item>, label: String, members: Vec<usize>, w: usize) {
-        let cost: f64 = members.iter().map(|&i| self.sessions[i].cost_total).sum();
         let newest = members
             .iter()
-            .filter_map(|&i| self.sessions[i].last_activity)
+            .map(|&i| self.sessions[i].last_user_or_activity())
             .max()
             .unwrap_or(0);
         let header = format!(
-            "▾ {}  {} sessions · {} · last {}",
+            "▾ {}  {} sessions · last {}",
             trunc(&label, (w / 2).max(30)),
             members.len(),
-            fmt_cost(cost),
             fmt_age(now() - newest)
         );
         items.push(Item {
             session: None,
-            line: Line::from(Span::styled(
+            lines: vec![Line::from(Span::styled(
                 header,
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )),
+            ))],
         });
         for i in members {
             items.push(Item {
                 session: Some(i),
-                line: self.row_line(i, w),
+                lines: self.member_lines(i, w),
             });
         }
     }
+}
+
+/// Running sessions show the live peer name (`pi-dotfiles-2`); others use /name or prompt.
+fn display_title(s: &SessionMeta, hit: Option<&RunningHit>, show_prompts: bool) -> String {
+    if let Some(n) = hit.and_then(|h| h.peer_name.as_deref()).filter(|n| !n.is_empty()) {
+        return n.to_string();
+    }
+    if hit.is_some() {
+        return format!("pi-{}", project_base(&s.cwd));
+    }
+    if let Some(n) = &s.name {
+        return n.clone();
+    }
+    if show_prompts {
+        if let Some(p) = &s.first_prompt {
+            return p.clone();
+        }
+    }
+    s.id.chars().take(8).collect()
 }
 
 fn hay_contains(hay: &str, needle: &str) -> bool {
@@ -461,7 +506,12 @@ fn hay_contains(hay: &str, needle: &str) -> bool {
 
 fn detail_text(s: &SessionMeta, hit: Option<&RunningHit>, cfg: &Config) -> String {
     let mut v = Vec::new();
-    v.push(format!("title:    {}", s.title()));
+    v.push(format!("title:    {}", display_title(s, hit, true)));
+    if let Some(n) = hit.and_then(|h| h.peer_name.as_deref()) {
+        if s.title() != n {
+            v.push(format!("prompt:   {}", s.title()));
+        }
+    }
     v.push(format!("project:  {}", s.cwd));
     v.push(format!("file:     {}", s.path.display()));
     v.push(format!("id:       {}", s.id));
@@ -479,13 +529,11 @@ fn detail_text(s: &SessionMeta, hit: Option<&RunningHit>, cfg: &Config) -> Strin
             ));
         }
     }
-    v.push(format!("model:    {}", s.model.as_deref().unwrap_or("-")));
     v.push(format!(
         "tokens:   {} in / {} out",
         fmt_tokens(s.tokens_in),
         fmt_tokens(s.tokens_out)
     ));
-    v.push(format!("cost:     {}", fmt_cost(s.cost_total)));
     v.push(format!(
         "messages: {} ({} branch pts)",
         s.messages, s.branches
@@ -506,12 +554,21 @@ fn detail_text(s: &SessionMeta, hit: Option<&RunningHit>, cfg: &Config) -> Strin
                     )
                 })
                 .unwrap_or_else(|| "no tmux".into());
+            let status = h
+                .status
+                .as_deref()
+                .map(|s| format!(" · {}", s))
+                .unwrap_or_default();
             v.push(format!(
-                "state:    ● RUNNING pid {} @ {} ({})",
+                "state:    ● RUNNING pid {} @ {} ({}){}",
                 h.pid,
                 t,
-                if h.direct { "exact" } else { "heuristic" }
+                if h.direct { "exact" } else { "heuristic" },
+                status
             ));
+            if let Some(sum) = &h.summary {
+                v.push(format!("activity: {}", sum));
+            }
         }
         None => v.push("state:    ○ idle".to_string()),
     }
@@ -540,29 +597,41 @@ fn ui(f: &mut Frame, app: &App, items: &[Item], list_state: &mut ListState) {
     ])
     .areas(area);
 
-    let total_cost: f64 = app.sessions.iter().map(|s| s.cost_total).sum();
     let header_spans = vec![
         Span::styled(
             " psst ",
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            " {} sessions · {} running · {} total · sort:{} group:{}",
+            " {} sessions · {} running · sort:{} group:{}{}",
             app.sessions.len(),
             app.running.len(),
-            fmt_cost(total_cost),
             app.sort.label(),
-            app.group.label()
+            app.group.label(),
+            if app.active_only { " · active" } else { "" }
         )),
     ];
     f.render_widget(Paragraph::new(Line::from(header_spans)), header);
 
-    let filter_spans = vec![
-        Span::styled("/", Style::default().fg(Color::Green)),
+    let slash = if app.search_focus {
+        Span::styled("/", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("/", Style::default().fg(Color::DarkGray))
+    };
+    let query = if app.search_focus {
         Span::styled(
             format!("{}▏", app.filter),
             Style::default().add_modifier(Modifier::BOLD),
-        ),
+        )
+    } else {
+        Span::styled(
+            app.filter.clone(),
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+    let filter_spans = vec![
+        slash,
+        query,
         Span::styled(
             format!("  ({} shown)", app.order.len()),
             Style::default().fg(Color::DarkGray),
@@ -570,37 +639,44 @@ fn ui(f: &mut Frame, app: &App, items: &[Item], list_state: &mut ListState) {
     ];
     f.render_widget(Paragraph::new(Line::from(filter_spans)), filterbar);
 
-    let [list_area, detail_area] = Layout::horizontal([
-        Constraint::Percentage(62),
-        Constraint::Percentage(38),
-    ])
-    .areas(body);
-
     let list_items: Vec<ListItem> = items
         .iter()
-        .map(|it| ListItem::new(it.line.clone()))
+        .map(|it| ListItem::new(Text::from(it.lines.clone())))
         .collect();
     let list = List::new(list_items)
-        .block(Block::new().borders(Borders::RIGHT))
+        .block(if app.detail {
+            Block::new().borders(Borders::BOTTOM)
+        } else {
+            Block::new()
+        })
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("▶ ");
-    f.render_stateful_widget(list, list_area, list_state);
 
-    if let Some(s) = app.selected() {
-        let hit = app.running.get(&s.path);
-        let detail = Paragraph::new(detail_text(s, hit, &app.config))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::new()
-                    .borders(Borders::LEFT)
-                    .title(" detail ")
-                    .title_style(Style::default().fg(Color::Cyan)),
-            );
-        f.render_widget(detail, detail_area);
+    if app.detail {
+        let [list_area, detail_area] = Layout::vertical([
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
+        .areas(body);
+        f.render_stateful_widget(list, list_area, list_state);
+        if let Some(s) = app.selected() {
+            let hit = app.running.get(&s.path);
+            let detail = Paragraph::new(detail_text(s, hit, &app.config))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::new()
+                        .borders(Borders::TOP)
+                        .title(" detail ")
+                        .title_style(Style::default().fg(Color::Cyan)),
+                );
+            f.render_widget(detail, detail_area);
+        }
+    } else {
+        f.render_stateful_widget(list, body, list_state);
     }
 
     let mut footer_spans = vec![Span::styled(
-        " type=filter tab=group ^S=sort enter=open r=rescan R=full-rescan esc=clear q=quit",
+        " /=search  a=active  j/k  tab=group ^S=sort ^D=detail ^P=prompts enter=open r=rescan esc=clear q=quit",
         Style::default().fg(Color::DarkGray),
     )];
     if !app.status.is_empty() {
@@ -634,9 +710,13 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                // Global: Esc, arrows, tab, ctrl chords work in both modes.
                 match (key.code, key.modifiers) {
-                    (KeyCode::Char('q'), _) => break,
                     (KeyCode::Esc, _) => {
+                        if app.search_focus {
+                            app.search_focus = false;
+                            continue;
+                        }
                         if !app.filter.is_empty() {
                             app.filter.clear();
                             app.apply_filter_sort();
@@ -645,8 +725,8 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                         }
                     }
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
-                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.move_sel(1),
-                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.move_sel(-1),
+                    (KeyCode::Down, _) => app.move_sel(1),
+                    (KeyCode::Up, _) => app.move_sel(-1),
                     (KeyCode::PageDown, _) => app.move_sel(10),
                     (KeyCode::PageUp, _) => app.move_sel(-10),
                     (KeyCode::Home, _) => app.sel = 0,
@@ -656,6 +736,53 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                         app.sort = app.sort.next();
                         app.apply_filter_sort();
                     }
+                    (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                        app.detail = !app.detail;
+                    }
+                    (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                        app.show_prompts = !app.show_prompts;
+                        app.status = if app.show_prompts {
+                            "prompts shown".into()
+                        } else {
+                            "prompts hidden".into()
+                        };
+                    }
+                    (KeyCode::Enter, _) => match app.open_selected() {
+                        Some(a) => {
+                            result = Some(a);
+                            break;
+                        }
+                        None => app.status = "nothing selected".into(),
+                    },
+                    (KeyCode::Char('/'), m) if m == KeyModifiers::NONE && !app.search_focus => {
+                        app.search_focus = true;
+                    }
+                    _ if app.search_focus => match key.code {
+                        KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE
+                            || key.modifiers == KeyModifiers::SHIFT =>
+                        {
+                            app.filter.push(c);
+                            app.apply_filter_sort();
+                            app.sel = 0;
+                        }
+                        KeyCode::Backspace => {
+                            app.filter.pop();
+                            app.apply_filter_sort();
+                        }
+                        _ => {}
+                    },
+                    (KeyCode::Char('q'), _) => break,
+                    (KeyCode::Char('a'), _) => {
+                        app.active_only = !app.active_only;
+                        app.apply_filter_sort();
+                        app.status = if app.active_only {
+                            "active only".into()
+                        } else {
+                            "showing all".into()
+                        };
+                    }
+                    (KeyCode::Char('j'), _) => app.move_sel(1),
+                    (KeyCode::Char('k'), _) => app.move_sel(-1),
                     (KeyCode::Char('r'), _) => {
                         app.refresh(false);
                         app.status = "rescanned".into();
@@ -667,18 +794,6 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                     (KeyCode::Backspace, _) => {
                         app.filter.pop();
                         app.apply_filter_sort();
-                    }
-                    (KeyCode::Enter, _) => match app.open_selected() {
-                        Some(a) => {
-                            result = Some(a);
-                            break;
-                        }
-                        None => app.status = "nothing selected".into(),
-                    },
-                    (KeyCode::Char(c), _) => {
-                        app.filter.push(c);
-                        app.apply_filter_sort();
-                        app.sel = 0;
                     }
                     _ => {}
                 }
