@@ -8,7 +8,7 @@ use chrono::Timelike;
 use serde::{Deserialize, Serialize};
 use ratatui::{
     Frame,
-    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -109,7 +109,7 @@ impl ViewFilter {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum OpenAction {
     /// Switch/attach to an existing tmux session (`session[:window]`).
     TmuxAttach { target: String, inside: bool },
@@ -158,7 +158,7 @@ pub struct App {
 }
 
 /// One rendered row: a session (index into `sessions`) or a group header.
-struct Item {
+pub(crate) struct Item {
     session: Option<usize>,
     lines: Vec<Line<'static>>,
     /// Group key for headers (project cwd / day label); lets a parked
@@ -1144,6 +1144,203 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
     f.render_widget(Paragraph::new(Line::from(footer_spans)), footer);
 }
 
+/// What the event loop should do after one keypress.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyOutcome {
+    /// Keep running.
+    Continue,
+    /// Rescan (`r`) or rebuild the cache (`R`). Performed by the event
+    /// loop so the reducer itself stays free of I/O.
+    Refresh(bool),
+    /// Exit and open the selected session.
+    Open(OpenAction),
+    /// Exit with nothing to do.
+    Quit,
+}
+
+/// Single-key reducer: all key handling lives here, mutating only `App`
+/// state. Render inputs (the built items + highlighted position) come in
+/// as arguments; side effects leave as `KeyOutcome`. Callers must only
+/// pass `Press` events.
+pub(crate) fn handle_key(
+    app: &mut App,
+    key: KeyEvent,
+    items: &[Item],
+    selected: Option<usize>,
+) -> KeyOutcome {
+    if app.show_help {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => return KeyOutcome::Quit,
+            (KeyCode::Char('?'), _)
+            | (KeyCode::Esc, _)
+            | (KeyCode::Char('q'), _) => app.show_help = false,
+            _ => {}
+        }
+        return KeyOutcome::Continue;
+    }
+    // Global: Esc, arrows, tab, ctrl chords work in both modes.
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => {
+            if app.search_focus {
+                app.search_focus = false;
+            } else if !app.filter.is_empty() {
+                app.filter.clear();
+                app.apply_filter_sort();
+            } else {
+                return KeyOutcome::Quit;
+            }
+        }
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => return KeyOutcome::Quit,
+        (KeyCode::Down, _) => app.move_sel(1),
+        (KeyCode::Up, _) => app.move_sel(-1),
+        (KeyCode::PageDown, _) => app.move_sel(10),
+        (KeyCode::PageUp, _) => app.move_sel(-10),
+        (KeyCode::Home, _) => app.sel = 0,
+        (KeyCode::End, _) => app.sel = app.order.len().saturating_sub(1),
+        (KeyCode::Tab, _) => {
+            app.group = app.group.next();
+            app.header_park = None;
+        }
+        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+            app.sort = app.sort.next();
+            app.apply_filter_sort();
+        }
+        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+            app.detail = !app.detail;
+        }
+        (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            app.show_prompts = !app.show_prompts;
+            app.status = if app.show_prompts {
+                "prompts shown".into()
+            } else {
+                "prompts hidden".into()
+            };
+        }
+        (KeyCode::Enter, _) => {
+            let header_key = selected
+                .and_then(|pos| items.get(pos))
+                .filter(|it| it.session.is_none())
+                .and_then(|it| it.group_key.clone());
+            match header_key {
+                Some(k) => {
+                    if app.collapsed.remove(&k) {
+                        app.status = "unfolded".into();
+                    } else {
+                        app.collapsed.insert(k.clone());
+                        app.status = format!("folded {}", short_group(&k));
+                    }
+                }
+                None => match app.open_selected() {
+                    Some(a) => return KeyOutcome::Open(a),
+                    None => app.status = "nothing selected".into(),
+                },
+            }
+        }
+        (KeyCode::Char('/'), m) if m == KeyModifiers::NONE && !app.search_focus => {
+            app.search_focus = true;
+        }
+        _ if app.search_focus => match key.code {
+            KeyCode::Char(c)
+                if key.modifiers == KeyModifiers::NONE
+                    || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                app.filter.push(c);
+                app.apply_filter_sort();
+                app.sel = 0;
+            }
+            KeyCode::Backspace => {
+                app.filter.pop();
+                app.apply_filter_sort();
+            }
+            _ => {}
+        },
+        (KeyCode::Char('q'), _) => return KeyOutcome::Quit,
+        (KeyCode::Char('?'), _) => app.show_help = !app.show_help,
+        (KeyCode::Char('f'), _) => {
+            app.view_filter = app.view_filter.next();
+            app.apply_filter_sort();
+            app.status = format!("filter:{}", app.view_filter.label());
+        }
+        (KeyCode::Char('g'), _) => {
+            app.group = app.group.next();
+            // parked headers belong to the old grouping
+            app.header_park = None;
+            app.status = format!("group:{}", app.group.label());
+        }
+        (KeyCode::Char('s'), _) => {
+            app.sort = app.sort.next();
+            app.apply_filter_sort();
+            app.status = format!("sort:{}", app.sort.label());
+        }
+        (KeyCode::Char('d'), _) => {
+            app.detail = !app.detail;
+        }
+        (KeyCode::Char('p'), _) => {
+            app.show_prompts = !app.show_prompts;
+            app.status = if app.show_prompts {
+                "prompts shown".into()
+            } else {
+                "prompts hidden".into()
+            };
+        }
+        (KeyCode::Char('J'), _) => app.move_group(1),
+        (KeyCode::Char('K'), _) => app.move_group(-1),
+        (KeyCode::Char('j'), KeyModifiers::SHIFT) => app.move_group(1),
+        (KeyCode::Char('k'), KeyModifiers::SHIFT) => app.move_group(-1),
+        (KeyCode::Char('j'), _) => app.move_sel(1),
+        (KeyCode::Char('k'), _) => app.move_sel(-1),
+        (KeyCode::Char('h'), _) => match app.collapse_current() {
+            Some(key) => app.status = format!("folded {}", short_group(&key)),
+            None => {
+                app.status = if app.group == Group::Flat {
+                    "nothing to fold (flat)".into()
+                } else {
+                    "already folded".into()
+                }
+            }
+        },
+        (KeyCode::Char('l'), _) => {
+            app.status = if app.group == Group::Flat {
+                "nothing to fold (flat)".into()
+            } else if app.expand_current() {
+                "unfolded".into()
+            } else {
+                "already unfolded".into()
+            }
+        }
+        (KeyCode::Char('H'), _) => {
+            let n = app.collapse_all();
+            app.status = if app.group == Group::Flat {
+                "nothing to fold (flat)".into()
+            } else {
+                format!("folded {} groups", n)
+            }
+        }
+        (KeyCode::Char('L'), _) => {
+            let n = app.expand_all();
+            app.status = if n > 0 {
+                format!("unfolded {} groups", n)
+            } else {
+                "nothing folded".into()
+            }
+        }
+        (KeyCode::Char('r'), _) => {
+            app.status = "rescanned".into();
+            return KeyOutcome::Refresh(false);
+        }
+        (KeyCode::Char('R'), _) => {
+            app.status = "full rescan (cache rebuilt)".into();
+            return KeyOutcome::Refresh(true);
+        }
+        (KeyCode::Backspace, _) => {
+            app.filter.pop();
+            app.apply_filter_sort();
+        }
+        _ => {}
+    }
+    KeyOutcome::Continue
+}
+
 pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
     let mut terminal = ratatui::init();
     let mut list_state = ListState::default();
@@ -1171,180 +1368,14 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                if app.show_help {
-                    match (key.code, key.modifiers) {
-                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
-                        (KeyCode::Char('?'), _)
-                        | (KeyCode::Esc, _)
-                        | (KeyCode::Char('q'), _) => app.show_help = false,
-                        _ => {}
+                match handle_key(app, key, &items, list_state.selected()) {
+                    KeyOutcome::Continue => {}
+                    KeyOutcome::Refresh(full) => app.refresh(full),
+                    KeyOutcome::Open(a) => {
+                        result = Some(a);
+                        break;
                     }
-                    continue;
-                }
-                // Global: Esc, arrows, tab, ctrl chords work in both modes.
-                match (key.code, key.modifiers) {
-                    (KeyCode::Esc, _) => {
-                        if app.search_focus {
-                            app.search_focus = false;
-                            continue;
-                        }
-                        if !app.filter.is_empty() {
-                            app.filter.clear();
-                            app.apply_filter_sort();
-                        } else {
-                            break;
-                        }
-                    }
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
-                    (KeyCode::Down, _) => app.move_sel(1),
-                    (KeyCode::Up, _) => app.move_sel(-1),
-                    (KeyCode::PageDown, _) => app.move_sel(10),
-                    (KeyCode::PageUp, _) => app.move_sel(-10),
-                    (KeyCode::Home, _) => app.sel = 0,
-                    (KeyCode::End, _) => app.sel = app.order.len().saturating_sub(1),
-                    (KeyCode::Tab, _) => {
-                        app.group = app.group.next();
-                        app.header_park = None;
-                    }
-                    (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                        app.sort = app.sort.next();
-                        app.apply_filter_sort();
-                    }
-                    (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                        app.detail = !app.detail;
-                    }
-                    (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-                        app.show_prompts = !app.show_prompts;
-                        app.status = if app.show_prompts {
-                            "prompts shown".into()
-                        } else {
-                            "prompts hidden".into()
-                        };
-                    }
-                    (KeyCode::Enter, _) => {
-                        let header_key = list_state
-                            .selected()
-                            .and_then(|pos| items.get(pos))
-                            .filter(|it| it.session.is_none())
-                            .and_then(|it| it.group_key.clone());
-                        match header_key {
-                            Some(k) => {
-                                if app.collapsed.remove(&k) {
-                                    app.status = "unfolded".into();
-                                } else {
-                                    app.collapsed.insert(k.clone());
-                                    app.status = format!("folded {}", short_group(&k));
-                                }
-                            }
-                            None => match app.open_selected() {
-                                Some(a) => {
-                                    result = Some(a);
-                                    break;
-                                }
-                                None => app.status = "nothing selected".into(),
-                            },
-                        }
-                    }
-                    (KeyCode::Char('/'), m) if m == KeyModifiers::NONE && !app.search_focus => {
-                        app.search_focus = true;
-                    }
-                    _ if app.search_focus => match key.code {
-                        KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE
-                            || key.modifiers == KeyModifiers::SHIFT =>
-                        {
-                            app.filter.push(c);
-                            app.apply_filter_sort();
-                            app.sel = 0;
-                        }
-                        KeyCode::Backspace => {
-                            app.filter.pop();
-                            app.apply_filter_sort();
-                        }
-                        _ => {}
-                    },
-                    (KeyCode::Char('q'), _) => break,
-                    (KeyCode::Char('?'), _) => app.show_help = !app.show_help,
-                    (KeyCode::Char('f'), _) => {
-                        app.view_filter = app.view_filter.next();
-                        app.apply_filter_sort();
-                        app.status = format!("filter:{}", app.view_filter.label());
-                    }
-                    (KeyCode::Char('g'), _) => {
-                        app.group = app.group.next();
-                        // parked headers belong to the old grouping
-                        app.header_park = None;
-                        app.status = format!("group:{}", app.group.label());
-                    }
-                    (KeyCode::Char('s'), _) => {
-                        app.sort = app.sort.next();
-                        app.apply_filter_sort();
-                        app.status = format!("sort:{}", app.sort.label());
-                    }
-                    (KeyCode::Char('d'), _) => {
-                        app.detail = !app.detail;
-                    }
-                    (KeyCode::Char('p'), _) => {
-                        app.show_prompts = !app.show_prompts;
-                        app.status = if app.show_prompts {
-                            "prompts shown".into()
-                        } else {
-                            "prompts hidden".into()
-                        };
-                    }
-                    (KeyCode::Char('J'), _) => app.move_group(1),
-                    (KeyCode::Char('K'), _) => app.move_group(-1),
-                    (KeyCode::Char('j'), KeyModifiers::SHIFT) => app.move_group(1),
-                    (KeyCode::Char('k'), KeyModifiers::SHIFT) => app.move_group(-1),
-                    (KeyCode::Char('j'), _) => app.move_sel(1),
-                    (KeyCode::Char('k'), _) => app.move_sel(-1),
-                    (KeyCode::Char('h'), _) => match app.collapse_current() {
-                        Some(key) => app.status = format!("folded {}", short_group(&key)),
-                        None => {
-                            app.status = if app.group == Group::Flat {
-                                "nothing to fold (flat)".into()
-                            } else {
-                                "already folded".into()
-                            }
-                        }
-                    },
-                    (KeyCode::Char('l'), _) => {
-                        app.status = if app.group == Group::Flat {
-                            "nothing to fold (flat)".into()
-                        } else if app.expand_current() {
-                            "unfolded".into()
-                        } else {
-                            "already unfolded".into()
-                        }
-                    }
-                    (KeyCode::Char('H'), _) => {
-                        let n = app.collapse_all();
-                        app.status = if app.group == Group::Flat {
-                            "nothing to fold (flat)".into()
-                        } else {
-                            format!("folded {} groups", n)
-                        }
-                    }
-                    (KeyCode::Char('L'), _) => {
-                        let n = app.expand_all();
-                        app.status = if n > 0 {
-                            format!("unfolded {} groups", n)
-                        } else {
-                            "nothing folded".into()
-                        }
-                    }
-                    (KeyCode::Char('r'), _) => {
-                        app.refresh(false);
-                        app.status = "rescanned".into();
-                    }
-                    (KeyCode::Char('R'), _) => {
-                        app.refresh(true);
-                        app.status = "full rescan (cache rebuilt)".into();
-                    }
-                    (KeyCode::Backspace, _) => {
-                        app.filter.pop();
-                        app.apply_filter_sort();
-                    }
-                    _ => {}
+                    KeyOutcome::Quit => break,
                 }
             }
         }
@@ -1714,6 +1745,222 @@ mod tests {
         let head = Line::from(Span::raw("▾ Today"));
         let out = highlight_row(&[head], true);
         assert!(reversed(&out[0].spans[0]));
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn keyed_app() -> App {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        app
+    }
+
+    fn press(app: &mut App, ke: KeyEvent) -> KeyOutcome {
+        let items = app.build_items(100);
+        handle_key(app, ke, &items, None)
+    }
+
+    #[test]
+    fn keys_quit_and_escape() {
+        let mut app = keyed_app();
+        assert_eq!(press(&mut app, key(KeyCode::Char('q'))), KeyOutcome::Quit);
+        assert_eq!(
+            press(&mut app, ctrl(KeyCode::Char('c'))),
+            KeyOutcome::Quit
+        );
+        assert_eq!(press(&mut app, key(KeyCode::Esc)), KeyOutcome::Quit);
+        // Esc clears a filter first, and drops search focus before that
+        app.filter = "a".into();
+        app.search_focus = true;
+        assert_eq!(press(&mut app, key(KeyCode::Esc)), KeyOutcome::Continue);
+        assert!(!app.search_focus);
+        assert_eq!(app.filter, "a");
+        assert_eq!(press(&mut app, key(KeyCode::Esc)), KeyOutcome::Continue);
+        assert!(app.filter.is_empty());
+    }
+
+    #[test]
+    fn keys_help_overlay() {
+        let mut app = keyed_app();
+        assert_eq!(press(&mut app, key(KeyCode::Char('?'))), KeyOutcome::Continue);
+        assert!(app.show_help);
+        // ordinary keys are swallowed while help is up
+        assert_eq!(press(&mut app, key(KeyCode::Char('j'))), KeyOutcome::Continue);
+        assert_eq!(app.sel, 0);
+        for closer in [KeyCode::Char('?'), KeyCode::Esc, KeyCode::Char('q')] {
+            app.show_help = true;
+            assert_eq!(press(&mut app, key(closer)), KeyOutcome::Continue);
+            assert!(!app.show_help);
+        }
+        app.show_help = true;
+        assert_eq!(
+            press(&mut app, ctrl(KeyCode::Char('c'))),
+            KeyOutcome::Quit
+        );
+    }
+
+    #[test]
+    fn keys_search_typing() {
+        let mut app = keyed_app();
+        assert_eq!(press(&mut app, key(KeyCode::Char('/'))), KeyOutcome::Continue);
+        assert!(app.search_focus);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('b'))),
+            KeyOutcome::Continue
+        );
+        assert_eq!(app.filter, "b");
+        assert_eq!(press(&mut app, key(KeyCode::Backspace)), KeyOutcome::Continue);
+        assert!(app.filter.is_empty());
+    }
+
+    #[test]
+    fn keys_filter_sort_group_toggles() {
+        let mut app = keyed_app();
+        assert_eq!(press(&mut app, key(KeyCode::Char('f'))), KeyOutcome::Continue);
+        assert_eq!(app.view_filter, ViewFilter::Named);
+        assert_eq!(app.status, "filter:named");
+        assert_eq!(press(&mut app, key(KeyCode::Char('g'))), KeyOutcome::Continue);
+        assert_eq!(app.group, Group::Day);
+        assert_eq!(app.header_park, None);
+        assert_eq!(app.status, "group:day");
+        assert_eq!(press(&mut app, key(KeyCode::Tab)), KeyOutcome::Continue);
+        assert_eq!(app.group, Group::Flat);
+        assert_eq!(press(&mut app, key(KeyCode::Char('s'))), KeyOutcome::Continue);
+        assert_eq!(app.status, "sort:tmux");
+        assert_eq!(
+            press(&mut app, ctrl(KeyCode::Char('s'))),
+            KeyOutcome::Continue
+        );
+        assert_eq!(press(&mut app, key(KeyCode::Char('d'))), KeyOutcome::Continue);
+        assert!(app.detail);
+        assert_eq!(
+            press(&mut app, ctrl(KeyCode::Char('d'))),
+            KeyOutcome::Continue
+        );
+        assert!(!app.detail);
+        assert_eq!(press(&mut app, key(KeyCode::Char('p'))), KeyOutcome::Continue);
+        assert!(app.show_prompts);
+        assert_eq!(app.status, "prompts shown");
+        assert_eq!(
+            press(&mut app, ctrl(KeyCode::Char('p'))),
+            KeyOutcome::Continue
+        );
+        assert!(!app.show_prompts);
+    }
+
+    #[test]
+    fn keys_movement_and_group_jump() {
+        let mut app = keyed_app();
+        assert_eq!(press(&mut app, key(KeyCode::End)), KeyOutcome::Continue);
+        assert_eq!(app.sel, 3);
+        assert_eq!(press(&mut app, key(KeyCode::Home)), KeyOutcome::Continue);
+        assert_eq!(app.sel, 0);
+        assert_eq!(press(&mut app, key(KeyCode::Down)), KeyOutcome::Continue);
+        assert_eq!(app.order[app.sel], 0);
+        assert_eq!(press(&mut app, key(KeyCode::Up)), KeyOutcome::Continue);
+        assert_eq!(app.order[app.sel], 1);
+        assert_eq!(press(&mut app, key(KeyCode::Char('J'))), KeyOutcome::Continue);
+        assert_eq!(app.header_park.as_deref(), Some("/proj/b"));
+        assert_eq!(press(&mut app, key(KeyCode::Char('K'))), KeyOutcome::Continue);
+        assert_eq!(app.header_park.as_deref(), Some("/proj/a"));
+        // explicit shift modifiers take the same path
+        let shift_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::SHIFT);
+        assert_eq!(press(&mut app, shift_j), KeyOutcome::Continue);
+        assert_eq!(app.header_park.as_deref(), Some("/proj/b"));
+        assert_eq!(press(&mut app, key(KeyCode::F(1))), KeyOutcome::Continue);
+    }
+
+    #[test]
+    fn keys_fold_unfold() {
+        let mut app = keyed_app();
+        assert_eq!(press(&mut app, key(KeyCode::Char('h'))), KeyOutcome::Continue);
+        assert_eq!(app.status, "folded a");
+        assert_eq!(app.header_park.as_deref(), Some("/proj/a"));
+        assert_eq!(press(&mut app, key(KeyCode::Char('h'))), KeyOutcome::Continue);
+        assert_eq!(app.status, "already folded");
+        assert_eq!(press(&mut app, key(KeyCode::Char('l'))), KeyOutcome::Continue);
+        assert_eq!(app.status, "unfolded");
+        assert_eq!(press(&mut app, key(KeyCode::Char('l'))), KeyOutcome::Continue);
+        assert_eq!(app.status, "already unfolded");
+        assert_eq!(press(&mut app, key(KeyCode::Char('H'))), KeyOutcome::Continue);
+        assert_eq!(app.status, "folded 3 groups");
+        assert_eq!(press(&mut app, key(KeyCode::Char('L'))), KeyOutcome::Continue);
+        assert_eq!(app.status, "unfolded 3 groups");
+        assert_eq!(press(&mut app, key(KeyCode::Char('L'))), KeyOutcome::Continue);
+        assert_eq!(app.status, "nothing folded");
+        // flat has nothing to fold
+        app.group = Group::Flat;
+        assert_eq!(press(&mut app, key(KeyCode::Char('h'))), KeyOutcome::Continue);
+        assert_eq!(app.status, "nothing to fold (flat)");
+        assert_eq!(press(&mut app, key(KeyCode::Char('l'))), KeyOutcome::Continue);
+        assert_eq!(app.status, "nothing to fold (flat)");
+    }
+
+    #[test]
+    fn key_enter_opens_session() {
+        let mut app = keyed_app();
+        let items = app.build_items(100);
+        let pos = items.iter().position(|it| it.session.is_some()).unwrap();
+        match handle_key(&mut app, key(KeyCode::Enter), &items, Some(pos)) {
+            KeyOutcome::Open(OpenAction::TmuxNew { cwd, .. }) => {
+                assert_eq!(cwd, "/proj/a")
+            }
+            other => panic!("expected Open, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn key_enter_toggles_header() {
+        let mut app = keyed_app();
+        app.collapse_current();
+        let items = app.build_items(100);
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Enter), &items, Some(0)),
+            KeyOutcome::Continue
+        );
+        assert!(app.collapsed.is_empty());
+        assert_eq!(app.status, "unfolded");
+        let items = app.build_items(100);
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Enter), &items, Some(0)),
+            KeyOutcome::Continue
+        );
+        assert_eq!(app.status, "folded a");
+    }
+
+    #[test]
+    fn key_enter_with_empty_list() {
+        let mut app = keyed_app();
+        app.filter = "zzz-no-match".into();
+        app.apply_filter_sort();
+        let items = app.build_items(100);
+        assert!(items.is_empty());
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Enter), &items, None),
+            KeyOutcome::Continue
+        );
+        assert_eq!(app.status, "nothing selected");
+    }
+
+    #[test]
+    fn keys_refresh_is_an_effect() {
+        let mut app = keyed_app();
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('r'))),
+            KeyOutcome::Refresh(false)
+        );
+        assert_eq!(app.status, "rescanned");
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('R'))),
+            KeyOutcome::Refresh(true)
+        );
+        assert_eq!(app.status, "full rescan (cache rebuilt)");
     }
 
     #[test]
