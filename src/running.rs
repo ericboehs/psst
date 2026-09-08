@@ -28,10 +28,23 @@ pub struct TmuxTarget {
     pub attention: bool,
 }
 
+/// Subtree %CPU (process plus descendants) at or above which a session
+/// counts as working. Idle pi nodes sit at exactly 0.0% sample after sample;
+/// a streaming agent holds mid-to-high single digits and up (observed 9-11%
+/// sustained on a working session), tool children spike far higher. Kept low
+/// on purpose: ps %CPU is a decaying/lifetime average, so this also catches
+/// "just finished a burst" rather than only mid-token instants. A stale
+/// "idle" cache entry loses to live CPU — same as a fresh hook event.
+pub const CPU_WORKING_PCT: f64 = 5.0;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PiProc {
     /// Host owning the process: "local" or a `[hosts.<name>]` key.
     pub host: String,
+    /// Subtree %CPU (self plus descendants) sampled at detect time.
+    /// Lets hosts without the agent-link status hook (e.g. gfew, coop)
+    /// still report working vs waiting.
+    pub cpu: f64,
     pub pid: u32,
     pub ppid: u32,
     pub cwd: Option<PathBuf>,
@@ -49,6 +62,9 @@ pub struct PiProc {
 #[derive(Debug, Clone, Serialize)]
 pub struct RunningHit {
     pub pid: u32,
+    /// Subtree %CPU carried over from the process (see [`CPU_WORKING_PCT`]).
+    #[serde(default)]
+    pub cpu: f64,
     pub tmux: Option<TmuxTarget>,
     /// true when matched exactly via `--session`; false = cwd + recent-mtime heuristic.
     pub direct: bool,
@@ -101,7 +117,8 @@ fn is_prompt_status(st: &str) -> bool {
 }
 
 /// Running + ask/confirm/input → prompt; thinking/other tools → working;
-/// tmux `@special_activity` → unread; otherwise waiting on you.
+/// hot CPU (no hook status on this host) → working; tmux `@special_activity`
+/// → unread; otherwise waiting on you.
 pub fn live_mark(hit: Option<&RunningHit>) -> LiveMark {
     match hit {
         None => LiveMark::Exited,
@@ -110,6 +127,8 @@ pub fn live_mark(hit: Option<&RunningHit>) -> LiveMark {
             if is_prompt_status(st) {
                 LiveMark::Prompt
             } else if st == "thinking" || st.starts_with("tool") {
+                LiveMark::Working
+            } else if h.cpu >= CPU_WORKING_PCT {
                 LiveMark::Working
             } else if h.tmux.as_ref().is_some_and(|t| t.attention) {
                 LiveMark::Unread
@@ -198,6 +217,49 @@ pub(crate) fn parse_tmux_panes(
     (panes, panes_by_id)
 }
 
+/// Parse `ps -axo pid=,pcpu=` output (macOS and Linux) into pid → %CPU.
+/// Pure for tests; unparseable lines are skipped.
+pub(crate) fn parse_ps_cpu(out: &str) -> HashMap<u32, f64> {
+    let mut map = HashMap::new();
+    for line in out.lines() {
+        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        if let (Ok(pid), Ok(cpu)) = (parts[0].parse::<u32>(), parts[1].parse::<f64>()) {
+            map.insert(pid, cpu);
+        }
+    }
+    map
+}
+
+/// %CPU for `root` plus all descendants, using parent links from the ps
+/// table. Catches tool children (rg, tsc, cargo) doing the agent's work
+/// while the node parent waits. Cycle-guarded; unknown pids read 0.
+pub(crate) fn subtree_cpu(
+    table: &HashMap<u32, (u32, String, Option<i64>)>,
+    cpu_map: &HashMap<u32, f64>,
+    root: u32,
+) -> f64 {
+    let mut kids: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (pid, (ppid, _, _)) in table {
+        kids.entry(*ppid).or_default().push(*pid);
+    }
+    let mut total = 0.0;
+    let mut visited: HashSet<u32> = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(pid) = stack.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        total += cpu_map.get(&pid).copied().unwrap_or(0.0);
+        if let Some(children) = kids.get(&pid) {
+            stack.extend(children.iter().copied());
+        }
+    }
+    total
+}
+
 pub(crate) fn session_arg_from_cmd(cmd: &str) -> Option<String> {
     cmd.split_whitespace()
         .skip(1)
@@ -267,6 +329,13 @@ pub fn detect() -> Vec<PiProc> {
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
     let (panes, panes_by_id) = parse_tmux_panes(&tmux_out);
+    let cpu_map = std::process::Command::new("ps")
+        .args(["-axo", "pid=,pcpu="])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_ps_cpu(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default();
 
     let mut procs = Vec::new();
     for (pid, (ppid, cmd, started_at)) in &table {
@@ -283,6 +352,7 @@ pub fn detect() -> Vec<PiProc> {
         );
         procs.push(PiProc {
             host: LOCAL_HOST.to_string(),
+            cpu: subtree_cpu(&table, &cpu_map, *pid),
             pid: *pid,
             ppid: *ppid,
             cwd: proc_cwd(*pid),
@@ -384,7 +454,7 @@ pub(crate) fn split_sections(out: &str) -> HashMap<String, String> {
 
 /// Snapshot pi processes on a remote host over ssh in two roundtrips: `ps`
 /// first (to learn the pi pids), then one combined tmux-panes + cwd/environ
-/// probe script whose `===PSST-*===` sections parse separately.
+/// probe + cpu script whose `===PSST-*===` sections parse separately.
 pub fn detect_remote(ssh_target: &str, host_name: &str) -> anyhow::Result<Vec<PiProc>> {
     let ps_out = ssh_run(ssh_target, "ps -axo pid=,ppid=,etime=,command=")?;
     let now = chrono::Utc::now().timestamp();
@@ -401,10 +471,13 @@ pub fn detect_remote(ssh_target: &str, host_name: &str) -> anyhow::Result<Vec<Pi
         "echo '===PSST-TMUX==='; tmux list-panes -a -F '#{pane_pid}\t#{pane_id}\t#{session_name}\t#{window_index}\t#{@special_activity}' 2>/dev/null || true; echo '===PSST-PROBE==='; ",
     );
     script.push_str(&remote_probe_script(&pi_pids));
+    script.push_str("; echo '===PSST-CPU==='; ps -axo pid=,pcpu=");
     let sections = split_sections(&ssh_run(ssh_target, &script).unwrap_or_default());
     let empty = String::new();
     let (panes, panes_by_id) = parse_tmux_panes(sections.get("TMUX").unwrap_or(&empty));
     let probe = parse_remote_probe(sections.get("PROBE").unwrap_or(&empty));
+    // Subtree CPU needs every pid's usage, not just the pi pids'.
+    let cpu_map = parse_ps_cpu(sections.get("CPU").unwrap_or(&empty));
     let mut procs = Vec::new();
     for pid in pi_pids {
         let Some((ppid, cmd, started_at)) = table.get(&pid) else { continue };
@@ -412,6 +485,7 @@ pub fn detect_remote(ssh_target: &str, host_name: &str) -> anyhow::Result<Vec<Pi
         let tmux = resolve_tmux(pid, *ppid, &table, &panes, &panes_by_id, pane);
         procs.push(PiProc {
             host: host_name.to_string(),
+            cpu: subtree_cpu(&table, &cpu_map, pid),
             pid,
             ppid: *ppid,
             cwd,
@@ -744,6 +818,7 @@ fn match_one_host(
             key,
             RunningHit {
                 pid: p.pid,
+                cpu: p.cpu,
                 tmux: p.tmux.clone(),
                 direct,
                 summary: None,
@@ -1003,6 +1078,7 @@ mod tests {
         assert_eq!(live_mark(None), LiveMark::Exited);
         let idle = RunningHit {
             pid: 1,
+            cpu: 0.0,
             tmux: None,
             direct: true,
             summary: None,
@@ -1086,11 +1162,11 @@ mod tests {
 
     #[test]
     fn sections_split_on_markers() {
-        let out = "noise\n===PSST-TMUX===\na\nb\n===PSST-PROBE===\nc\n";
+        let out = "noise\n===PSST-TMUX===\na\nb\n===PSST-CPU===\nc\n";
         let s = split_sections(out);
         assert_eq!(s.get("TMUX").map(|x| x.as_str()), Some("a\nb\n"));
-        assert_eq!(s.get("PROBE").map(|x| x.as_str()), Some("c\n"));
-        assert!(!s.contains_key("NAMES"));
+        assert_eq!(s.get("CPU").map(|x| x.as_str()), Some("c\n"));
+        assert!(!s.contains_key("PROBE"));
         // Body lines before any marker are dropped, never misattributed.
         assert!(!s.values().any(|b| b.contains("noise")));
     }
@@ -1123,6 +1199,54 @@ mod tests {
     }
 
     #[test]
+    fn ps_cpu_parses() {
+        let out = "  123   0.0\n  124  87.5\nbad\n  125\n";
+        let m = parse_ps_cpu(out);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[&123], 0.0);
+        assert_eq!(m[&124], 87.5);
+    }
+
+    #[test]
+    fn subtree_sums_descendants() {
+        // 1(UI shell) -> 2(pi) -> 3(rg); 4 unrelated.
+        let table: HashMap<u32, (u32, String, Option<i64>)> = HashMap::from([
+            (1, (0, "zsh".into(), None)),
+            (2, (1, "pi".into(), None)),
+            (3, (2, "rg foo".into(), None)),
+            (4, (0, "other".into(), None)),
+        ]);
+        let cpu: HashMap<u32, f64> = HashMap::from([(2, 5.0), (3, 60.0), (4, 99.0)]);
+        assert_eq!(subtree_cpu(&table, &cpu, 2), 65.0);
+        assert_eq!(subtree_cpu(&table, &cpu, 1), 65.0);
+        assert_eq!(subtree_cpu(&table, &cpu, 999), 0.0);
+    }
+
+    #[test]
+    fn hot_cpu_reads_working_without_hook_status() {
+        let mut h = RunningHit {
+            pid: 7,
+            cpu: CPU_WORKING_PCT,
+            tmux: None,
+            direct: false,
+            summary: None,
+            status: None,
+            peer_name: None,
+        };
+        assert_eq!(live_mark(Some(&h)), LiveMark::Working);
+        // Stale "idle" loses to live CPU.
+        h.status = Some("idle".into());
+        assert_eq!(live_mark(Some(&h)), LiveMark::Working);
+        // A blocking prompt still wins: the user must answer.
+        h.status = Some("tool:ask".into());
+        assert_eq!(live_mark(Some(&h)), LiveMark::Prompt);
+        // Cool and statusless stays waiting.
+        h.status = None;
+        h.cpu = CPU_WORKING_PCT - 0.1;
+        assert_eq!(live_mark(Some(&h)), LiveMark::Waiting);
+    }
+
+    #[test]
     fn cmd_flags_parse() {
         assert_eq!(
             session_arg_from_cmd("pi --session /tmp/x.jsonl"),
@@ -1137,6 +1261,7 @@ mod tests {
     fn proc_for(host: &str, pid: u32, cwd: &str) -> PiProc {
         PiProc {
             host: host.to_string(),
+            cpu: 0.0,
             pid,
             ppid: 1,
             cwd: Some(PathBuf::from(cwd)),

@@ -478,6 +478,7 @@ mod tests {
     fn hit(peer: &str) -> RunningHit {
         RunningHit {
             pid: 4242,
+            cpu: 0.0,
             tmux: Some(TmuxTarget {
                 session: "s".into(),
                 window: Some(3),

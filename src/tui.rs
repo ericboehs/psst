@@ -1145,6 +1145,13 @@ fn detail_lines(
                 .as_deref()
                 .map(|s| format!(" · {}", s))
                 .unwrap_or_default();
+            // Surface inferred load: on hosts without the status hook this
+            // is the only evidence behind a yellow dot.
+            let cpu = if h.cpu >= 1.0 {
+                format!(" · cpu {:.0}%", h.cpu)
+            } else {
+                String::new()
+            };
             let mark = live_mark(Some(h));
             let (color, emphasis) = match mark {
                 LiveMark::Working => (Color::Yellow, true),
@@ -1161,12 +1168,13 @@ fn detail_lines(
                 Span::styled("state:   ", dim),
                 Span::styled(mark.glyph(), glyph),
                 Span::raw(format!(
-                    " {} pid {} @ {} ({}){}",
+                    " {} pid {} @ {} ({}){}{}",
                     mark.as_str(),
                     h.pid,
                     t,
                     if h.direct { "exact" } else { "heuristic" },
-                    status
+                    status,
+                    cpu
                 )),
             ]));
         }

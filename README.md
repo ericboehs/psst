@@ -13,7 +13,7 @@ archive *and* showing which agents are running right now.
 ▾ ~/Code/github.com/ericboehs/dotfiles  47 sessions · last 2s
 ```
 
-- `●` yellow = live, working (`thinking` / `tool:…` from agent-link)
+- `●` yellow = live, working (`thinking` / `tool:…` from agent-link, or hot subtree CPU ≥5% on hosts without the hook)
 - `●` red + bold title = blocking prompt (`ask` / confirm / input)
 - `●` cyan + bold title = unread (tmux `@special_activity`, not focused yet)
 - `◎` cyan = live, waiting, already looked at
@@ -113,7 +113,7 @@ then remotes by recency.
   (`ControlMaster=auto`, sockets in `~/.cache/psst/ssh/`, 10min persist —
   the first connection pays the handshake, follow-ups cost milliseconds,
   across psst runs too). Calls are batched to ~4 per host per rescan
-  (list, `ps`, tmux+probe sections, enrichment) and mirrored to
+  (list, `ps`, tmux+probe+cpu sections, enrichment) and mirrored to
   `~/.cache/psst/hosts/<name>/<absolute-remote-path>` (only changed files
   are fetched, checked against the shared metadata cache). The mirror backs
   the detail pane, so remotes stay browsable while offline. Running
@@ -123,11 +123,15 @@ then remotes by recency.
   `~/.cache/agent-link/summaries/<pid>.json` when present. Matching is
   partitioned by host, so identical cwds on two machines never cross-match.
   Minted fallback names are host-prefixed (`pi-coop-agent`).
+- **Working without the hook**: hosts lacking agent-link summaries (gfew runs
+  `pi-claude-link` instead; coop has neither) report no `thinking`/`tool`
+  status, so psst falls back to subtree %CPU (process plus descendants, so
+  `tool:bash` children count): ≥5% reads working. Idle nodes sit at exactly
+  0.0% across samples while a streaming agent holds ~9-11% sustained, and a
+  stale `idle` cache entry loses to live CPU. The detail pane shows the
+  reading (`working pid 80608 @ code:1 (heuristic) · cpu 9%`).
 - **Cache**: parsed metadata is cached at `~/.cache/psst/cache.json`, keyed by
-  host+path+mtime+size, so rescans only reparse changed files. Files ≥5MB
-  additionally persist fold state (lines folded + parent→child counts), so a
-  rescan folds only appended tail lines instead of re-reading megabytes —
-  exact, including branch points, since session files are append-only.
+  host+path+mtime+size, so rescans only reparse changed files.
 
 ## Config — `~/.config/psst/config.toml`
 
