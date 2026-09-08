@@ -95,7 +95,7 @@ pub(crate) fn ssh_socket_dir() -> PathBuf {
 /// host pays the handshake, follow-ups reuse the master in milliseconds.
 /// Masters linger 10min (`ControlPersist`) so separate psst runs share them.
 /// With `ControlMaster=auto`, a dead master is replaced transparently.
-pub(crate) fn ssh_command(target: &str, remote_cmd: &str) -> Command {
+pub fn ssh_command(target: &str, remote_cmd: &str) -> Command {
     let dir = ssh_socket_dir();
     let _ = std::fs::create_dir_all(&dir);
     let socket = dir.join("%r@%h:%p");
@@ -435,6 +435,53 @@ pub fn sync_all(hosts: &[HostConfig], force: bool) -> Vec<HostSync> {
     hosts.iter().map(|h| sync_host(h, force)).collect()
 }
 
+/// Open a window in the *host's own* tmux, returning its `%pane_id`.
+///
+/// The point is to land where the user is already looking: the terminal tab
+/// for this host shows one remote session, so the new window goes to the
+/// session its attached client is on rather than whichever one tmux would
+/// pick by default. Falling back to the most recent session covers a host
+/// whose tmux is running but currently unattached.
+///
+/// A pane id rather than `session:window` because hosts commonly set
+/// `renumber-windows`: one window closing between here and the focus hop
+/// shifts every index after it, so the target could name a different window
+/// by the time it is used. A pane id belongs to that pane for life.
+pub fn new_remote_window(
+    ssh_target: &str,
+    cwd: &str,
+    name: &str,
+    command: &str,
+) -> anyhow::Result<String> {
+    let out = ssh_command(ssh_target, &new_window_script(cwd, name, command)).output()?;
+    if !out.status.success() {
+        anyhow::bail!("no tmux on {}", ssh_target);
+    }
+    let target = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if target.is_empty() {
+        anyhow::bail!("tmux on {} reported no window", ssh_target);
+    }
+    Ok(target)
+}
+
+/// Script for [`new_remote_window`]; separated so the quoting is testable.
+/// Exits nonzero when the host has no tmux server, which is the caller's
+/// signal to open a local ssh window the old way instead.
+pub(crate) fn new_window_script(cwd: &str, name: &str, command: &str) -> String {
+    format!(
+        "sess=$(tmux list-clients -F '#{{client_activity}} #{{client_session}}' 2>/dev/null \
+         | sort -rn | awk 'NR==1{{print $2}}'); \
+         [ -n \"$sess\" ] || sess=$(tmux list-sessions -F '#{{session_activity}} #{{session_name}}' \
+         2>/dev/null | sort -rn | awk 'NR==1{{print $2}}'); \
+         [ -n \"$sess\" ] || exit 1; \
+         tmux new-window -t \"$sess:\" -c {cwd} -n {name} \
+         -P -F '#{{pane_id}}' {command}",
+        cwd = sh_quote(cwd),
+        name = sh_quote(name),
+        command = sh_quote(command),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +514,28 @@ mod tests {
         assert!(cmd.contains("ControlPersist=600"), "got {}", cmd);
         assert!(cmd.contains("ControlPath="), "got {}", cmd);
         assert!(cmd.contains("BatchMode=yes"), "got {}", cmd);
+    }
+
+    #[test]
+    fn new_window_script_lands_in_the_attached_session() {
+        let s = new_window_script("/home/agent/proj", "proj", "pi --continue");
+        // The tab shows whatever session its client is attached to, so that
+        // is the session the window has to join — not tmux's default pick.
+        assert!(s.contains("tmux list-clients"), "got {}", s);
+        assert!(s.contains("tmux new-window -t \"$sess:\""), "got {}", s);
+        // Unattached-but-running tmux still works; no server at all exits 1
+        // so the caller can fall back to a local ssh window.
+        assert!(s.contains("tmux list-sessions"), "got {}", s);
+        assert!(s.contains("|| exit 1"), "got {}", s);
+        // Prints the new pane id for the focus hop that follows: window
+        // indices shift under `renumber-windows`, pane ids do not.
+        assert!(s.contains("-P -F '#{pane_id}'"), "got {}", s);
+        // Every interpolated value is quoted: a project dir with a space
+        // must not turn into two tmux arguments.
+        let spaced = new_window_script("/home/agent/my proj", "my proj", "pi -c");
+        assert!(spaced.contains("-c '/home/agent/my proj'"), "got {}", spaced);
+        assert!(spaced.contains("-n 'my proj'"), "got {}", spaced);
+        assert!(spaced.ends_with("'pi -c'"), "got {}", spaced);
     }
 
     #[test]

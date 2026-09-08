@@ -28,6 +28,7 @@ struct Args {
     json: bool,
     refresh: bool,
     debug_running: bool,
+    debug_focus: bool,
     scope: Option<PathBuf>,
 }
 
@@ -41,6 +42,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
         json: false,
         refresh: false,
         debug_running: false,
+        debug_focus: false,
         scope: None,
     };
     for a in args {
@@ -49,6 +51,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "--json" => parsed.json = true,
             "--refresh" => parsed.refresh = true,
             "--debug-running" => parsed.debug_running = true,
+            "--debug-focus" => parsed.debug_focus = true,
             "-h" | "--help" => {
                 println!(
                     "psst — pi session tui\n\n\
@@ -57,7 +60,8 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
                      --list            plain table (host column; pipe-friendly)\n\
                      --json            JSON array (implies list; adds host)\n\
                      --refresh         rebuild the metadata cache (re-mirrors hosts)\n\
-                     --debug-running   dump detected pi processes (local + hosts)\n\n\
+                     --debug-running   dump detected pi processes (local + hosts)\n\
+                     --debug-focus     show which terminal tab each host resolves to\n\n\
                      no flags opens the TUI. /=search, ?=keys, enter=open\n\
                      config: ~/.config/psst/config.toml ([hosts.coop] ssh=\"coop\")"
                 );
@@ -165,6 +169,12 @@ fn project_base(cwd: &str) -> String {
 fn main() -> Result<()> {
     let args = parse_args()?;
     let cfg = config::Config::load();
+    // Answered before the archive scan: "where would Enter send me" has
+    // nothing to do with sessions and should stay instant.
+    if args.debug_focus {
+        print_focus_debug(&cfg);
+        return Ok(());
+    }
     let (sessions, hits, host_errors) = load_sessions(&cfg, args.refresh)?;
     for e in &host_errors {
         eprintln!("psst: {}", e);
@@ -206,6 +216,46 @@ fn main() -> Result<()> {
     match tui::run(&mut app)? {
         Some(action) => perform(action),
         None => Ok(()),
+    }
+}
+
+/// Explain the tab hop for every configured host.
+///
+/// This path fails invisibly by nature: a revoked Accessibility grant, a
+/// terminal that is not running, and a tag that matched nothing all look
+/// identical from the outside — you just end up somewhere unexpected. So
+/// each input is printed rather than inferred.
+fn print_focus_debug(cfg: &config::Config) {
+    let app = cfg.terminal();
+    println!("terminal:   {}", app);
+    println!(
+        "tmux-focus: {}",
+        psst::focus::tmux_focus_bin()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "not on PATH — remote opens use a new ssh window".to_string())
+    );
+    let titles = psst::focus::tab_titles(app);
+    if titles.is_empty() {
+        println!("tabs:       none visible (not macOS, {app} not running, or no Accessibility grant)");
+    } else {
+        println!("tabs:");
+        for t in &titles {
+            println!("  {}", t);
+        }
+    }
+    if cfg.hosts().is_empty() {
+        println!("hosts:      none configured");
+    }
+    for h in cfg.hosts() {
+        let tags = psst::focus::host_tags(&h.name, &h.ssh_target, h.tab.as_deref());
+        match psst::focus::match_tab(&titles, &tags) {
+            Some(tag) => println!("{}: focuses tab matching {:?}", h.name, tag),
+            None => println!(
+                "{}: no matching tab — opens a new ssh window (tried: {})",
+                h.name,
+                tags.join(", ")
+            ),
+        }
     }
 }
 
@@ -377,6 +427,56 @@ fn perform(action: tui::OpenAction) -> Result<()> {
                 bail!("tmux attach failed");
             }
         }
+        tui::OpenAction::SshFocus {
+            focus,
+            target,
+            inside,
+        } => {
+            // The session is already on screen somewhere; move to it rather
+            // than stacking a second ssh beside the tab that has it.
+            match psst::focus::focusable_tab(&focus.app, &focus.tags) {
+                Some(tag) => {
+                    psst::focus::focus_tab(&focus.app, &tag, Some((&focus.ssh_target, &target)))
+                }
+                // No tab holds this host (or no tmux-focus, or no
+                // Accessibility grant): opening one beats doing nothing.
+                None => perform(tui::OpenAction::SshAttach {
+                    ssh_target: focus.ssh_target,
+                    target,
+                    inside,
+                }),
+            }
+        }
+        tui::OpenAction::SshFocusNew {
+            focus,
+            cwd,
+            name,
+            command,
+            inside,
+        } => {
+            // Put the window in the host's own tmux: it then outlives the
+            // tab, and lands in the session that tab is already showing.
+            if let Some(tag) = psst::focus::focusable_tab(&focus.app, &focus.tags) {
+                if let Ok(target) =
+                    hosts::new_remote_window(&focus.ssh_target, &cwd, &name, &command)
+                {
+                    return psst::focus::focus_tab(
+                        &focus.app,
+                        &tag,
+                        Some((&focus.ssh_target, &target)),
+                    );
+                }
+                // Tab exists but the host has no tmux server to put a
+                // window in; fall through to a local ssh window.
+            }
+            perform(tui::OpenAction::SshNew {
+                ssh_target: focus.ssh_target,
+                cwd,
+                name,
+                command,
+                inside,
+            })
+        }
     }
 }
 
@@ -544,11 +644,11 @@ mod tests {
         let args = parse_args_from(Vec::<String>::new()).unwrap();
         assert!(!args.list && !args.json && !args.refresh && !args.debug_running);
         assert_eq!(args.scope, None);
-        let argv = ["--list", "--json", "--refresh", "--debug-running"]
+        let argv = ["--list", "--json", "--refresh", "--debug-running", "--debug-focus"]
             .iter()
             .map(|s| s.to_string());
         let args = parse_args_from(argv).unwrap();
-        assert!(args.list && args.json && args.refresh && args.debug_running);
+        assert!(args.list && args.json && args.refresh && args.debug_running && args.debug_focus);
         let err = parse_args_from(["--bogus".to_string()]).unwrap_err();
         assert!(err.to_string().contains("unknown argument"));
         // an existing dir resolves through canonicalization

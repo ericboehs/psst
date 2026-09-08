@@ -134,8 +134,7 @@ pub enum OpenAction {
         ssh_target: String,
         target: String,
         inside: bool,
-    },
-    /// Resume a remote session via `ssh -t <ssh_target> 'cd <cwd> && <command>'`.
+    },    /// Resume a remote session via `ssh -t <ssh_target> 'cd <cwd> && <command>'`.
     /// `command` is the remote resume command; `cwd` is the remote cwd.
     SshNew {
         ssh_target: String,
@@ -144,6 +143,33 @@ pub enum OpenAction {
         command: String,
         inside: bool,
     },
+    /// Bring forward the terminal tab already holding an ssh to this host,
+    /// with `target` (`session[:window]` on the remote) selected there.
+    /// Degrades to [`OpenAction::SshAttach`] when no tab can be focused.
+    SshFocus {
+        focus: TabFocus,
+        target: String,
+        inside: bool,
+    },
+    /// Open a window for an idle remote session in the host's own tmux, then
+    /// focus its tab. Degrades to [`OpenAction::SshNew`].
+    SshFocusNew {
+        focus: TabFocus,
+        cwd: String,
+        name: String,
+        command: String,
+        inside: bool,
+    },
+}
+
+/// Everything needed to find and click one host's terminal tab.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabFocus {
+    /// Terminal application owning the tab bar.
+    pub app: String,
+    pub ssh_target: String,
+    /// Tab-title fragments identifying the host, most specific first.
+    pub tags: Vec<String>,
 }
 
 pub struct App {
@@ -318,15 +344,21 @@ impl App {
         self.running.get(&s.key())
     }
 
-    fn ssh_target_for(&self, host: &str) -> Option<String> {
+    /// The `[hosts.<name>]` entry backing a session, or `None` when local.
+    fn host_config_for(&self, host: &str) -> Option<&crate::config::HostConfig> {
         if host == LOCAL_HOST {
             return None;
         }
-        self.config
-            .hosts()
-            .iter()
-            .find(|h| h.name == host)
-            .map(|h| h.ssh_target.clone())
+        self.config.hosts().iter().find(|h| h.name == host)
+    }
+
+    /// How to reach this host's terminal tab (see [`crate::focus`]).
+    fn tab_focus_for(&self, h: &crate::config::HostConfig) -> TabFocus {
+        TabFocus {
+            app: self.config.terminal().to_string(),
+            ssh_target: h.ssh_target.clone(),
+            tags: crate::focus::host_tags(&h.name, &h.ssh_target, h.tab.as_deref()),
+        }
     }
 
     /// Swap in a background [`full_refresh`] result, keeping the selection
@@ -882,17 +914,18 @@ impl App {
     pub fn open_selected(&self) -> Option<OpenAction> {
         let s = self.selected()?;
         let inside = std::env::var("TMUX").is_ok();
-        // Remote sessions open over ssh; local ones use tmux directly.
-        let ssh_target = self.ssh_target_for(&s.host);
+        // Remote sessions live in their host's terminal tab; local ones use
+        // tmux directly.
+        let host_cfg = self.host_config_for(&s.host);
         if let Some(hit) = self.hit_for(s) {
             if let Some(t) = &hit.tmux {
                 let target = match t.window {
                     Some(w) => format!("{}:{}", t.session, w),
                     None => t.session.clone(),
                 };
-                return match ssh_target {
-                    Some(ssh) => Some(OpenAction::SshAttach {
-                        ssh_target: ssh,
+                return match host_cfg {
+                    Some(h) => Some(OpenAction::SshFocus {
+                        focus: self.tab_focus_for(h),
                         target,
                         inside,
                     }),
@@ -907,9 +940,9 @@ impl App {
             .replace("{file}", &s.path.to_string_lossy())
             .replace("{id}", &s.id)
             .replace("{cwd}", &s.cwd);
-        match ssh_target {
-            Some(ssh) => Some(OpenAction::SshNew {
-                ssh_target: ssh,
+        match host_cfg {
+            Some(h) => Some(OpenAction::SshFocusNew {
+                focus: self.tab_focus_for(h),
                 cwd: s.cwd.clone(),
                 name: project_base(&s.cwd),
                 command,
@@ -2429,12 +2462,13 @@ mod tests {
     }
 
     #[test]
-    fn open_remote_session_uses_ssh() {
+    fn open_remote_session_targets_its_host_tab() {
         use crate::config::HostConfig;
         let cfg = Config::with_hosts_for_test(vec![HostConfig {
             name: "coop".to_string(),
             ssh_target: "coop".to_string(),
             sessions_dir: None,
+            tab: None,
         }]);
         assert_eq!(cfg.hosts().len(), 1);
         let mut app = fold_app();
@@ -2445,12 +2479,54 @@ mod tests {
         let pos = app.order.iter().position(|&i| app.sessions[i].host == "coop").unwrap();
         app.sel = pos;
         app.header_park = None;
+        // Idle remote session: window goes to the host's tmux, tab gets focus.
         match app.open_selected() {
-            Some(OpenAction::SshNew { ssh_target, cwd, .. }) => {
-                assert_eq!(ssh_target, "coop");
+            Some(OpenAction::SshFocusNew { focus, cwd, .. }) => {
+                assert_eq!(focus.ssh_target, "coop");
+                assert_eq!(focus.app, "Ghostty");
+                assert_eq!(focus.tags.first().map(String::as_str), Some("coop:"));
                 assert_eq!(cwd, "/home/agent");
             }
-            other => panic!("expected SshNew, got {:?}", other),
+            other => panic!("expected SshFocusNew, got {:?}", other),
         }
+        // Running remote session: focus the tab showing its tmux window.
+        let key = app.sessions[app.order[app.sel]].key();
+        app.running.insert(
+            key,
+            RunningHit {
+                pid: 99,
+                cpu: 0.0,
+                tmux: Some(crate::running::TmuxTarget {
+                    session: "code".to_string(),
+                    window: Some(3),
+                    attention: false,
+                }),
+                direct: true,
+                summary: None,
+                status: None,
+                peer_name: None,
+            },
+        );
+        match app.open_selected() {
+            Some(OpenAction::SshFocus { focus, target, .. }) => {
+                assert_eq!(focus.ssh_target, "coop");
+                assert_eq!(target, "code:3");
+            }
+            other => panic!("expected SshFocus, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn local_sessions_never_focus_a_tab() {
+        // psst already runs in the tab holding the local tmux, so a click
+        // would be a no-op at best and a jump away at worst.
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        app.sel = 0;
+        app.header_park = None;
+        assert!(matches!(
+            app.open_selected(),
+            Some(OpenAction::TmuxNew { .. }) | Some(OpenAction::TmuxAttach { .. })
+        ));
     }
 }

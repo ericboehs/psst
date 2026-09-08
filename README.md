@@ -45,6 +45,7 @@ psst --list           # plain table with a host column (pipe-friendly)
 psst --json           # JSON array (same rows as --list; each row has "host")
 psst --refresh        # rebuild the metadata cache from scratch (re-mirrors hosts)
 psst --debug-running  # print detected pi processes + tmux targets (local + hosts)
+psst --debug-focus    # print terminal tabs and which host each one holds
 ```
 
 Remote sessions carry a magenta `[coop]` badge, show up in the header as
@@ -65,7 +66,7 @@ working with the last mirror + local sessions.
 | `h` / `l` | fold / unfold the current group |
 | `H` / `L` | fold / unfold all groups |
 | `?` | shortcut overlay (also in the TUI footer) |
-| `Enter` | **open**: attach to the running tmux session, or spawn `pi --session <file>` in a new tmux window (on a header: toggle fold). Remote sessions open via `ssh -t <host>` (attach: `tmux attach` on the remote; resume: `cd <cwd> && <command>` on the remote, in a new local window) |
+| `Enter` | **open**: attach to the running tmux session, or spawn `pi --session <file>` in a new tmux window (on a header: toggle fold). Remote sessions focus the terminal tab already holding that host's ssh (see below) |
 | `d` | toggle the bottom detail pane (off by default) |
 | `p` | hide/show last user prompt on a second line under each row |
 | `r` / `R` | rescan (cache-aware) / full rescan |
@@ -105,10 +106,23 @@ then remotes by recency.
 - **Open**: running sessions switch/attach to their tmux target (window, not
   just session); idle sessions spawn a new tmux window (or detached session
   when outside tmux) running the resume command in the session's project cwd.
-  Remote sessions do the same over `ssh -t`: attach runs
-  `tmux select-window … \; attach` on the remote; resume runs
-  `cd <remote-cwd> && <resume-command>` on the remote inside a new *local*
-  tmux window (or local session + attach when outside tmux).
+- **Opening a remote session**: a session on another box already has a home on
+  screen — the terminal tab holding an ssh to that host — so psst brings that
+  tab forward instead of stacking a second ssh beside it. Running sessions
+  select their window in the remote tmux first; idle ones get a new window in
+  the *host's own* tmux (in the session that tab is attached to, so it lands
+  where you are looking, and it outlives the tab). The click is delegated to
+  [`tmux-focus`](https://github.com/ericboehs/agent-notify), which drives the
+  tab bar through the accessibility API — macOS exposes no way to focus a
+  Ghostty surface. Tabs are matched by title, most specific first: `coop:`
+  (a remote tmux renames the tab to `<host>:<session>:<window> …`), then
+  `ssh coop` (Ghostty titles a bare tab with its command), then plain `coop`
+  last, since that also matches a tab merely mentioning the box. Pin one with
+  `tab = "…"` under the host. When the tab, `tmux-focus`, or the Accessibility
+  grant is missing, psst falls back to the old behaviour: `ssh -t <host>`
+  running `tmux select-window … \; attach` (or `cd <cwd> && <command>`) in a
+  new *local* tmux window. `psst --debug-focus` prints the visible tabs and
+  what each host resolves to, since these failures are otherwise invisible.
 - **Hosts**: each `[hosts.<name>]` entry is dialed over multiplexed ssh
   (`ControlMaster=auto`, sockets in `~/.cache/psst/ssh/`, 10min persist —
   the first connection pays the handshake, follow-ups cost milliseconds,
@@ -149,6 +163,8 @@ active_secs = 120
 [ui]
 # grouping on launch: "day" (default), "project", "flat", or "host"
 group = "day"
+# terminal whose tabs are focused when opening a remote session
+terminal = "Ghostty"
 
 [hosts.coop]
 # ssh target as in `ssh <target>` (key-based, BatchMode — no passwords)
@@ -156,6 +172,8 @@ ssh = "coop"
 # enabled = true (default when the table exists; false hides the host)
 # sessions_dir = ".pi/agent/sessions" (default; $PI_CODING_AGENT_DIR wins
 #   on the remote when set; absolute or ~/ paths also allowed)
+# tab = "coop:"  (tab-title fragment holding this host's ssh; guessed from
+#   the name and ssh target when unset — see `psst --debug-focus`)
 
 [hosts.gfe]
 # display name and ssh target may differ: this entry shows as `gfe` but
