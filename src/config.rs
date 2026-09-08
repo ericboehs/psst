@@ -80,6 +80,7 @@ pub struct HostConfig {
     pub sessions_dir: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Config {
     resume_command: String,
     active_secs: i64,

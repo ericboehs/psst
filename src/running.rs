@@ -297,18 +297,7 @@ pub fn detect() -> Vec<PiProc> {
 }
 
 fn ssh_run(target: &str, remote_cmd: &str) -> anyhow::Result<String> {
-    let out = std::process::Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=5",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectionAttempts=1",
-            target,
-            remote_cmd,
-        ])
-        .output()?;
+    let out = crate::hosts::ssh_command(target, remote_cmd).output()?;
     if !out.status.success() {
         anyhow::bail!("ssh {}: {}", target, String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -368,9 +357,34 @@ pub(crate) fn parse_remote_probe(out: &str) -> HashMap<u32, (Option<PathBuf>, Op
     map
 }
 
-/// Snapshot pi processes on a remote host over ssh. Linux remotes read
-/// `/proc/<pid>/cwd` and `/proc/<pid>/environ`; macOS remotes (no /proc)
-/// use lsof + `ps eww` — all in a single batch probe (no per-pid roundtrips).
+/// Split multi-section script output on `===PSST-<NAME>===` marker lines
+/// into name → body. Section bodies keep their trailing newline. Pure.
+pub(crate) fn split_sections(out: &str) -> HashMap<String, String> {
+    let mut sections: HashMap<String, String> = HashMap::new();
+    let mut cur: Option<String> = None;
+    for line in out.lines() {
+        if let Some(name) = line
+            .strip_prefix("===PSST-")
+            .and_then(|s| s.strip_suffix("==="))
+        {
+            // Per-pid markers (`===PSST-NAME:123===`) belong to the
+            // enrichment parser, not bare sections — still, never let body
+            // lines leak across a marker.
+            cur = Some(name.to_string());
+            sections.entry(name.to_string()).or_default();
+        } else if let Some(name) = &cur {
+            if let Some(body) = sections.get_mut(name) {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+    }
+    sections
+}
+
+/// Snapshot pi processes on a remote host over ssh in two roundtrips: `ps`
+/// first (to learn the pi pids), then one combined tmux-panes + cwd/environ
+/// probe script whose `===PSST-*===` sections parse separately.
 pub fn detect_remote(ssh_target: &str, host_name: &str) -> anyhow::Result<Vec<PiProc>> {
     let ps_out = ssh_run(ssh_target, "ps -axo pid=,ppid=,etime=,command=")?;
     let now = chrono::Utc::now().timestamp();
@@ -383,16 +397,14 @@ pub fn detect_remote(ssh_target: &str, host_name: &str) -> anyhow::Result<Vec<Pi
     if pi_pids.is_empty() {
         return Ok(Vec::new());
     }
-    let tmux_out = ssh_run(
-        ssh_target,
-        "tmux list-panes -a -F '#{pane_pid}\t#{pane_id}\t#{session_name}\t#{window_index}\t#{@special_activity}' 2>/dev/null || true",
-    )
-    .unwrap_or_default();
-    let (panes, panes_by_id) = parse_tmux_panes(&tmux_out);
-    // Batch cwd + TMUX_PANE for just the pi pids (one ssh call).
-    let script = remote_probe_script(&pi_pids);
-    let probe_out = ssh_run(ssh_target, &script).unwrap_or_default();
-    let probe = parse_remote_probe(&probe_out);
+    let mut script = String::from(
+        "echo '===PSST-TMUX==='; tmux list-panes -a -F '#{pane_pid}\t#{pane_id}\t#{session_name}\t#{window_index}\t#{@special_activity}' 2>/dev/null || true; echo '===PSST-PROBE==='; ",
+    );
+    script.push_str(&remote_probe_script(&pi_pids));
+    let sections = split_sections(&ssh_run(ssh_target, &script).unwrap_or_default());
+    let empty = String::new();
+    let (panes, panes_by_id) = parse_tmux_panes(sections.get("TMUX").unwrap_or(&empty));
+    let probe = parse_remote_probe(sections.get("PROBE").unwrap_or(&empty));
     let mut procs = Vec::new();
     for pid in pi_pids {
         let Some((ppid, cmd, started_at)) = table.get(&pid) else { continue };
@@ -413,35 +425,73 @@ pub fn detect_remote(ssh_target: &str, host_name: &str) -> anyhow::Result<Vec<Pi
     Ok(procs)
 }
 
-/// Remote peer names from `~/.claude/sessions/<pid>.json` (one ssh call).
-/// Missing files are skipped; empty map means "mint from cwd" downstream.
-pub fn fetch_remote_names(ssh_target: &str, pids: &[u32]) -> HashMap<u32, String> {
+/// Fetch both remote enrichment sources in one ssh call: peer names from
+/// `~/.claude/sessions/<pid>.json` and agent-link summaries from
+/// `~/.cache/agent-link/summaries/<pid>.json`. Missing files are skipped;
+/// empty maps mean "mint from cwd" downstream. Hosts without pi-agent-link
+/// (gfew, coop) simply yield an empty summaries map.
+pub fn fetch_remote_enrichment(
+    ssh_target: &str,
+    pids: &[u32],
+) -> (HashMap<u32, String>, HashMap<u32, CacheFields>) {
+    let empty = (HashMap::new(), HashMap::new());
     if pids.is_empty() {
-        return HashMap::new();
+        return empty;
     }
-    let mut script = String::new();
+    let mut script = String::from("echo '===PSST-NAMES==='; ");
     for pid in pids {
         script.push_str(&format!(
             "echo PID:{pid}; cat ~/.claude/sessions/{pid}.json 2>/dev/null; echo; ",
             pid = pid
         ));
     }
-    let Ok(out) = ssh_run(ssh_target, &script) else { return HashMap::new() };
+    script.push_str("echo '===PSST-SUMMARIES==='; ");
+    for pid in pids {
+        script.push_str(&format!(
+            "echo PID:{pid}; cat ~/.cache/agent-link/summaries/{pid}.json 2>/dev/null || cat \"$XDG_CACHE_HOME/agent-link/summaries/{pid}.json\" 2>/dev/null; echo; ",
+            pid = pid
+        ));
+    }
+    let Ok(out) = ssh_run(ssh_target, &script) else { return empty };
+    parse_enrichment(&out)
+}
+
+/// Parse [`fetch_remote_enrichment`] output: `===PSST-NAMES===` /
+/// `===PSST-SUMMARIES===` sections of `PID:<pid>` + single-line JSON rows.
+/// Pure for tests.
+pub(crate) fn parse_enrichment(
+    out: &str,
+) -> (HashMap<u32, String>, HashMap<u32, CacheFields>) {
     let mut names = HashMap::new();
+    let mut summaries = HashMap::new();
+    let mut in_summaries = false;
     let mut cur: Option<u32> = None;
+    let non_empty = |v: &serde_json::Value, k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
     for line in out.lines() {
-        if let Some(rest) = line.strip_prefix("PID:") {
+        if line.starts_with("===PSST-") {
+            in_summaries = line.contains("SUMMARIES");
+            cur = None;
+        } else if let Some(rest) = line.strip_prefix("PID:") {
             cur = rest.trim().parse::<u32>().ok();
         } else if let Some(pid) = cur {
             let line = line.trim();
             if line.starts_with('{') {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                    if let Some(n) = v
-                        .get("name")
-                        .and_then(|x| x.as_str())
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                    {
+                    if in_summaries {
+                        summaries.insert(
+                            pid,
+                            CacheFields {
+                                name: non_empty(&v, "name"),
+                                summary: non_empty(&v, "summary"),
+                                status: non_empty(&v, "status"),
+                            },
+                        );
+                    } else if let Some(n) = non_empty(&v, "name") {
                         names.insert(pid, n);
                     }
                 }
@@ -449,52 +499,7 @@ pub fn fetch_remote_names(ssh_target: &str, pids: &[u32]) -> HashMap<u32, String
             }
         }
     }
-    names
-}
-
-/// Remote agent-link summaries (`~/.cache/agent-link/summaries/<pid>.json`).
-/// Absent on hosts without pi-agent-link — then empty.
-pub fn fetch_remote_summaries(ssh_target: &str, pids: &[u32]) -> HashMap<u32, CacheFields> {
-    if pids.is_empty() {
-        return HashMap::new();
-    }
-    let mut script = String::new();
-    for pid in pids {
-        script.push_str(&format!(
-            "echo PID:{pid}; cat ~/.cache/agent-link/summaries/{pid}.json 2>/dev/null || cat \"$XDG_CACHE_HOME/agent-link/summaries/{pid}.json\" 2>/dev/null; echo; ",
-            pid = pid
-        ));
-    }
-    let Ok(out) = ssh_run(ssh_target, &script) else { return HashMap::new() };
-    let mut map = HashMap::new();
-    let mut cur: Option<u32> = None;
-    for line in out.lines() {
-        if let Some(rest) = line.strip_prefix("PID:") {
-            cur = rest.trim().parse::<u32>().ok();
-        } else if let Some(pid) = cur {
-            let line = line.trim();
-            if line.starts_with('{') {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                    let get = |k: &str| {
-                        v.get(k)
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                    };
-                    map.insert(
-                        pid,
-                        CacheFields {
-                            name: get("name"),
-                            summary: get("summary"),
-                            status: get("status"),
-                        },
-                    );
-                }
-                cur = None;
-            }
-        }
-    }
-    map
+    (names, summaries)
 }
 
 /// Read TMUX_PANE from a process environment (macOS/Linux `ps eww`).
@@ -1077,6 +1082,34 @@ mod tests {
         assert_eq!(m[&1].1, Some("%3".to_string()));
         assert_eq!(m[&2].0, None);
         assert!(!m.contains_key(&0));
+    }
+
+    #[test]
+    fn sections_split_on_markers() {
+        let out = "noise\n===PSST-TMUX===\na\nb\n===PSST-PROBE===\nc\n";
+        let s = split_sections(out);
+        assert_eq!(s.get("TMUX").map(|x| x.as_str()), Some("a\nb\n"));
+        assert_eq!(s.get("PROBE").map(|x| x.as_str()), Some("c\n"));
+        assert!(!s.contains_key("NAMES"));
+        // Body lines before any marker are dropped, never misattributed.
+        assert!(!s.values().any(|b| b.contains("noise")));
+    }
+
+    #[test]
+    fn enrichment_routes_names_and_summaries() {
+        let out = "===PSST-NAMES===\nPID:11\n{\"name\":\"pi-x\"}\nPID:12\n{}\n\
+                       ===PSST-SUMMARIES===\nPID:11\n{\"name\":\"pi-x\",\"status\":\"thinking\",\"summary\":\"s\"}\n";
+        let (names, summaries) = parse_enrichment(out);
+        assert_eq!(names.get(&11).map(|s| s.as_str()), Some("pi-x"));
+        assert!(!names.contains_key(&12));
+        assert_eq!(
+            summaries.get(&11),
+            Some(&CacheFields {
+                name: Some("pi-x".to_string()),
+                summary: Some("s".to_string()),
+                status: Some("thinking".to_string()),
+            })
+        );
     }
 
     #[test]

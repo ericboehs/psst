@@ -73,7 +73,11 @@ working with the last mirror + local sessions.
 | `q` | quit |
 
 Local running detection ticks every 1s; the session archive rescans every
-10s. Remote hosts sync + detect on the 10s rescan (and `r`/`R`) only.
+10s. Startup paints local sessions first (no ssh), then a background worker
+fills remotes in behind the first frame. Remote hosts sync + detect on the
+10s rescan (and `r`/`R`) only, and the rescan runs on that worker thread —
+keys stay live while ssh is in flight (a dim `sync…` badge in the header
+shows work is pending, and the selection is preserved across the swap).
 Filter, grouping, sort, detail, prompts, and the selected row are restored
 the next time you open psst (`~/.cache/psst/ui-state.json`).
 
@@ -105,7 +109,11 @@ then remotes by recency.
   `tmux select-window … \; attach` on the remote; resume runs
   `cd <remote-cwd> && <resume-command>` on the remote inside a new *local*
   tmux window (or local session + attach when outside tmux).
-- **Hosts**: each `[hosts.<name>]` entry is listed over ssh and mirrored to
+- **Hosts**: each `[hosts.<name>]` entry is dialed over multiplexed ssh
+  (`ControlMaster=auto`, sockets in `~/.cache/psst/ssh/`, 10min persist —
+  the first connection pays the handshake, follow-ups cost milliseconds,
+  across psst runs too). Calls are batched to ~4 per host per rescan
+  (list, `ps`, tmux+probe sections, enrichment) and mirrored to
   `~/.cache/psst/hosts/<name>/<absolute-remote-path>` (only changed files
   are fetched, checked against the shared metadata cache). The mirror backs
   the detail pane, so remotes stay browsable while offline. Running
@@ -116,7 +124,10 @@ then remotes by recency.
   partitioned by host, so identical cwds on two machines never cross-match.
   Minted fallback names are host-prefixed (`pi-coop-agent`).
 - **Cache**: parsed metadata is cached at `~/.cache/psst/cache.json`, keyed by
-  host+path+mtime+size, so rescans only reparse changed files.
+  host+path+mtime+size, so rescans only reparse changed files. Files ≥5MB
+  additionally persist fold state (lines folded + parent→child counts), so a
+  rescan folds only appended tail lines instead of re-reading megabytes —
+  exact, including branch points, since session files are append-only.
 
 ## Config — `~/.config/psst/config.toml`
 

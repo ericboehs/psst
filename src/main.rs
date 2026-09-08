@@ -11,8 +11,8 @@
 use psst::config;
 use psst::hosts;
 use psst::running::{
-    self, attach_remote_enrichment, detect, detect_remote, fetch_remote_names,
-    fetch_remote_summaries, live_mark, map_running,
+    self, attach_remote_enrichment, detect, detect_remote, fetch_remote_enrichment,
+    live_mark, map_running,
 };
 use psst::scan::{in_scope, resolve_scope, scan, sessions_root, SessionKey, SessionMeta};
 use psst::tui;
@@ -214,11 +214,23 @@ fn load_sessions(
     force: bool,
 ) -> Result<(Vec<SessionMeta>, Hits, Vec<String>)> {
     let mut sessions = scan(&sessions_root(), force)?;
-    let (mut remote_sessions, mut errors) = hosts::sync_all(cfg.hosts(), force);
-    sessions.append(&mut remote_sessions);
+    let mut errors = Vec::new();
+    let mut synced_ok = std::collections::HashSet::new();
+    for sync in hosts::sync_all(cfg.hosts(), force) {
+        if sync.error.is_none() {
+            synced_ok.insert(sync.name.clone());
+        }
+        if let Some(e) = sync.error {
+            errors.push(e);
+        }
+        sessions.extend(sync.sessions);
+    }
 
     let mut procs = detect();
     for h in cfg.hosts() {
+        if !synced_ok.contains(&h.name) {
+            continue;
+        }
         match detect_remote(&h.ssh_target, &h.name) {
             Ok(rp) => procs.extend(rp),
             Err(e) => errors.push(format!("{}: {}", h.name, e)),
@@ -237,8 +249,7 @@ fn load_sessions(
         if remote_pids.is_empty() {
             continue;
         }
-        let summaries = fetch_remote_summaries(&h.ssh_target, &remote_pids);
-        let names = fetch_remote_names(&h.ssh_target, &remote_pids);
+        let (names, summaries) = fetch_remote_enrichment(&h.ssh_target, &remote_pids);
         // Restrict to this host's hits.
         let mut sub: HashMap<SessionKey, running::RunningHit> = hits
             .iter()

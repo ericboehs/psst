@@ -81,19 +81,46 @@ pub fn parse_find_output(out: &str) -> Vec<RemoteFile> {
     files
 }
 
+/// Directory for ssh multiplex sockets. Sibling of `cache.json`, so
+/// `PSST_CACHE` test overrides stay isolated.
+pub(crate) fn ssh_socket_dir() -> PathBuf {
+    let cache = scan::cache_path();
+    match cache.parent() {
+        Some(d) => d.join("ssh"),
+        None => PathBuf::from("ssh"),
+    }
+}
+
+/// Build an ssh invocation with connection multiplexing: the first call to a
+/// host pays the handshake, follow-ups reuse the master in milliseconds.
+/// Masters linger 10min (`ControlPersist`) so separate psst runs share them.
+/// With `ControlMaster=auto`, a dead master is replaced transparently.
+pub(crate) fn ssh_command(target: &str, remote_cmd: &str) -> Command {
+    let dir = ssh_socket_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let socket = dir.join("%r@%h:%p");
+    let mut cmd = Command::new("ssh");
+    cmd.args([
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectionAttempts=1",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        &format!("ControlPath={}", socket.to_string_lossy()),
+        "-o",
+        "ControlPersist=600",
+        target,
+        remote_cmd,
+    ]);
+    cmd
+}
+
 fn ssh_output(target: &str, remote_cmd: &str) -> anyhow::Result<String> {
-    let out = Command::new("ssh")
-        .args([
-            "-o",
-            "ConnectTimeout=5",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectionAttempts=1",
-            target,
-            remote_cmd,
-        ])
-        .output()?;
+    let out = ssh_command(target, remote_cmd).output()?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         anyhow::bail!(
@@ -156,24 +183,17 @@ fn list_remote(host: &HostConfig, root: &str) -> anyhow::Result<Vec<RemoteFile>>
         "find {} -name '*.jsonl' -printf '%p\\t%T@\\t%s\\n' 2>/dev/null",
         sh_quote(root)
     );
-    // GNU -printf is unknown to BSD find (macOS remotes): that failure falls
-    // through to the stat fallback instead of failing the sync.
+    // One roundtrip, not two: GNU `-printf` where supported, else BSD `stat`
+    // (macOS remotes fail the first branch and run the second). Every ssh
+    // call costs ~200ms even multiplexed, so branches compose with `||`.
     // NB: `\t` in the BSD format is a literal TAB (Rust escape): BSD stat
     // prints format backslashes through untouched, so an escaped `\\t`
     // would yield no separators for `parse_find_output` to split on.
-    if let Ok(out) = ssh_output(&host.ssh_target, &gnu) {
-        let files = parse_find_output(&out);
-        if !files.is_empty() {
-            return Ok(files);
-        }
-        // Empty could still mean "no sessions" — but confirm via BSD before
-        // trusting it, since a BSD host also yields empty here.
-    }
     let bsd = format!(
         "find {} -name '*.jsonl' -exec stat -f '%N\t%m\t%z' {{}} + 2>/dev/null",
         sh_quote(root)
     );
-    let out = ssh_output(&host.ssh_target, &bsd)?;
+    let out = ssh_output(&host.ssh_target, &format!("{} || {}", gnu, bsd))?;
     Ok(parse_find_output(&out))
 }
 
@@ -239,18 +259,27 @@ pub(crate) fn parse_fetch_output(out: &str) -> HashMap<PathBuf, String> {
 /// Result of syncing one host: sessions plus a displayable error when the
 /// host was unreachable (sessions then holds whatever the cache had, if anything).
 pub struct HostSync {
+    pub name: String,
     pub sessions: Vec<SessionMeta>,
     pub error: Option<String>,
+}
+
+impl HostSync {
+    pub fn ok(&self) -> bool {
+        self.error.is_none()
+    }
 }
 
 /// Mirror one host's sessions and return parsed metadata.
 pub fn sync_host(host: &HostConfig, force: bool) -> HostSync {
     match sync_host_inner(host, force) {
         Ok(s) => HostSync {
+            name: host.name.clone(),
             sessions: s,
             error: None,
         },
         Err(e) => HostSync {
+            name: host.name.clone(),
             sessions: cached_sessions_for_host(&host.name),
             error: Some(format!("{}: {}", host.name, e)),
         },
@@ -397,18 +426,10 @@ fn sync_host_inner(host: &HostConfig, force: bool) -> anyhow::Result<Vec<Session
     Ok(out)
 }
 
-/// Sync every configured host, returning merged sessions plus per-host errors.
-pub fn sync_all(hosts: &[HostConfig], force: bool) -> (Vec<SessionMeta>, Vec<String>) {
-    let mut sessions = Vec::new();
-    let mut errors = Vec::new();
-    for h in hosts {
-        let sync = sync_host(h, force);
-        sessions.extend(sync.sessions);
-        if let Some(e) = sync.error {
-            errors.push(e);
-        }
-    }
-    (sessions, errors)
+/// Sync every configured host. Callers merge `sessions`, show `error`s, and
+/// skip ssh detection for hosts that failed to sync (one timeout, not three).
+pub fn sync_all(hosts: &[HostConfig], force: bool) -> Vec<HostSync> {
+    hosts.iter().map(|h| sync_host(h, force)).collect()
 }
 
 #[cfg(test)]
@@ -432,6 +453,17 @@ mod tests {
         let m = mirror_path("coop", Path::new("/home/agent/.pi/agent/sessions/--x--/a.jsonl"));
         let s = m.to_string_lossy();
         assert!(s.contains("hosts/coop/home/agent/.pi/agent/sessions/--x--/a.jsonl"), "got {}", s);
+    }
+
+    #[test]
+    fn ssh_uses_connection_multiplexing() {
+        // Drop the Bourne-sensitive parts; assert the multiplex flags that
+        // make hosts 2-12 cheap after the first handshake.
+        let cmd = format!("{:?}", ssh_command("coop", "true"));
+        assert!(cmd.contains("ControlMaster=auto"), "got {}", cmd);
+        assert!(cmd.contains("ControlPersist=600"), "got {}", cmd);
+        assert!(cmd.contains("ControlPath="), "got {}", cmd);
+        assert!(cmd.contains("BatchMode=yes"), "got {}", cmd);
     }
 
     #[test]

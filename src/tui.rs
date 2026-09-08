@@ -3,8 +3,8 @@
 use crate::config::Config;
 use crate::hosts::{self, local_path_for};
 use crate::running::{
-    attach_remote_enrichment, detect, detect_remote, fetch_remote_names,
-    fetch_remote_summaries, live_mark, map_running, LiveMark, RunningHit,
+    attach_remote_enrichment, detect, detect_remote, fetch_remote_enrichment,
+    live_mark, map_running, LiveMark, RunningHit,
 };
 use crate::scan::{in_scope, recent_messages_from_str, scan, sessions_root, SessionKey, SessionMeta, LOCAL_HOST};
 use anyhow::Result;
@@ -152,6 +152,10 @@ pub struct App {
     /// Mirror/sync errors per host (e.g. `coop: ssh failed`); shown in the
     /// header until the next successful refresh.
     pub host_errors: Vec<String>,
+    /// A background full-refresh worker is in flight. Set by the event loop
+    /// in [`run`]; renders a `sync…` badge so a slow host reads as loading,
+    /// not frozen.
+    pub syncing: bool,
     /// Indices into `sessions` after filter+sort; `sel` indexes this.
     pub order: Vec<usize>,
     pub sel: usize,
@@ -283,6 +287,7 @@ impl App {
             sel: 0,
             filter: String::new(),
             host_errors: Vec::new(),
+            syncing: false,
             group: match config.group_default() {
                 "project" => Group::Project,
                 "flat" => Group::Flat,
@@ -304,7 +309,7 @@ impl App {
             config,
         };
         app.load_ui_state();
-        app.refresh(false);
+        app.refresh_local();
         app
     }
 
@@ -324,41 +329,94 @@ impl App {
             .map(|h| h.ssh_target.clone())
     }
 
-    /// Rescan everything: local sessions, host mirrors, and local + remote
-    /// running processes. Selection is pinned by host-qualified key so it
-    /// survives the list changing underneath it.
-    pub fn refresh(&mut self, force: bool) {
+    /// Swap in a background [`full_refresh`] result, keeping the selection
+    /// pinned to its session (or the restored ui-state row) across the swap.
+    fn apply_refresh(&mut self, res: RefreshResult, sel_key: Option<SessionKey>) {
+        self.sessions = res.sessions;
+        self.running = res.hits;
+        self.host_errors = res.errors;
+        self.apply_filter_sort();
+        self.restore_selection(sel_key);
+    }
+
+    /// Re-pin the selection to a session key after the list changes.
+    fn restore_selection(&mut self, sel_key: Option<SessionKey>) {
+        let restore = sel_key.or_else(|| self.pending_sel.take());
+        if let Some(k) = restore {
+            if let Some(pos) = self
+                .order
+                .iter()
+                .position(|&i| self.sessions[i].key() == k)
+            {
+                self.sel = pos;
+            }
+        }
+        self.clamp_sel();
+    }
+
+    /// Local-only rescan with no ssh: fast first paint at startup. The event
+    /// loop queues a background [`full_refresh`] immediately, so remotes pop
+    /// in a moment later instead of blocking the first frame on handshakes.
+    pub fn refresh_local(&mut self) {
         let sel_key = self.order.get(self.sel).map(|&i| self.sessions[i].key());
-        let mut sessions = scan(&sessions_root(), force).unwrap_or_default();
+        self.sessions = scan(&sessions_root(), false).unwrap_or_default();
+        let procs = detect();
+        self.running = map_running(&procs, &self.sessions, self.config.active_secs());
+        self.apply_filter_sort();
+        self.restore_selection(sel_key);
+    }
+}
+
+/// Output of one full rescan, computed off the UI thread.
+struct RefreshResult {
+    sessions: Vec<SessionMeta>,
+    hits: HashMap<SessionKey, RunningHit>,
+    errors: Vec<String>,
+}
+
+/// Rescan everything: local sessions, host mirrors, local + remote running
+/// processes with remote ssh enrichment. Pure I/O + compute, no `&mut App` —
+/// safe to run on a background thread while the TUI keeps handling keys.
+fn full_refresh(config: &Config, force: bool) -> RefreshResult {
+    let root = sessions_root();
+        let mut sessions = scan(&root, force).unwrap_or_default();
         let mut errors = Vec::new();
-        for h in self.config.hosts() {
-            let sync = hosts::sync_host(h, force);
-            sessions.extend(sync.sessions);
+        let mut synced_ok: HashSet<String> = HashSet::new();
+        for sync in hosts::sync_all(config.hosts(), force) {
+            if sync.ok() {
+                synced_ok.insert(sync.name.clone());
+            }
             if let Some(e) = sync.error {
                 errors.push(e);
             }
+            sessions.extend(sync.sessions);
         }
         let mut procs = detect();
-        for h in self.config.hosts() {
+        for h in config.hosts() {
+            // A failed sync already waited out one ssh timeout; don't spend
+            // two more on detection for a host that's down.
+            if !synced_ok.contains(&h.name) {
+                continue;
+            }
             match detect_remote(&h.ssh_target, &h.name) {
                 Ok(rp) => procs.extend(rp),
                 Err(e) => errors.push(format!("{}: {}", h.name, e)),
             }
         }
-        let mut hits = map_running(&procs, &sessions, self.config.active_secs());
-        for h in self.config.hosts() {
-            let pids: Vec<u32> = hits
+        let mut hits = map_running(&procs, &sessions, config.active_secs());
+        // ssh enrichment for remote hits (names/status from the remote).
+        for h in config.hosts() {
+            let remote_pids: Vec<u32> = hits
                 .iter()
                 .filter(|(k, _)| k.host == h.name)
                 .map(|(_, hit)| hit.pid)
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
-            if pids.is_empty() {
+            if remote_pids.is_empty() {
                 continue;
             }
-            let names = fetch_remote_names(&h.ssh_target, &pids);
-            let summaries = fetch_remote_summaries(&h.ssh_target, &pids);
+            let (names, summaries) = fetch_remote_enrichment(&h.ssh_target, &remote_pids);
             let mut sub: HashMap<SessionKey, RunningHit> = hits
                 .iter()
                 .filter(|(k, _)| k.host == h.name)
@@ -369,17 +427,10 @@ impl App {
                 hits.insert(k, v);
             }
         }
-        self.sessions = sessions;
-        self.running = hits;
-        self.host_errors = errors;
-        self.apply_filter_sort();
-        let restore = sel_key.or_else(|| self.pending_sel.take());
-        if let Some(k) = restore {
-            if let Some(pos) = self.order.iter().position(|&i| self.sessions[i].key() == k) {
-                self.sel = pos;
-            }
-        }
-        self.clamp_sel();
+    RefreshResult {
+        sessions,
+        hits,
+        errors,
     }
 }
 
@@ -1246,6 +1297,10 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
             ));
         }
     }
+    if app.syncing {
+        header_spans.push(Span::styled(" · ", dim));
+        header_spans.push(Span::styled("sync…", dim));
+    }
     if !app.host_errors.is_empty() {
         header_spans.push(Span::styled(" · ", dim));
         header_spans.push(Span::styled(
@@ -1565,12 +1620,65 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
     let mut last_full = std::time::Instant::now();
     let mut last_running = std::time::Instant::now();
     let mut result: Option<OpenAction> = None;
+    // Full rescans (local scan + ssh mirrors + remote detection) run on a
+    // worker thread: with two hosts that's a dozen ssh roundtrips, and doing
+    // them here froze key handling for seconds. Only one worker at a time;
+    // a refresh requested mid-flight (10s tick or r/R) queues behind it.
+    // A panicking worker must wedge neither the list nor future refreshes:
+    // failures arrive as `None` and keep the current data on screen.
+    let (refresh_tx, refresh_rx) =
+        std::sync::mpsc::channel::<(Option<RefreshResult>, bool)>();
+    let mut refresh_busy = false;
+    // Startup painted local-only (`App::new` → `refresh_local`); queue the
+    // full pass at once so remotes fill in behind the first frame instead
+    // of blocking it on ssh handshakes.
+    let mut refresh_queued: Option<bool> = Some(false);
+    let spawn_refresh = |app: &App,
+                         tx: &std::sync::mpsc::Sender<(Option<RefreshResult>, bool)>,
+                         force: bool| {
+        let config = app.config.clone();
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let res = std::panic::catch_unwind(|| full_refresh(&config, force)).ok();
+            let _ = tx.send((res, force));
+        });
+    };
+
     loop {
-        if last_full.elapsed() > std::time::Duration::from_secs(10) {
-            app.refresh(false);
+        // Collect a finished background refresh without blocking. The
+        // selection key is read now (post-keypress) so the swap doesn't yank
+        // a row the user just moved to while ssh was in flight.
+        let mut drained: Option<(Option<RefreshResult>, bool)> = None;
+        while let Ok(msg) = refresh_rx.try_recv() {
+            drained = Some(msg);
+        }
+        if let Some((res, _force)) = drained {
+            refresh_busy = false;
+            app.syncing = false;
+            if let Some(res) = res {
+                let sel_key = app.order.get(app.sel).map(|&i| app.sessions[i].key());
+                app.apply_refresh(res, sel_key);
+            }
             last_full = std::time::Instant::now();
             last_running = last_full;
+        }
+        if !refresh_busy {
+            if let Some(force) = refresh_queued.take() {
+                app.syncing = true;
+                spawn_refresh(app, &refresh_tx, force);
+                refresh_busy = true;
+            } else if last_full.elapsed() > std::time::Duration::from_secs(10) {
+                app.syncing = true;
+                spawn_refresh(app, &refresh_tx, false);
+                refresh_busy = true;
+            } else if last_running.elapsed() > std::time::Duration::from_secs(1) {
+                // Cheap synchronous tick: local `ps` only, no ssh.
+                app.refresh_running();
+                last_running = std::time::Instant::now();
+            }
         } else if last_running.elapsed() > std::time::Duration::from_secs(1) {
+            // Even mid-sync, local dots stay live: re-map local procs over
+            // the current (pre-swap) session list.
             app.refresh_running();
             last_running = std::time::Instant::now();
         }
@@ -1587,7 +1695,16 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
                 }
                 match handle_key(app, key, &items, list_state.selected()) {
                     KeyOutcome::Continue => {}
-                    KeyOutcome::Refresh(full) => app.refresh(full),
+                    KeyOutcome::Refresh(full) => {
+                        // Queue behind any in-flight worker; the loop spawns
+                        // it (a force refresh wins over a queued routine one).
+                        refresh_queued = Some(refresh_queued.unwrap_or(false) || full);
+                        app.status = if full {
+                            "full rescan queued".into()
+                        } else {
+                            "rescan queued".into()
+                        };
+                    }
                     KeyOutcome::Open(a) => {
                         result = Some(a);
                         break;
@@ -1809,6 +1926,7 @@ mod tests {
             ],
             running: HashMap::new(),
             host_errors: Vec::new(),
+            syncing: false,
             order: Vec::new(),
             sel: 0,
             filter: String::new(),
@@ -2269,6 +2387,37 @@ mod tests {
         let idx = app.sessions.iter().position(|s| s.host == "coop").unwrap();
         let hit_lines = detail_lines(&app.sessions[idx], None, &[]);
         assert!(hit_lines.iter().any(|l| l.spans.iter().any(|sp| sp.content == "coop")));
+    }
+
+    #[test]
+    fn apply_refresh_swaps_data_and_keeps_selection() {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        // Select b1 (order is activity-desc: a2, b1, c1, a1).
+        app.sel = 1;
+        let key = app.sessions[app.order[app.sel]].key();
+        // Background result: same sessions plus a newcomer on top.
+        let mut sessions = app.sessions.clone();
+        sessions.push(fake_session("z9", "/proj/z", 9999));
+        let res = RefreshResult {
+            sessions,
+            hits: HashMap::new(),
+            errors: vec!["coop: boom".to_string()],
+        };
+        app.apply_refresh(res, Some(key.clone()));
+        assert_eq!(app.sessions.len(), 5);
+        assert_eq!(app.sessions[app.order[app.sel]].key(), key);
+        assert_eq!(app.host_errors, vec!["coop: boom".to_string()]);
+        // Unknown keys clamp instead of panicking.
+        app.apply_refresh(
+            RefreshResult {
+                sessions: vec![],
+                hits: HashMap::new(),
+                errors: vec![],
+            },
+            Some(key),
+        );
+        assert_eq!(app.sel, 0);
     }
 
     #[test]
