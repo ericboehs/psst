@@ -150,7 +150,11 @@ pub(crate) fn cache_key(host: &str, path: &Path) -> String {
     format!("{}\0{}", host, path.to_string_lossy())
 }
 
-pub(crate) fn cache_lookup<'a>(cache: &'a Cache, host: &str, path: &Path) -> Option<&'a CacheEntry> {
+pub(crate) fn cache_lookup<'a>(
+    cache: &'a Cache,
+    host: &str,
+    path: &Path,
+) -> Option<&'a CacheEntry> {
     if let Some(e) = cache.0.get(&cache_key(host, path)) {
         return Some(e);
     }
@@ -225,8 +229,8 @@ pub fn parse_file_with_host(path: &Path, host: &str) -> Result<SessionMeta> {
 
 /// [`parse_file_with_host`], keeping fold state for the incremental cache.
 pub(crate) fn parse_file_full(path: &Path, host: &str) -> Result<Parsed> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     let stat = std::fs::metadata(path)?;
     let mtime = stat
@@ -256,11 +260,7 @@ pub(crate) struct Parsed {
 
 /// Fold one JSONL line into `meta`. Returns true for a `session` header
 /// line, which is only valid at offset 0 (see [`parse_tail`]).
-fn fold_line(
-    meta: &mut SessionMeta,
-    child_counts: &mut HashMap<String, u32>,
-    line: &str,
-) -> bool {
+fn fold_line(meta: &mut SessionMeta, child_counts: &mut HashMap<String, u32>, line: &str) -> bool {
     if line.is_empty() {
         return false;
     }
@@ -272,96 +272,111 @@ fn fold_line(
     match typ {
         "session" => {
             saw_session = true;
-                meta.id = v
-                    .get("id")
-                    .and_then(|i| i.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                meta.cwd = v
-                    .get("cwd")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                meta.parent_session = v
-                    .get("parentSession")
-                    .and_then(|p| p.as_str())
-                    .map(|s| s.to_string());
-                meta.created = v
-                    .get("timestamp")
-                    .and_then(|t| t.as_str())
-                    .and_then(parse_epoch);
-            }
-            "message" => {
-                meta.messages += 1;
-                let Some(msg) = v.get("message") else {
-                    return saw_session;
-                };
-                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                match role {
-                    "user" => {
-                        let text =
-                            content_text(msg.get("content").unwrap_or(&serde_json::Value::Null));
-                        if meta.first_prompt.is_none() {
-                            meta.first_prompt = text.clone();
-                        }
-                        if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()).and_then(parse_epoch) {
-                            if meta.last_user.is_none() || ts >= meta.last_user.unwrap_or(0) {
-                                meta.last_user = Some(ts);
-                                if let Some(t) = text.as_deref() {
-                                    let t = t.trim();
-                                    if !t.is_empty() && !t.starts_with('/') {
-                                        meta.last_prompt = Some(t.to_string());
-                                    }
+            meta.id = v
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or_default()
+                .to_string();
+            meta.cwd = v
+                .get("cwd")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_string();
+            meta.parent_session = v
+                .get("parentSession")
+                .and_then(|p| p.as_str())
+                .map(|s| s.to_string());
+            meta.created = v
+                .get("timestamp")
+                .and_then(|t| t.as_str())
+                .and_then(parse_epoch);
+        }
+        "message" => {
+            meta.messages += 1;
+            let Some(msg) = v.get("message") else {
+                return saw_session;
+            };
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            match role {
+                "user" => {
+                    let text = content_text(msg.get("content").unwrap_or(&serde_json::Value::Null));
+                    if meta.first_prompt.is_none() {
+                        meta.first_prompt = text.clone();
+                    }
+                    if let Some(ts) = v
+                        .get("timestamp")
+                        .and_then(|t| t.as_str())
+                        .and_then(parse_epoch)
+                    {
+                        if meta.last_user.is_none() || ts >= meta.last_user.unwrap_or(0) {
+                            meta.last_user = Some(ts);
+                            if let Some(t) = text.as_deref() {
+                                let t = t.trim();
+                                if !t.is_empty() && !t.starts_with('/') {
+                                    meta.last_prompt = Some(t.to_string());
                                 }
                             }
                         }
                     }
-                    "assistant" => {
-                        if let Some(u) = msg.get("usage") {
-                            if let Some(c) = u.get("cost").and_then(|c| c.get("total")).and_then(|c| c.as_f64()) {
-                                meta.cost_total += c;
-                            }
-                            meta.tokens_in += u.get("input").and_then(|t| t.as_u64()).unwrap_or(0);
-                            meta.tokens_out += u.get("output").and_then(|t| t.as_u64()).unwrap_or(0);
+                }
+                "assistant" => {
+                    if let Some(u) = msg.get("usage") {
+                        if let Some(c) = u
+                            .get("cost")
+                            .and_then(|c| c.get("total"))
+                            .and_then(|c| c.as_f64())
+                        {
+                            meta.cost_total += c;
                         }
-                        if let Some(m) = msg.get("model").and_then(|m| m.as_str()) {
-                            meta.model = Some(m.to_string());
-                        }
+                        meta.tokens_in += u.get("input").and_then(|t| t.as_u64()).unwrap_or(0);
+                        meta.tokens_out += u.get("output").and_then(|t| t.as_u64()).unwrap_or(0);
                     }
-                    "toolResult" => {
-                        // nested usage = LLM work performed inside tools
-                        if let Some(u) = msg.get("usage") {
-                            if let Some(c) = u.get("cost").and_then(|c| c.get("total")).and_then(|c| c.as_f64()) {
-                                meta.cost_total += c;
-                            }
-                            meta.tokens_in += u.get("input").and_then(|t| t.as_u64()).unwrap_or(0);
-                            meta.tokens_out += u.get("output").and_then(|t| t.as_u64()).unwrap_or(0);
-                        }
+                    if let Some(m) = msg.get("model").and_then(|m| m.as_str()) {
+                        meta.model = Some(m.to_string());
                     }
-                    _ => {}
                 }
-            }
-            "session_info" => {
-                if let Some(n) = v.get("name").and_then(|n| n.as_str()) {
-                    meta.name = Some(n.to_string());
+                "toolResult" => {
+                    // nested usage = LLM work performed inside tools
+                    if let Some(u) = msg.get("usage") {
+                        if let Some(c) = u
+                            .get("cost")
+                            .and_then(|c| c.get("total"))
+                            .and_then(|c| c.as_f64())
+                        {
+                            meta.cost_total += c;
+                        }
+                        meta.tokens_in += u.get("input").and_then(|t| t.as_u64()).unwrap_or(0);
+                        meta.tokens_out += u.get("output").and_then(|t| t.as_u64()).unwrap_or(0);
+                    }
                 }
-            }
-            "model_change" => {
-                if let Some(m) = v.get("modelId").and_then(|m| m.as_str()) {
-                    meta.model = Some(m.to_string());
-                }
-            }
-            _ => {}
-        }
-        if let Some(pid) = v.get("parentId").and_then(|p| p.as_str()) {
-            *child_counts.entry(pid.to_string()).or_insert(0) += 1;
-        }
-        // track max timestamp for last_activity
-        if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()).and_then(parse_epoch) {
-            if meta.last_activity.is_none() || ts > meta.last_activity.unwrap_or(0) {
-                meta.last_activity = Some(ts);
+                _ => {}
             }
         }
+        "session_info" => {
+            if let Some(n) = v.get("name").and_then(|n| n.as_str()) {
+                meta.name = Some(n.to_string());
+            }
+        }
+        "model_change" => {
+            if let Some(m) = v.get("modelId").and_then(|m| m.as_str()) {
+                meta.model = Some(m.to_string());
+            }
+        }
+        _ => {}
+    }
+    if let Some(pid) = v.get("parentId").and_then(|p| p.as_str()) {
+        *child_counts.entry(pid.to_string()).or_insert(0) += 1;
+    }
+    // track max timestamp for last_activity
+    if let Some(ts) = v
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .and_then(parse_epoch)
+    {
+        if meta.last_activity.is_none() || ts > meta.last_activity.unwrap_or(0) {
+            meta.last_activity = Some(ts);
+        }
+    }
     saw_session
 }
 
@@ -399,13 +414,7 @@ fn fresh_meta(path: &Path, mtime: i64, size: u64, host: &str) -> SessionMeta {
 }
 
 /// Fold a whole session file from scratch.
-pub(crate) fn parse_full(
-    raw: &str,
-    path: &Path,
-    mtime: i64,
-    size: u64,
-    host: &str,
-) -> Parsed {
+pub(crate) fn parse_full(raw: &str, path: &Path, mtime: i64, size: u64, host: &str) -> Parsed {
     let mut meta = fresh_meta(path, mtime, size, host);
     let mut child_counts: HashMap<String, u32> = HashMap::new();
     let mut lines = 0u64;
@@ -504,7 +513,11 @@ pub(crate) fn scan_with_host_and_threshold(
     if !root.exists() {
         return Ok(out);
     }
-    let mut cache = if force { Cache::default() } else { load_cache() };
+    let mut cache = if force {
+        Cache::default()
+    } else {
+        load_cache()
+    };
     let mut changed = false;
 
     // structure: <root>/<encoded-project-dir>/*.jsonl
@@ -540,10 +553,9 @@ pub(crate) fn scan_with_host_and_threshold(
                 if entry.mtime == mtime && entry.size == size {
                     // Reparse once after last_user was added so activity sort
                     // isn't stuck on None until the file next changes.
-                    let missing_last = entry.meta.last_prompt.is_none()
-                        && entry.meta.first_prompt.is_some();
-                    if (entry.meta.last_user.is_some() || entry.meta.messages == 0)
-                        && !missing_last
+                    let missing_last =
+                        entry.meta.last_prompt.is_none() && entry.meta.first_prompt.is_some();
+                    if (entry.meta.last_user.is_some() || entry.meta.messages == 0) && !missing_last
                     {
                         let mut meta = entry.meta.clone();
                         if meta.host.is_empty() {
@@ -567,8 +579,7 @@ pub(crate) fn scan_with_host_and_threshold(
                             size,
                             host,
                         ) {
-                            let (meta, lines, child_counts) =
-                                stored_state(size, parsed, min_bytes);
+                            let (meta, lines, child_counts) = stored_state(size, parsed, min_bytes);
                             cache.0.insert(
                                 key,
                                 CacheEntry {
@@ -588,8 +599,7 @@ pub(crate) fn scan_with_host_and_threshold(
             }
             match parse_file_full(&path, host) {
                 Ok(parsed) => {
-                    let (mut meta, lines, child_counts) =
-                        stored_state(size, parsed, min_bytes);
+                    let (mut meta, lines, child_counts) = stored_state(size, parsed, min_bytes);
                     // Old cache entries predate `host`; normalize on rewrite
                     // and drop the legacy bare-path key.
                     meta.host = host.to_string();
@@ -926,15 +936,23 @@ mod tests {
         // Append the rest: the rescan must fold the tail and match a fresh
         // full parse exactly.
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
         writeln!(f, "{}", tail_fixture()[4..].join("\n")).unwrap();
         drop(f);
         let second = scan_with_host_and_threshold(&dir, "local", false, 200).unwrap();
         assert_eq!(second.len(), 2);
         let grown = second.iter().find(|s| s.path == file).unwrap();
-        let expect =
-            parse_content(&std::fs::read_to_string(&file).unwrap(), &file, 0, 0, "local")
-                .unwrap();
+        let expect = parse_content(
+            &std::fs::read_to_string(&file).unwrap(),
+            &file,
+            0,
+            0,
+            "local",
+        )
+        .unwrap();
         // mtime/size differ (cache attrs), everything parsed must match.
         let (mut got_v, mut exp_v) = (meta_json(grown), meta_json(&expect));
         got_v["mtime"] = serde_json::Value::Null;

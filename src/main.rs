@@ -11,8 +11,8 @@
 use psst::config;
 use psst::hosts;
 use psst::running::{
-    self, attach_remote_enrichment, detect, detect_remote, fetch_remote_enrichment,
-    live_mark, map_running,
+    self, attach_remote_enrichment, detect, detect_remote, fetch_remote_enrichment, live_mark,
+    map_running,
 };
 use psst::scan::{in_scope, resolve_scope, scan, sessions_root, SessionKey, SessionMeta};
 use psst::tui;
@@ -95,7 +95,10 @@ fn print_list(sessions: &[&SessionMeta], hits: &Hits) {
 
 fn list_text(sessions: &[&SessionMeta], hits: &Hits) -> String {
     use std::fmt::Write;
-    let mut out = format!("{:<2} {:<42} {:<8} {:<22} {:>7}\n", "", "title", "host", "project", "age");
+    let mut out = format!(
+        "{:<2} {:<42} {:<8} {:<22} {:>7}\n",
+        "", "title", "host", "project", "age"
+    );
     for s in sessions {
         let hit = hits.get(&s.key());
         let mark = live_mark(hit);
@@ -236,7 +239,9 @@ fn print_focus_debug(cfg: &config::Config) {
     );
     let titles = psst::focus::tab_titles(app);
     if titles.is_empty() {
-        println!("tabs:       none visible (not macOS, {app} not running, or no Accessibility grant)");
+        println!(
+            "tabs:       none visible (not macOS, {app} not running, or no Accessibility grant)"
+        );
     } else {
         println!("tabs:");
         for t in &titles {
@@ -323,7 +328,9 @@ fn perform(action: tui::OpenAction) -> Result<()> {
     match action {
         tui::OpenAction::TmuxAttach { target, inside } => {
             if inside {
-                let st = Command::new("tmux").args(["switch-client", "-t", &target]).status();
+                let st = Command::new("tmux")
+                    .args(["switch-client", "-t", &target])
+                    .status();
                 match st {
                     Ok(s) if s.success() => Ok(()),
                     _ => bail!("tmux switch-client failed for {}", target),
@@ -367,7 +374,15 @@ fn perform(action: tui::OpenAction) -> Result<()> {
             if inside {
                 let label = format!("ssh-{}", session);
                 let st = Command::new("tmux")
-                    .args(["new-window", "-n", &label, "ssh", "-t", &ssh_target, &remote])
+                    .args([
+                        "new-window",
+                        "-n",
+                        &label,
+                        "ssh",
+                        "-t",
+                        &ssh_target,
+                        &remote,
+                    ])
                     .status();
                 match st {
                     Ok(s) if s.success() => Ok(()),
@@ -417,13 +432,22 @@ fn perform(action: tui::OpenAction) -> Result<()> {
                 }
                 let st = Command::new("tmux")
                     .args([
-                        "new-session", "-d", "-s", &sess, "ssh", "-t", &ssh_target, &remote,
+                        "new-session",
+                        "-d",
+                        "-s",
+                        &sess,
+                        "ssh",
+                        "-t",
+                        &ssh_target,
+                        &remote,
                     ])
                     .status();
                 if let Err(e) = st {
                     bail!("tmux new-session: {}", e);
                 }
-                let _ = Command::new("tmux").args(["attach-session", "-t", &sess]).exec();
+                let _ = Command::new("tmux")
+                    .args(["attach-session", "-t", &sess])
+                    .exec();
                 bail!("tmux attach failed");
             }
         }
@@ -513,7 +537,9 @@ fn tmux_new_local(cwd: &str, name: &str, command: &str, inside: bool) -> Result<
         if let Err(e) = st {
             bail!("tmux new-session: {}", e);
         }
-        let _ = Command::new("tmux").args(["attach-session", "-t", &sess]).exec();
+        let _ = Command::new("tmux")
+            .args(["attach-session", "-t", &sess])
+            .exec();
         bail!("tmux attach failed");
     }
 }
@@ -644,9 +670,15 @@ mod tests {
         let args = parse_args_from(Vec::<String>::new()).unwrap();
         assert!(!args.list && !args.json && !args.refresh && !args.debug_running);
         assert_eq!(args.scope, None);
-        let argv = ["--list", "--json", "--refresh", "--debug-running", "--debug-focus"]
-            .iter()
-            .map(|s| s.to_string());
+        let argv = [
+            "--list",
+            "--json",
+            "--refresh",
+            "--debug-running",
+            "--debug-focus",
+        ]
+        .iter()
+        .map(|s| s.to_string());
         let args = parse_args_from(argv).unwrap();
         assert!(args.list && args.json && args.refresh && args.debug_running && args.debug_focus);
         let err = parse_args_from(["--bogus".to_string()]).unwrap_err();

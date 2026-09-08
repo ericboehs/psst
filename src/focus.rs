@@ -177,10 +177,16 @@ mod tests {
             tags(&["gfe:", "gfew:", "ssh gfew", "ssh gfe", "gfe", "gfew"])
         );
         // Name and ssh target usually match; no duplicate tags from that.
-        assert_eq!(host_tags("coop", "coop", None), tags(&["coop:", "ssh coop", "coop"]));
+        assert_eq!(
+            host_tags("coop", "coop", None),
+            tags(&["coop:", "ssh coop", "coop"])
+        );
         // A configured tab wins outright: the user has seen their tab bar.
         assert_eq!(host_tags("coop", "coop", Some("work ")), tags(&["work"]));
-        assert_eq!(host_tags("coop", "coop", Some("  ")), host_tags("coop", "coop", None));
+        assert_eq!(
+            host_tags("coop", "coop", Some("  ")),
+            host_tags("coop", "coop", None)
+        );
     }
 
     #[test]

@@ -65,7 +65,10 @@ fn parses_fork_parent_and_tool_result_nested_usage() {
     );
 
     let meta = parse_file(&path).unwrap();
-    assert_eq!(meta.parent_session.as_deref(), Some("/tmp/cache/other.jsonl"));
+    assert_eq!(
+        meta.parent_session.as_deref(),
+        Some("/tmp/cache/other.jsonl")
+    );
     // text extracted from block-array user content
     assert_eq!(meta.first_prompt.as_deref(), Some("run the tests"));
     // assistant + nested toolResult usage both counted

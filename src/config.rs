@@ -143,7 +143,11 @@ impl Config {
             if let Some(d) = ui.detail {
                 cfg.detail = d;
             }
-            if let Some(t) = ui.terminal.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+            if let Some(t) = ui
+                .terminal
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+            {
                 cfg.terminal = t;
             }
         }

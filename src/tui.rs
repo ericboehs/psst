@@ -3,21 +3,23 @@
 use crate::config::Config;
 use crate::hosts::{self, local_path_for};
 use crate::running::{
-    attach_remote_enrichment, detect, detect_remote, fetch_remote_enrichment,
-    live_mark, map_running, LiveMark, RunningHit,
+    attach_remote_enrichment, detect, detect_remote, fetch_remote_enrichment, live_mark,
+    map_running, LiveMark, RunningHit,
 };
-use crate::scan::{in_scope, recent_messages_from_str, scan, sessions_root, SessionKey, SessionMeta, LOCAL_HOST};
+use crate::scan::{
+    in_scope, recent_messages_from_str, scan, sessions_root, SessionKey, SessionMeta, LOCAL_HOST,
+};
 use anyhow::Result;
 use chrono::Timelike;
-use serde::{Deserialize, Serialize};
 use ratatui::{
-    Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    Frame,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -134,7 +136,8 @@ pub enum OpenAction {
         ssh_target: String,
         target: String,
         inside: bool,
-    },    /// Resume a remote session via `ssh -t <ssh_target> 'cd <cwd> && <command>'`.
+    },
+    /// Resume a remote session via `ssh -t <ssh_target> 'cd <cwd> && <command>'`.
     /// `command` is the remote resume command; `cwd` is the remote cwd.
     SshNew {
         ssh_target: String,
@@ -240,7 +243,12 @@ fn fmt_clock(ts: i64) -> String {
     };
     let t = t.with_timezone(&chrono::Local);
     let (is_pm, hour) = t.hour12();
-    format!("{}:{:02}{}", hour, t.minute(), if is_pm { "p" } else { "a" })
+    format!(
+        "{}:{:02}{}",
+        hour,
+        t.minute(),
+        if is_pm { "p" } else { "a" }
+    )
 }
 
 fn fmt_age(secs: i64) -> String {
@@ -375,11 +383,7 @@ impl App {
     fn restore_selection(&mut self, sel_key: Option<SessionKey>) {
         let restore = sel_key.or_else(|| self.pending_sel.take());
         if let Some(k) = restore {
-            if let Some(pos) = self
-                .order
-                .iter()
-                .position(|&i| self.sessions[i].key() == k)
-            {
+            if let Some(pos) = self.order.iter().position(|&i| self.sessions[i].key() == k) {
                 self.sel = pos;
             }
         }
@@ -411,54 +415,54 @@ struct RefreshResult {
 /// safe to run on a background thread while the TUI keeps handling keys.
 fn full_refresh(config: &Config, force: bool) -> RefreshResult {
     let root = sessions_root();
-        let mut sessions = scan(&root, force).unwrap_or_default();
-        let mut errors = Vec::new();
-        let mut synced_ok: HashSet<String> = HashSet::new();
-        for sync in hosts::sync_all(config.hosts(), force) {
-            if sync.ok() {
-                synced_ok.insert(sync.name.clone());
-            }
-            if let Some(e) = sync.error {
-                errors.push(e);
-            }
-            sessions.extend(sync.sessions);
+    let mut sessions = scan(&root, force).unwrap_or_default();
+    let mut errors = Vec::new();
+    let mut synced_ok: HashSet<String> = HashSet::new();
+    for sync in hosts::sync_all(config.hosts(), force) {
+        if sync.ok() {
+            synced_ok.insert(sync.name.clone());
         }
-        let mut procs = detect();
-        for h in config.hosts() {
-            // A failed sync already waited out one ssh timeout; don't spend
-            // two more on detection for a host that's down.
-            if !synced_ok.contains(&h.name) {
-                continue;
-            }
-            match detect_remote(&h.ssh_target, &h.name) {
-                Ok(rp) => procs.extend(rp),
-                Err(e) => errors.push(format!("{}: {}", h.name, e)),
-            }
+        if let Some(e) = sync.error {
+            errors.push(e);
         }
-        let mut hits = map_running(&procs, &sessions, config.active_secs());
-        // ssh enrichment for remote hits (names/status from the remote).
-        for h in config.hosts() {
-            let remote_pids: Vec<u32> = hits
-                .iter()
-                .filter(|(k, _)| k.host == h.name)
-                .map(|(_, hit)| hit.pid)
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            if remote_pids.is_empty() {
-                continue;
-            }
-            let (names, summaries) = fetch_remote_enrichment(&h.ssh_target, &remote_pids);
-            let mut sub: HashMap<SessionKey, RunningHit> = hits
-                .iter()
-                .filter(|(k, _)| k.host == h.name)
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            attach_remote_enrichment(&mut sub, &names, &summaries);
-            for (k, v) in sub {
-                hits.insert(k, v);
-            }
+        sessions.extend(sync.sessions);
+    }
+    let mut procs = detect();
+    for h in config.hosts() {
+        // A failed sync already waited out one ssh timeout; don't spend
+        // two more on detection for a host that's down.
+        if !synced_ok.contains(&h.name) {
+            continue;
         }
+        match detect_remote(&h.ssh_target, &h.name) {
+            Ok(rp) => procs.extend(rp),
+            Err(e) => errors.push(format!("{}: {}", h.name, e)),
+        }
+    }
+    let mut hits = map_running(&procs, &sessions, config.active_secs());
+    // ssh enrichment for remote hits (names/status from the remote).
+    for h in config.hosts() {
+        let remote_pids: Vec<u32> = hits
+            .iter()
+            .filter(|(k, _)| k.host == h.name)
+            .map(|(_, hit)| hit.pid)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        if remote_pids.is_empty() {
+            continue;
+        }
+        let (names, summaries) = fetch_remote_enrichment(&h.ssh_target, &remote_pids);
+        let mut sub: HashMap<SessionKey, RunningHit> = hits
+            .iter()
+            .filter(|(k, _)| k.host == h.name)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        attach_remote_enrichment(&mut sub, &names, &summaries);
+        for (k, v) in sub {
+            hits.insert(k, v);
+        }
+    }
     RefreshResult {
         sessions,
         hits,
@@ -517,11 +521,7 @@ impl App {
         }
         self.apply_filter_sort();
         if let Some(k) = sel_key {
-            if let Some(pos) = self
-                .order
-                .iter()
-                .position(|&i| self.sessions[i].key() == k)
-            {
+            if let Some(pos) = self.order.iter().position(|&i| self.sessions[i].key() == k) {
                 self.sel = pos;
             }
         }
@@ -585,8 +585,8 @@ impl App {
                 match self.view_filter {
                     ViewFilter::All => {}
                     ViewFilter::Named => {
-                        let named = s.name.is_some()
-                            || hit.and_then(|h| h.peer_name.as_deref()).is_some();
+                        let named =
+                            s.name.is_some() || hit.and_then(|h| h.peer_name.as_deref()).is_some();
                         if !named {
                             return false;
                         }
@@ -621,36 +621,29 @@ impl App {
 
         match self.sort {
             Sort::Activity => {
-                idx.sort_by_key(|&i| {
-                    std::cmp::Reverse(self.sessions[i].last_user_or_activity())
-                });
+                idx.sort_by_key(|&i| std::cmp::Reverse(self.sessions[i].last_user_or_activity()));
             }
             Sort::Tmux => {
                 idx.sort_by(|&a, &b| {
-                    let key =
-                        |i: usize| -> (u8, String, u32, std::cmp::Reverse<i64>) {
-                            match self.running.get(&self.sessions[i].key()) {
-                                Some(h) => (
-                                    0u8,
-                                    h.tmux
-                                        .as_ref()
-                                        .map(|t| t.session.clone())
-                                        .unwrap_or_default(),
-                                    h.tmux.as_ref().and_then(|t| t.window).unwrap_or(0),
-                                    std::cmp::Reverse(
-                                        self.sessions[i].last_user_or_activity(),
-                                    ),
-                                ),
-                                None => (
-                                    1u8,
-                                    String::new(),
-                                    0,
-                                    std::cmp::Reverse(
-                                        self.sessions[i].last_user_or_activity(),
-                                    ),
-                                ),
-                            }
-                        };
+                    let key = |i: usize| -> (u8, String, u32, std::cmp::Reverse<i64>) {
+                        match self.running.get(&self.sessions[i].key()) {
+                            Some(h) => (
+                                0u8,
+                                h.tmux
+                                    .as_ref()
+                                    .map(|t| t.session.clone())
+                                    .unwrap_or_default(),
+                                h.tmux.as_ref().and_then(|t| t.window).unwrap_or(0),
+                                std::cmp::Reverse(self.sessions[i].last_user_or_activity()),
+                            ),
+                            None => (
+                                1u8,
+                                String::new(),
+                                0,
+                                std::cmp::Reverse(self.sessions[i].last_user_or_activity()),
+                            ),
+                        }
+                    };
                     key(a).cmp(&key(b))
                 });
             }
@@ -686,7 +679,8 @@ impl App {
         // Stale park (group filtered out) or hidden sel: resync from sel.
         let cur = cur.or_else(|| {
             self.header_park = None;
-            rows.iter().position(|r| matches!(r, Row::Member(pos) if *pos == self.sel))
+            rows.iter()
+                .position(|r| matches!(r, Row::Member(pos) if *pos == self.sel))
         });
         let next = match cur {
             Some(c) => (c as i32 + delta).clamp(0, rows.len() as i32 - 1) as usize,
@@ -797,7 +791,10 @@ impl App {
                 // bucket by host; local first, then by most recent activity.
                 let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
                 for (pos, &i) in self.order.iter().enumerate() {
-                    buckets.entry(self.sessions[i].host.clone()).or_default().push(pos);
+                    buckets
+                        .entry(self.sessions[i].host.clone())
+                        .or_default()
+                        .push(pos);
                 }
                 let mut groups: Vec<(String, Vec<usize>)> = buckets.into_iter().collect();
                 groups.sort_by_key(|(host, v)| {
@@ -847,12 +844,7 @@ impl App {
                 dates.sort_by(|a, b| b.cmp(a));
                 dates
                     .into_iter()
-                    .map(|d| {
-                        (
-                            day_label(d, today),
-                            buckets.remove(&d).unwrap_or_default(),
-                        )
-                    })
+                    .map(|d| (day_label(d, today), buckets.remove(&d).unwrap_or_default()))
                     .collect()
             }
         }
@@ -963,12 +955,16 @@ impl App {
         let mark = live_mark(hit);
         let dot = match mark {
             LiveMark::Working => Span::styled("● ", Style::default().fg(Color::Yellow)),
-            LiveMark::Prompt => {
-                Span::styled("● ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-            }
-            LiveMark::Unread => {
-                Span::styled("● ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-            }
+            LiveMark::Prompt => Span::styled(
+                "● ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            LiveMark::Unread => Span::styled(
+                "● ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             LiveMark::Waiting => Span::styled("◎ ", Style::default().fg(Color::Cyan)),
             LiveMark::Exited => Span::styled("○ ", Style::default().fg(Color::DarkGray)),
         };
@@ -1018,7 +1014,15 @@ impl App {
             None => Span::raw(""),
         };
         Line::from(vec![
-            dot, fork, title, Span::raw(" "), proj, Span::raw(" "), age, tmux, host_badge,
+            dot,
+            fork,
+            title,
+            Span::raw(" "),
+            proj,
+            Span::raw(" "),
+            age,
+            tmux,
+            host_badge,
         ])
     }
 
@@ -1086,7 +1090,9 @@ impl App {
             session: None,
             lines: vec![Line::from(Span::styled(
                 header,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ))],
             group_key: Some(label),
         });
@@ -1105,7 +1111,10 @@ impl App {
 
 /// Running sessions show the live peer name (`pi-dotfiles-2`); others use /name or prompt.
 fn display_title(s: &SessionMeta, hit: Option<&RunningHit>) -> String {
-    if let Some(n) = hit.and_then(|h| h.peer_name.as_deref()).filter(|n| !n.is_empty()) {
+    if let Some(n) = hit
+        .and_then(|h| h.peer_name.as_deref())
+        .filter(|n| !n.is_empty())
+    {
         return n.to_string();
     }
     if hit.is_some() {
@@ -1266,7 +1275,9 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
     let mut header_spans = vec![
         Span::styled(
             " psst ",
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(" {} sessions", app.order.len())),
     ];
@@ -1361,30 +1372,32 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
         );
     } else {
         let slash = if app.search_focus {
-            Span::styled("/", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+            Span::styled(
+                "/",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else {
             Span::styled("/", Style::default().fg(Color::DarkGray))
         };
-    let query = if app.search_focus {
-        Span::styled(
-            format!("{}▏", app.filter),
-            Style::default().add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(
-            app.filter.clone(),
-            Style::default().fg(Color::DarkGray),
-        )
-    };
-    let filter_spans = vec![
-        slash,
-        query,
-        Span::styled(
-            format!("  ({} shown)", app.order.len()),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ];
-    f.render_widget(Paragraph::new(Line::from(filter_spans)), filterbar);
+        let query = if app.search_focus {
+            Span::styled(
+                format!("{}▏", app.filter),
+                Style::default().add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(app.filter.clone(), Style::default().fg(Color::DarkGray))
+        };
+        let filter_spans = vec![
+            slash,
+            query,
+            Span::styled(
+                format!("  ({} shown)", app.order.len()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        f.render_widget(Paragraph::new(Line::from(filter_spans)), filterbar);
     }
 
     let target = app.order.get(app.sel).copied();
@@ -1408,11 +1421,8 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
     let list = List::new(list_items).block(Block::new());
 
     if app.detail {
-        let [list_area, detail_area] = Layout::vertical([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
-        .areas(body);
+        let [list_area, detail_area] =
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
         f.render_stateful_widget(list, list_area, list_state);
         let recent = app.recent_for_selected();
         if let Some(s) = app.selected() {
@@ -1485,9 +1495,9 @@ pub(crate) fn handle_key(
     if app.show_help {
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return KeyOutcome::Quit,
-            (KeyCode::Char('?'), _)
-            | (KeyCode::Esc, _)
-            | (KeyCode::Char('q'), _) => app.show_help = false,
+            (KeyCode::Char('?'), _) | (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
+                app.show_help = false
+            }
             _ => {}
         }
         return KeyOutcome::Continue;
@@ -1555,8 +1565,7 @@ pub(crate) fn handle_key(
         }
         _ if app.search_focus => match key.code {
             KeyCode::Char(c)
-                if key.modifiers == KeyModifiers::NONE
-                    || key.modifiers == KeyModifiers::SHIFT =>
+                if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT =>
             {
                 app.filter.push(c);
                 app.apply_filter_sort();
@@ -1667,23 +1676,21 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
     // a refresh requested mid-flight (10s tick or r/R) queues behind it.
     // A panicking worker must wedge neither the list nor future refreshes:
     // failures arrive as `None` and keep the current data on screen.
-    let (refresh_tx, refresh_rx) =
-        std::sync::mpsc::channel::<(Option<RefreshResult>, bool)>();
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<(Option<RefreshResult>, bool)>();
     let mut refresh_busy = false;
     // Startup painted local-only (`App::new` → `refresh_local`); queue the
     // full pass at once so remotes fill in behind the first frame instead
     // of blocking it on ssh handshakes.
     let mut refresh_queued: Option<bool> = Some(false);
-    let spawn_refresh = |app: &App,
-                         tx: &std::sync::mpsc::Sender<(Option<RefreshResult>, bool)>,
-                         force: bool| {
-        let config = app.config.clone();
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let res = std::panic::catch_unwind(|| full_refresh(&config, force)).ok();
-            let _ = tx.send((res, force));
-        });
-    };
+    let spawn_refresh =
+        |app: &App, tx: &std::sync::mpsc::Sender<(Option<RefreshResult>, bool)>, force: bool| {
+            let config = app.config.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let res = std::panic::catch_unwind(|| full_refresh(&config, force)).ok();
+                let _ = tx.send((res, force));
+            });
+        };
 
     loop {
         // Collect a finished background refresh without blocking. The
@@ -1798,9 +1805,8 @@ fn highlight_row(lines: &[Line<'static>], full: bool) -> Vec<Line<'static>> {
                         if !full && li == 0 && si == 0 {
                             sp.clone()
                         } else {
-                            sp.clone().patch_style(
-                                Style::default().add_modifier(Modifier::REVERSED),
-                            )
+                            sp.clone()
+                                .patch_style(Style::default().add_modifier(Modifier::REVERSED))
                         }
                     })
                     .collect::<Vec<_>>(),
@@ -2155,10 +2161,7 @@ mod tests {
     fn keys_quit_and_escape() {
         let mut app = keyed_app();
         assert_eq!(press(&mut app, key(KeyCode::Char('q'))), KeyOutcome::Quit);
-        assert_eq!(
-            press(&mut app, ctrl(KeyCode::Char('c'))),
-            KeyOutcome::Quit
-        );
+        assert_eq!(press(&mut app, ctrl(KeyCode::Char('c'))), KeyOutcome::Quit);
         assert_eq!(press(&mut app, key(KeyCode::Esc)), KeyOutcome::Quit);
         // Esc clears a filter first, and drops search focus before that
         app.filter = "a".into();
@@ -2173,10 +2176,16 @@ mod tests {
     #[test]
     fn keys_help_overlay() {
         let mut app = keyed_app();
-        assert_eq!(press(&mut app, key(KeyCode::Char('?'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('?'))),
+            KeyOutcome::Continue
+        );
         assert!(app.show_help);
         // ordinary keys are swallowed while help is up
-        assert_eq!(press(&mut app, key(KeyCode::Char('j'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('j'))),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.sel, 0);
         for closer in [KeyCode::Char('?'), KeyCode::Esc, KeyCode::Char('q')] {
             app.show_help = true;
@@ -2184,33 +2193,42 @@ mod tests {
             assert!(!app.show_help);
         }
         app.show_help = true;
-        assert_eq!(
-            press(&mut app, ctrl(KeyCode::Char('c'))),
-            KeyOutcome::Quit
-        );
+        assert_eq!(press(&mut app, ctrl(KeyCode::Char('c'))), KeyOutcome::Quit);
     }
 
     #[test]
     fn keys_search_typing() {
         let mut app = keyed_app();
-        assert_eq!(press(&mut app, key(KeyCode::Char('/'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('/'))),
+            KeyOutcome::Continue
+        );
         assert!(app.search_focus);
         assert_eq!(
             press(&mut app, key(KeyCode::Char('b'))),
             KeyOutcome::Continue
         );
         assert_eq!(app.filter, "b");
-        assert_eq!(press(&mut app, key(KeyCode::Backspace)), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Backspace)),
+            KeyOutcome::Continue
+        );
         assert!(app.filter.is_empty());
     }
 
     #[test]
     fn keys_filter_sort_group_toggles() {
         let mut app = keyed_app();
-        assert_eq!(press(&mut app, key(KeyCode::Char('f'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('f'))),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.view_filter, ViewFilter::Named);
         assert_eq!(app.status, "filter:named");
-        assert_eq!(press(&mut app, key(KeyCode::Char('g'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('g'))),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.group, Group::Day);
         assert_eq!(app.header_park, None);
         assert_eq!(app.status, "group:day");
@@ -2218,20 +2236,29 @@ mod tests {
         assert_eq!(app.group, Group::Host);
         assert_eq!(press(&mut app, key(KeyCode::Tab)), KeyOutcome::Continue);
         assert_eq!(app.group, Group::Flat);
-        assert_eq!(press(&mut app, key(KeyCode::Char('s'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('s'))),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.status, "sort:tmux");
         assert_eq!(
             press(&mut app, ctrl(KeyCode::Char('s'))),
             KeyOutcome::Continue
         );
-        assert_eq!(press(&mut app, key(KeyCode::Char('d'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('d'))),
+            KeyOutcome::Continue
+        );
         assert!(app.detail);
         assert_eq!(
             press(&mut app, ctrl(KeyCode::Char('d'))),
             KeyOutcome::Continue
         );
         assert!(!app.detail);
-        assert_eq!(press(&mut app, key(KeyCode::Char('p'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('p'))),
+            KeyOutcome::Continue
+        );
         assert!(app.show_prompts);
         assert_eq!(app.status, "prompts shown");
         assert_eq!(
@@ -2252,9 +2279,15 @@ mod tests {
         assert_eq!(app.order[app.sel], 0);
         assert_eq!(press(&mut app, key(KeyCode::Up)), KeyOutcome::Continue);
         assert_eq!(app.order[app.sel], 1);
-        assert_eq!(press(&mut app, key(KeyCode::Char('J'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('J'))),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.header_park.as_deref(), Some("/proj/b"));
-        assert_eq!(press(&mut app, key(KeyCode::Char('K'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('K'))),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.header_park.as_deref(), Some("/proj/a"));
         // explicit shift modifiers take the same path
         let shift_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::SHIFT);
@@ -2266,26 +2299,53 @@ mod tests {
     #[test]
     fn keys_fold_unfold() {
         let mut app = keyed_app();
-        assert_eq!(press(&mut app, key(KeyCode::Char('h'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('h'))),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.status, "folded a");
         assert_eq!(app.header_park.as_deref(), Some("/proj/a"));
-        assert_eq!(press(&mut app, key(KeyCode::Char('h'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('h'))),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.status, "already folded");
-        assert_eq!(press(&mut app, key(KeyCode::Char('l'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('l'))),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.status, "unfolded");
-        assert_eq!(press(&mut app, key(KeyCode::Char('l'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('l'))),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.status, "already unfolded");
-        assert_eq!(press(&mut app, key(KeyCode::Char('H'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('H'))),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.status, "folded 3 groups");
-        assert_eq!(press(&mut app, key(KeyCode::Char('L'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('L'))),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.status, "unfolded 3 groups");
-        assert_eq!(press(&mut app, key(KeyCode::Char('L'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('L'))),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.status, "nothing folded");
         // flat has nothing to fold
         app.group = Group::Flat;
-        assert_eq!(press(&mut app, key(KeyCode::Char('h'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('h'))),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.status, "nothing to fold (flat)");
-        assert_eq!(press(&mut app, key(KeyCode::Char('l'))), KeyOutcome::Continue);
+        assert_eq!(
+            press(&mut app, key(KeyCode::Char('l'))),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.status, "nothing to fold (flat)");
     }
 
@@ -2420,14 +2480,16 @@ mod tests {
         app.apply_filter_sort();
         let items = app.build_items(120);
         let badge = items.iter().any(|it| {
-            it.lines.iter().any(|l| {
-                l.spans.iter().any(|sp| sp.content.contains("[coop]"))
-            })
+            it.lines
+                .iter()
+                .any(|l| l.spans.iter().any(|sp| sp.content.contains("[coop]")))
         });
         assert!(badge, "remote row should carry a [coop] badge");
         let idx = app.sessions.iter().position(|s| s.host == "coop").unwrap();
         let hit_lines = detail_lines(&app.sessions[idx], None, &[]);
-        assert!(hit_lines.iter().any(|l| l.spans.iter().any(|sp| sp.content == "coop")));
+        assert!(hit_lines
+            .iter()
+            .any(|l| l.spans.iter().any(|sp| sp.content == "coop")));
     }
 
     #[test]
@@ -2476,7 +2538,11 @@ mod tests {
         app.sessions.push(fake_remote("r1", "/home/agent", 5000));
         app.apply_filter_sort();
         // Select the remote session (newest activity sorts first).
-        let pos = app.order.iter().position(|&i| app.sessions[i].host == "coop").unwrap();
+        let pos = app
+            .order
+            .iter()
+            .position(|&i| app.sessions[i].host == "coop")
+            .unwrap();
         app.sel = pos;
         app.header_park = None;
         // Idle remote session: window goes to the host's tmux, tab gets focus.

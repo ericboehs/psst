@@ -180,8 +180,12 @@ pub(crate) fn parse_ps_table(ps_out: &str, now: i64) -> HashMap<u32, (u32, Strin
         if parts.len() < 4 {
             continue;
         }
-        let Ok(pid) = parts[0].parse::<u32>() else { continue };
-        let Ok(ppid) = parts[1].parse::<u32>() else { continue };
+        let Ok(pid) = parts[0].parse::<u32>() else {
+            continue;
+        };
+        let Ok(ppid) = parts[1].parse::<u32>() else {
+            continue;
+        };
         let started_at = parse_etime(parts[2]).map(|secs| now - secs);
         let cmd = parts[3..].join(" ");
         table.insert(pid, (ppid, cmd, started_at));
@@ -201,9 +205,10 @@ pub(crate) fn parse_tmux_panes(
         if parts.len() < 4 {
             continue;
         }
-        if let (Ok(ppid), Ok(win)) =
-            (parts[0].trim().parse::<u32>(), parts[3].trim().parse::<u32>())
-        {
+        if let (Ok(ppid), Ok(win)) = (
+            parts[0].trim().parse::<u32>(),
+            parts[3].trim().parse::<u32>(),
+        ) {
             let attention = parts.get(4).map(|s| s.trim() == "on").unwrap_or(false);
             let t = TmuxTarget {
                 session: parts[2].to_string(),
@@ -293,9 +298,7 @@ fn resolve_tmux(
             return Some(t.clone());
         }
         match table.get(&cur) {
-            Some((next_ppid, _, _)) if *next_ppid != 0 && *next_ppid != cur => {
-                cur = *next_ppid
-            }
+            Some((next_ppid, _, _)) if *next_ppid != 0 && *next_ppid != cur => cur = *next_ppid,
             _ => break,
         }
     }
@@ -369,7 +372,11 @@ pub fn detect() -> Vec<PiProc> {
 fn ssh_run(target: &str, remote_cmd: &str) -> anyhow::Result<String> {
     let out = crate::hosts::ssh_command(target, remote_cmd).output()?;
     if !out.status.success() {
-        anyhow::bail!("ssh {}: {}", target, String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "ssh {}: {}",
+            target,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
@@ -480,7 +487,9 @@ pub fn detect_remote(ssh_target: &str, host_name: &str) -> anyhow::Result<Vec<Pi
     let cpu_map = parse_ps_cpu(sections.get("CPU").unwrap_or(&empty));
     let mut procs = Vec::new();
     for pid in pi_pids {
-        let Some((ppid, cmd, started_at)) = table.get(&pid) else { continue };
+        let Some((ppid, cmd, started_at)) = table.get(&pid) else {
+            continue;
+        };
         let (cwd, pane) = probe.get(&pid).cloned().unwrap_or((None, None));
         let tmux = resolve_tmux(pid, *ppid, &table, &panes, &panes_by_id, pane);
         procs.push(PiProc {
@@ -526,16 +535,16 @@ pub fn fetch_remote_enrichment(
             pid = pid
         ));
     }
-    let Ok(out) = ssh_run(ssh_target, &script) else { return empty };
+    let Ok(out) = ssh_run(ssh_target, &script) else {
+        return empty;
+    };
     parse_enrichment(&out)
 }
 
 /// Parse [`fetch_remote_enrichment`] output: `===PSST-NAMES===` /
 /// `===PSST-SUMMARIES===` sections of `PID:<pid>` + single-line JSON rows.
 /// Pure for tests.
-pub(crate) fn parse_enrichment(
-    out: &str,
-) -> (HashMap<u32, String>, HashMap<u32, CacheFields>) {
+pub(crate) fn parse_enrichment(out: &str) -> (HashMap<u32, String>, HashMap<u32, CacheFields>) {
     let mut names = HashMap::new();
     let mut summaries = HashMap::new();
     let mut in_summaries = false;
@@ -616,9 +625,7 @@ fn proc_cwd(pid: u32) -> Option<PathBuf> {
 fn summary_cache_dir() -> Option<PathBuf> {
     if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
         if !x.is_empty() {
-            return Some(
-                PathBuf::from(x).join("agent-link").join("summaries"),
-            );
+            return Some(PathBuf::from(x).join("agent-link").join("summaries"));
         }
     }
     let home = std::env::var("HOME").ok()?;
@@ -653,7 +660,9 @@ fn registry_peer_names(pids: &[u32]) -> HashMap<u32, String> {
             Ok(r) => r,
             Err(_) => continue,
         };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
         if let Some(n) = v
             .get("name")
             .and_then(|x| x.as_str())
@@ -706,7 +715,9 @@ fn summary_cache_lookup(pids: &[u32]) -> HashMap<u32, CacheFields> {
             Ok(r) => r,
             Err(_) => continue,
         };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
         let get = |k: &str| {
             v.get(k)
                 .and_then(|x| x.as_str())
@@ -733,11 +744,17 @@ fn prune_summary_cache(live: &HashSet<u32>) {
         None => return,
     };
     let now = chrono::Utc::now().timestamp();
-    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
     for f in rd.flatten() {
         let name = f.file_name().to_string_lossy().to_string();
-        let Some(pid_str) = name.strip_suffix(".json") else { continue };
-        let Ok(fpid) = pid_str.parse::<u32>() else { continue };
+        let Some(pid_str) = name.strip_suffix(".json") else {
+            continue;
+        };
+        let Ok(fpid) = pid_str.parse::<u32>() else {
+            continue;
+        };
         if live.contains(&fpid) {
             continue;
         }
@@ -834,7 +851,9 @@ fn match_one_host(
         // 1. exact match from --session arg
         if let Some(arg) = &p.session_arg {
             let found = if arg.ends_with(".jsonl") {
-                sessions.iter().find(|s| s.path.to_string_lossy().ends_with(arg))
+                sessions
+                    .iter()
+                    .find(|s| s.path.to_string_lossy().ends_with(arg))
             } else {
                 by_id.get(arg.as_str()).copied()
             };
@@ -884,13 +903,16 @@ fn match_one_host(
         if let Some(cwd) = &p.cwd {
             let cwd_str = cwd.to_string_lossy();
             if let Some(candidates) = by_cwd.get(cwd_str.as_ref()) {
-                if let Some(s) = candidates.iter().find(|s| !claimed.contains(&s.key())).copied() {
+                if let Some(s) = candidates
+                    .iter()
+                    .find(|s| !claimed.contains(&s.key()))
+                    .copied()
+                {
                     claim(&mut *hits, &mut claimed, s, p, p.continue_flag);
                 }
             }
         }
     }
-
 }
 
 /// Map detected processes to concrete session files, partitioned by host so
@@ -918,8 +940,16 @@ pub fn map_running(
     // Owned views per host for the pure matcher (proc/session counts are
     // small; cloning keeps lifetimes simple).
     for host in hosts {
-        let ps: Vec<PiProc> = procs.iter().filter(|p| p.host.as_str() == host).cloned().collect();
-        let ss: Vec<SessionMeta> = sessions.iter().filter(|s| s.host.as_str() == host).cloned().collect();
+        let ps: Vec<PiProc> = procs
+            .iter()
+            .filter(|p| p.host.as_str() == host)
+            .cloned()
+            .collect();
+        let ss: Vec<SessionMeta> = sessions
+            .iter()
+            .filter(|s| s.host.as_str() == host)
+            .cloned()
+            .collect();
         match_one_host(&ps, &ss, active_secs, &mut hits);
     }
     // Enrich local hits from the on-disk caches.
@@ -972,7 +1002,11 @@ pub fn map_running(
             let base = if key.host == LOCAL_HOST {
                 peer_slug(cwd)
             } else {
-                format!("pi-{}-{}", key.host, peer_slug(cwd).trim_start_matches("pi-"))
+                format!(
+                    "pi-{}-{}",
+                    key.host,
+                    peer_slug(cwd).trim_start_matches("pi-")
+                )
             };
             let name = first_free_name(&base, &taken);
             taken.insert(name.clone());
@@ -1065,7 +1099,10 @@ mod tests {
 
     #[test]
     fn peer_names_suffix_unclaimed() {
-        assert_eq!(peer_slug("/Users/x/Code/github.com/ericboehs/dotfiles"), "pi-dotfiles");
+        assert_eq!(
+            peer_slug("/Users/x/Code/github.com/ericboehs/dotfiles"),
+            "pi-dotfiles"
+        );
         let mut taken = HashSet::new();
         taken.insert("pi-dotfiles".into());
         assert_eq!(first_free_name("pi-dotfiles", &taken), "pi-dotfiles-2");
@@ -1112,7 +1149,10 @@ mod tests {
     fn etime_parses() {
         assert_eq!(parse_etime("05:22"), Some(5 * 60 + 22));
         assert_eq!(parse_etime("01:02:03"), Some(3600 + 120 + 3));
-        assert_eq!(parse_etime("2-03:04:05"), Some(2 * 86400 + 3 * 3600 + 4 * 60 + 5));
+        assert_eq!(
+            parse_etime("2-03:04:05"),
+            Some(2 * 86400 + 3 * 3600 + 4 * 60 + 5)
+        );
         assert_eq!(parse_etime("bogus"), None);
     }
 

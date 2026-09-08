@@ -29,9 +29,7 @@ pub fn hosts_dir() -> PathBuf {
 /// Local mirror for `remote_path` on `host`. Preserves the full absolute
 /// path so no remote-root bookkeeping is needed for reads.
 pub fn mirror_path(host: &str, remote_path: &Path) -> PathBuf {
-    let rel = remote_path
-        .strip_prefix("/")
-        .unwrap_or(remote_path);
+    let rel = remote_path.strip_prefix("/").unwrap_or(remote_path);
     hosts_dir().join(host).join(rel)
 }
 
@@ -70,7 +68,12 @@ pub fn parse_find_output(out: &str) -> Vec<RemoteFile> {
         if path.is_empty() {
             continue;
         }
-        let mtime = mtime.split('.').next().unwrap_or("").parse::<i64>().unwrap_or(0);
+        let mtime = mtime
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .parse::<i64>()
+            .unwrap_or(0);
         let size = size.trim().parse::<u64>().unwrap_or(0);
         files.push(RemoteFile {
             path: PathBuf::from(path),
@@ -310,10 +313,13 @@ fn cached_sessions_for_host(host_name: &str) -> Vec<SessionMeta> {
         .collect::<Vec<_>>()
         // dedupe by path (belt and suspenders across the two filters)
         .into_iter()
-        .fold(HashMap::new(), |mut acc: HashMap<PathBuf, SessionMeta>, m| {
-            acc.insert(m.path.clone(), m);
-            acc
-        })
+        .fold(
+            HashMap::new(),
+            |mut acc: HashMap<PathBuf, SessionMeta>, m| {
+                acc.insert(m.path.clone(), m);
+                acc
+            },
+        )
         .into_values()
         .collect()
 }
@@ -495,14 +501,24 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].mtime, 1787357221);
         assert_eq!(got[0].size, 4111);
-        assert_eq!(got[1].path, PathBuf::from("/home/agent/.pi/agent/sessions/--x--/b.jsonl"));
+        assert_eq!(
+            got[1].path,
+            PathBuf::from("/home/agent/.pi/agent/sessions/--x--/b.jsonl")
+        );
     }
 
     #[test]
     fn mirror_preserves_absolute_path() {
-        let m = mirror_path("coop", Path::new("/home/agent/.pi/agent/sessions/--x--/a.jsonl"));
+        let m = mirror_path(
+            "coop",
+            Path::new("/home/agent/.pi/agent/sessions/--x--/a.jsonl"),
+        );
         let s = m.to_string_lossy();
-        assert!(s.contains("hosts/coop/home/agent/.pi/agent/sessions/--x--/a.jsonl"), "got {}", s);
+        assert!(
+            s.contains("hosts/coop/home/agent/.pi/agent/sessions/--x--/a.jsonl"),
+            "got {}",
+            s
+        );
     }
 
     #[test]
@@ -533,7 +549,11 @@ mod tests {
         // Every interpolated value is quoted: a project dir with a space
         // must not turn into two tmux arguments.
         let spaced = new_window_script("/home/agent/my proj", "my proj", "pi -c");
-        assert!(spaced.contains("-c '/home/agent/my proj'"), "got {}", spaced);
+        assert!(
+            spaced.contains("-c '/home/agent/my proj'"),
+            "got {}",
+            spaced
+        );
         assert!(spaced.contains("-n 'my proj'"), "got {}", spaced);
         assert!(spaced.ends_with("'pi -c'"), "got {}", spaced);
     }
