@@ -313,9 +313,9 @@ fn parse_selected(s: &str) -> SessionKey {
 }
 
 impl App {
-    pub fn new(sessions: Vec<SessionMeta>, config: Config, cwd_scope: Option<PathBuf>) -> App {
+    pub fn new(config: Config, cwd_scope: Option<PathBuf>) -> App {
         let mut app = App {
-            sessions,
+            sessions: Vec::new(),
             running: HashMap::new(),
             order: Vec::new(),
             sel: 0,
@@ -390,12 +390,15 @@ impl App {
         self.clamp_sel();
     }
 
-    /// Local-only rescan with no ssh: fast first paint at startup. The event
-    /// loop queues a background [`full_refresh`] immediately, so remotes pop
-    /// in a moment later instead of blocking the first frame on handshakes.
+    /// First-frame refresh: local sessions from the cache plus whatever the
+    /// host mirrors already hold, and local `ps` for running state. No ssh,
+    /// so the frame is not waiting on the network — [`run`] queues the full
+    /// pass on a worker thread and swaps it in when it lands.
     pub fn refresh_local(&mut self) {
         let sel_key = self.order.get(self.sel).map(|&i| self.sessions[i].key());
-        self.sessions = scan(&sessions_root(), false).unwrap_or_default();
+        let mut sessions = scan(&sessions_root(), false).unwrap_or_default();
+        sessions.extend(hosts::cached_sessions(self.config.hosts()));
+        self.sessions = sessions;
         let procs = detect();
         self.running = map_running(&procs, &self.sessions, self.config.active_secs());
         self.apply_filter_sort();
@@ -1664,7 +1667,10 @@ pub(crate) fn handle_key(
     KeyOutcome::Continue
 }
 
-pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
+/// Run the TUI. `force_first` makes the initial background rescan a full
+/// rebuild (`--refresh`), which still runs off the UI thread: the first
+/// frame comes from the cache either way.
+pub fn run(app: &mut App, force_first: bool) -> Result<Option<OpenAction>> {
     let mut terminal = ratatui::init();
     let mut list_state = ListState::default();
     let mut last_full = std::time::Instant::now();
@@ -1678,10 +1684,10 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
     // failures arrive as `None` and keep the current data on screen.
     let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<(Option<RefreshResult>, bool)>();
     let mut refresh_busy = false;
-    // Startup painted local-only (`App::new` → `refresh_local`); queue the
-    // full pass at once so remotes fill in behind the first frame instead
-    // of blocking it on ssh handshakes.
-    let mut refresh_queued: Option<bool> = Some(false);
+    // Startup painted from the cache (`App::new` → `refresh_local`); queue the
+    // ssh pass at once so remotes correct themselves behind the first frame
+    // instead of blocking it on handshakes.
+    let mut refresh_queued: Option<bool> = Some(force_first);
     let spawn_refresh =
         |app: &App, tx: &std::sync::mpsc::Sender<(Option<RefreshResult>, bool)>, force: bool| {
             let config = app.config.clone();

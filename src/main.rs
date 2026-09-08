@@ -178,12 +178,8 @@ fn main() -> Result<()> {
         print_focus_debug(&cfg);
         return Ok(());
     }
-    let (sessions, hits, host_errors) = load_sessions(&cfg, args.refresh)?;
-    for e in &host_errors {
-        eprintln!("psst: {}", e);
-    }
-
     if args.debug_running {
+        let (_, hits, _) = load_sessions(&cfg, args.refresh)?;
         let mut procs = detect();
         for h in cfg.hosts() {
             match detect_remote(&h.ssh_target, &h.name) {
@@ -201,22 +197,25 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let shown = scoped(&sessions, args.scope.as_deref());
-    if args.json {
-        print_json(&shown, &hits);
-        return Ok(());
-    }
-    if args.list {
-        print_list(&shown, &hits);
+    if args.json || args.list {
+        let (sessions, hits, host_errors) = load_sessions(&cfg, args.refresh)?;
+        for e in &host_errors {
+            eprintln!("psst: {}", e);
+        }
+        let shown = scoped(&sessions, args.scope.as_deref());
+        if args.json {
+            print_json(&shown, &hits);
+        } else {
+            print_list(&shown, &hits);
+        }
         return Ok(());
     }
 
-    let mut app = tui::App::new(sessions, cfg, args.scope);
-    // Surface mirror errors on the first frame instead of only stderr.
-    if !host_errors.is_empty() {
-        app.status = host_errors.join("; ");
-    }
-    match tui::run(&mut app)? {
+    // The TUI draws its first frame from the cache and does every ssh call on
+    // a worker thread, so loading synchronously here would only make that
+    // frame wait for the network — and then be thrown away and redone.
+    let mut app = tui::App::new(cfg, args.scope);
+    match tui::run(&mut app, args.refresh)? {
         Some(action) => perform(action),
         None => Ok(()),
     }

@@ -74,13 +74,16 @@ working with the last mirror + local sessions.
 | `q` | quit |
 
 Local running detection ticks every 1s; the session archive rescans every
-10s. Startup paints local sessions first (no ssh), then a background worker
-fills remotes in behind the first frame. Remote hosts sync + detect on the
-10s rescan (and `r`/`R`) only, and the rescan runs on that worker thread —
-keys stay live while ssh is in flight (a dim `sync…` badge in the header
-shows work is pending, and the selection is preserved across the swap).
-Filter, grouping, sort, detail, prompts, and the selected row are restored
-the next time you open psst (`~/.cache/psst/ui-state.json`).
+10s. The first frame is drawn entirely from the cache — local sessions plus
+the host mirrors — so it lands in ~0.15s and already lists every host; only
+remote *running* state waits for the background worker. Remote hosts sync +
+detect on the 10s rescan (and `r`/`R`) only, and the rescan runs on that
+worker thread — keys stay live while ssh is in flight (a dim `sync…` badge
+in the header shows work is pending, and the selection is preserved across
+the swap). `psst --refresh` forces a full rebuild on that worker too, so it
+no longer delays the first frame. Filter, grouping, sort, detail, prompts,
+and the selected row are restored the next time you open psst
+(`~/.cache/psst/ui-state.json`).
 
 Group headers (project, day, and host modes) show session count, total cost,
 and the newest activity in the group. Day buckets use local dates; within a

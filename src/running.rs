@@ -17,7 +17,7 @@
 use crate::scan::{SessionKey, SessionMeta, LOCAL_HOST};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TmuxTarget {
@@ -306,41 +306,165 @@ fn resolve_tmux(
 }
 
 /// Snapshot local running pi processes, their cwds, and tmux targets.
-pub fn detect() -> Vec<PiProc> {
-    let ps_out = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,etime=,command="])
+/// Capture a command's stdout, or empty on any failure.
+fn run_out(cmd: &str, args: &[&str]) -> String {
+    std::process::Command::new(cmd)
+        .args(args)
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// cwds for `pids`: `/proc` on Linux, one batched `lsof` on macOS.
+///
+/// Batching matters because this runs on every 1s tick: a fork per process
+/// cost ~80ms each, half a second per sweep with a handful of agents.
+fn local_cwds(pids: &[u32]) -> HashMap<u32, PathBuf> {
+    if pids.is_empty() {
+        return HashMap::new();
+    }
+    if Path::new("/proc/self").is_dir() {
+        return pids
+            .iter()
+            .filter_map(|&pid| {
+                std::fs::read_link(format!("/proc/{}/cwd", pid))
+                    .ok()
+                    .map(|p| (pid, p))
+            })
+            .collect();
+    }
+    parse_lsof_cwds(&run_out(
+        "lsof",
+        &["-a", "-d", "cwd", "-Fpn", "-p", &pid_csv(pids)],
+    ))
+}
+
+/// `TMUX_PANE` for `pids`, read from their environment.
+///
+/// Only worth calling for processes the parent-chain walk could not place:
+/// macOS hides the environment of these processes entirely, so the fork
+/// usually comes back empty.
+fn local_panes(pids: &[u32]) -> HashMap<u32, String> {
+    if pids.is_empty() {
+        return HashMap::new();
+    }
+    if Path::new("/proc/self").is_dir() {
+        return pids
+            .iter()
+            .filter_map(|&pid| {
+                let raw = std::fs::read(format!("/proc/{}/environ", pid)).ok()?;
+                let pane = pane_from_environ(&String::from_utf8_lossy(&raw))?;
+                Some((pid, pane))
+            })
+            .collect();
+    }
+    parse_ps_env_panes(&run_out("ps", &["eww", "-p", &pid_csv(pids)]))
+}
+
+fn pid_csv(pids: &[u32]) -> String {
+    pids.iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `TMUX_PANE` out of a NUL- or space-separated environment blob.
+fn pane_from_environ(raw: &str) -> Option<String> {
+    raw.split(['\0', ' '])
+        .find_map(|t| t.strip_prefix("TMUX_PANE=").map(|v| v.trim().to_string()))
+        .filter(|v| !v.is_empty())
+}
+
+/// Parse `lsof -Fpn` field output: `p<pid>` starts a section, the first
+/// `n<path>` under it is that process's cwd. Pure for tests.
+pub(crate) fn parse_lsof_cwds(out: &str) -> HashMap<u32, PathBuf> {
+    let mut map = HashMap::new();
+    let mut cur: Option<u32> = None;
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix('p') {
+            cur = rest.trim().parse::<u32>().ok();
+        } else if let Some(path) = line.strip_prefix('n') {
+            if let Some(pid) = cur {
+                if !path.is_empty() {
+                    // First cwd wins; a later fd must not overwrite it.
+                    map.entry(pid).or_insert_with(|| PathBuf::from(path));
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Parse `ps eww -p <csv>` output into pid → `TMUX_PANE`. Pure for tests.
+pub(crate) fn parse_ps_env_panes(out: &str) -> HashMap<u32, String> {
+    let mut map = HashMap::new();
+    for line in out.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(pid) = parts.next().and_then(|p| p.parse::<u32>().ok()) else {
+            continue; // header row
+        };
+        if let Some(pane) = pane_from_environ(line) {
+            map.insert(pid, pane);
+        }
+    }
+    map
+}
+
+pub fn detect() -> Vec<PiProc> {
+    // These three probes do not depend on each other and each costs a
+    // fork+exec of tens of ms, which the 1s tick pays in full. Run them
+    // together so the sweep costs the slowest one, not their sum.
+    let (ps_out, cpu_out, tmux_out) = std::thread::scope(|s| {
+        let ps = s.spawn(|| run_out("ps", &["-axo", "pid=,ppid=,etime=,command="]));
+        let cpu = s.spawn(|| run_out("ps", &["-axo", "pid=,pcpu="]));
+        let tmux = s.spawn(|| {
+            run_out(
+                "tmux",
+                &[
+                    "list-panes",
+                    "-a",
+                    "-F",
+                    "#{pane_pid}\t#{pane_id}\t#{session_name}\t#{window_index}\t#{@special_activity}",
+                ],
+            )
+        });
+        (
+            ps.join().unwrap_or_default(),
+            cpu.join().unwrap_or_default(),
+            tmux.join().unwrap_or_default(),
+        )
+    });
     if ps_out.is_empty() {
         return Vec::new();
     }
     let now = chrono::Utc::now().timestamp();
     let table = parse_ps_table(&ps_out, now);
-    let tmux_out = std::process::Command::new("tmux")
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{pane_pid}\t#{pane_id}\t#{session_name}\t#{window_index}\t#{@special_activity}",
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
     let (panes, panes_by_id) = parse_tmux_panes(&tmux_out);
-    let cpu_map = std::process::Command::new("ps")
-        .args(["-axo", "pid=,pcpu="])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| parse_ps_cpu(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or_default();
+    let cpu_map = parse_ps_cpu(&cpu_out);
 
     let mut procs = Vec::new();
+    let pi_pids: Vec<u32> = table
+        .iter()
+        .filter(|(_, (_, cmd, _))| looks_like_pi(cmd))
+        .map(|(pid, _)| *pid)
+        .collect();
+    // The parent-chain walk places anything launched inside tmux, which is
+    // nearly everything; only the leftovers justify the environment probe.
+    let needs_env: Vec<u32> = pi_pids
+        .iter()
+        .copied()
+        .filter(|pid| {
+            let ppid = table.get(pid).map(|t| t.0).unwrap_or(0);
+            resolve_tmux(*pid, ppid, &table, &panes, &panes_by_id, None).is_none()
+        })
+        .collect();
+    let (cwds, env_panes) = std::thread::scope(|s| {
+        let c = s.spawn(|| local_cwds(&pi_pids));
+        let e = s.spawn(|| local_panes(&needs_env));
+        (c.join().unwrap_or_default(), e.join().unwrap_or_default())
+    });
     for (pid, (ppid, cmd, started_at)) in &table {
         if !looks_like_pi(cmd) {
             continue;
@@ -351,14 +475,14 @@ pub fn detect() -> Vec<PiProc> {
             &table,
             &panes,
             &panes_by_id,
-            proc_tmux_pane(*pid),
+            env_panes.get(pid).cloned(),
         );
         procs.push(PiProc {
             host: LOCAL_HOST.to_string(),
             cpu: subtree_cpu(&table, &cpu_map, *pid),
             pid: *pid,
             ppid: *ppid,
-            cwd: proc_cwd(*pid),
+            cwd: cwds.get(pid).cloned(),
             cmd: cmd.clone(),
             session_arg: session_arg_from_cmd(cmd),
             continue_flag: continue_flag_from_cmd(cmd),
@@ -586,37 +710,6 @@ pub(crate) fn parse_enrichment(out: &str) -> (HashMap<u32, String>, HashMap<u32,
 }
 
 /// Read TMUX_PANE from a process environment (macOS/Linux `ps eww`).
-fn proc_tmux_pane(pid: u32) -> Option<String> {
-    let o = std::process::Command::new("ps")
-        .args(["eww", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    if !o.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&o.stdout)
-        .split_whitespace()
-        .find_map(|t| t.strip_prefix("TMUX_PANE=").map(|v| v.to_string()))
-}
-
-fn proc_cwd(pid: u32) -> Option<PathBuf> {
-    let o = std::process::Command::new("lsof")
-        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-        .output()
-        .ok()?;
-    if !o.status.success() {
-        return None;
-    }
-    for line in String::from_utf8_lossy(&o.stdout).lines() {
-        if let Some(p) = line.strip_prefix('n') {
-            if !p.is_empty() {
-                return Some(PathBuf::from(p));
-            }
-        }
-    }
-    None
-}
-
 /// Shared activity-summary cache. pi-agent-link mirrors each live pi session's
 /// name/status/summary here because psst must not read ~/.claude (guarded on
 /// this machine). Layout root must match the extension:
@@ -1284,6 +1377,42 @@ mod tests {
         h.status = None;
         h.cpu = CPU_WORKING_PCT - 0.1;
         assert_eq!(live_mark(Some(&h)), LiveMark::Waiting);
+    }
+
+    #[test]
+    fn lsof_batch_parses_one_cwd_per_pid() {
+        // One `lsof -Fpn` call covers every pi process; sections are keyed
+        // by the `p` line, and stray fds must not overwrite the cwd.
+        let out = "p3395\nfcwd\nn/Users/eric\np11138\nfcwd\nn/Users/eric/Vault\n";
+        let m = parse_lsof_cwds(out);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[&3395], PathBuf::from("/Users/eric"));
+        assert_eq!(m[&11138], PathBuf::from("/Users/eric/Vault"));
+        // A path with spaces survives (iCloud dirs have them).
+        let spaced = parse_lsof_cwds("p7\nfcwd\nn/Users/e/Mobile Documents/Vault\n");
+        assert_eq!(spaced[&7], PathBuf::from("/Users/e/Mobile Documents/Vault"));
+        // Values before any `p` line belong to nobody.
+        assert!(parse_lsof_cwds("n/orphan\n").is_empty());
+    }
+
+    #[test]
+    fn ps_env_batch_picks_out_tmux_pane() {
+        let out = "  PID   TT  STAT      TIME COMMAND\n                   49731 s005  S+    13:46.88 pi TMUX_PANE=%7 SHELL=/bin/zsh\n                   90943 s011  Ss+    0:01.19 pi SHELL=/bin/zsh\n";
+        let m = parse_ps_env_panes(out);
+        // Header row is skipped, and a process without the var is absent
+        // rather than present-and-empty (macOS hides env for some procs).
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[&49731], "%7");
+    }
+
+    #[test]
+    fn environ_reads_nul_separated_linux_form() {
+        assert_eq!(
+            pane_from_environ("A=1\0TMUX_PANE=%12\0B=2"),
+            Some("%12".to_string())
+        );
+        assert_eq!(pane_from_environ("A=1\0B=2"), None);
+        assert_eq!(pane_from_environ("TMUX_PANE=\0B=2"), None);
     }
 
     #[test]

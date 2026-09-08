@@ -289,6 +289,37 @@ pub fn sync_host(host: &HostConfig, force: bool) -> HostSync {
     }
 }
 
+/// Sessions for `hosts` straight from the cache, with no ssh at all.
+///
+/// Backs the first TUI frame: the mirrors and their metadata are already on
+/// disk, so remote rows can be drawn immediately and corrected by the
+/// background sync, instead of popping in seconds later.
+pub fn cached_sessions(hosts: &[HostConfig]) -> Vec<SessionMeta> {
+    if hosts.is_empty() {
+        return Vec::new();
+    }
+    // One cache read for every host: it is a single multi-MB file.
+    let cache = scan::load_cache();
+    let names: HashSet<&str> = hosts.iter().map(|h| h.name.as_str()).collect();
+    let mut out: HashMap<(String, PathBuf), SessionMeta> = HashMap::new();
+    for (key, entry) in &cache.0 {
+        let host = match key.split_once('\0') {
+            Some((h, _)) => h,
+            // Legacy bare-path keys are local by definition.
+            None => continue,
+        };
+        if !names.contains(host) {
+            continue;
+        }
+        let mut meta = entry.meta.clone();
+        if meta.host.is_empty() {
+            meta.host = host.to_string();
+        }
+        out.insert((meta.host.clone(), meta.path.clone()), meta);
+    }
+    out.into_values().collect()
+}
+
 fn cached_sessions_for_host(host_name: &str) -> Vec<SessionMeta> {
     // Offline view: whatever the shared cache already holds for this host.
     // Mirrors on disk still back the detail pane while the host is down.
