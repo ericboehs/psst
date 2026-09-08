@@ -39,13 +39,18 @@ Rust via Homebrew is the only dependency. tmux is required for opening sessions.
 ## Usage
 
 ```bash
-psst                  # TUI
-psst .                # TUI, only this project (git root, else cwd)
-psst --list           # plain table (pipe-friendly)
-psst --json           # JSON array (same rows as --list)
-psst --refresh        # rebuild the metadata cache from scratch
-psst --debug-running  # print detected pi processes + tmux targets
+psst                  # TUI (local + configured hosts)
+psst .                # TUI, only this project (git root, else cwd; remotes filtered out)
+psst --list           # plain table with a host column (pipe-friendly)
+psst --json           # JSON array (same rows as --list; each row has "host")
+psst --refresh        # rebuild the metadata cache from scratch (re-mirrors hosts)
+psst --debug-running  # print detected pi processes + tmux targets (local + hosts)
 ```
+
+Remote sessions carry a magenta `[coop]` badge, show up in the header as
+`coop:11`, match `coop` in `/` search, and open over ssh (see below).
+When a host is unreachable its error appears in the header and `psst` keeps
+working with the last mirror + local sessions.
 
 ### Keys
 
@@ -53,27 +58,29 @@ psst --debug-running  # print detected pi processes + tmux targets
 |-----|--------|
 | `/` | focus search (then type anything, including `j`/`k`; Esc unfocuses). Running sessions also match `active`. |
 | `f` | cycle list filter: all → named → active |
-| `g` or `Tab` | cycle grouping: flat → project → day |
+| `g` or `Tab` | cycle grouping: flat → project → day → host |
 | `s` or `Ctrl+S` | cycle sort: activity → tmux |
 | `↑`/`↓` or `k`/`j`, PgUp/PgDn | navigate rows — group headers are stops too (j/k only when search is not focused) |
 | `J` / `K` | next / previous group (day or project; no-op when flat) |
 | `h` / `l` | fold / unfold the current group |
 | `H` / `L` | fold / unfold all groups |
 | `?` | shortcut overlay (also in the TUI footer) |
-| `Enter` | **open**: attach to the running tmux session, or spawn `pi --session <file>` in a new tmux window (on a header: toggle fold) |
+| `Enter` | **open**: attach to the running tmux session, or spawn `pi --session <file>` in a new tmux window (on a header: toggle fold). Remote sessions open via `ssh -t <host>` (attach: `tmux attach` on the remote; resume: `cd <cwd> && <command>` on the remote, in a new local window) |
 | `d` | toggle the bottom detail pane (off by default) |
 | `p` | hide/show last user prompt on a second line under each row |
 | `r` / `R` | rescan (cache-aware) / full rescan |
 | `Esc` | clear filter (quit if empty) |
 | `q` | quit |
 
-Running detection ticks every 1s; the session archive rescans every 10s.
+Local running detection ticks every 1s; the session archive rescans every
+10s. Remote hosts sync + detect on the 10s rescan (and `r`/`R`) only.
 Filter, grouping, sort, detail, prompts, and the selected row are restored
 the next time you open psst (`~/.cache/psst/ui-state.json`).
 
-Group headers (project and day modes) show session count, total cost, and the
-newest activity in the group. Day buckets use local dates; within a group,
-rows keep the active sort's order.
+Group headers (project, day, and host modes) show session count, total cost,
+and the newest activity in the group. Day buckets use local dates; within a
+group, rows keep the active sort's order. In host mode local sorts first,
+then remotes by recency.
 
 ## How it works
 
@@ -94,8 +101,22 @@ rows keep the active sort's order.
 - **Open**: running sessions switch/attach to their tmux target (window, not
   just session); idle sessions spawn a new tmux window (or detached session
   when outside tmux) running the resume command in the session's project cwd.
+  Remote sessions do the same over `ssh -t`: attach runs
+  `tmux select-window … \; attach` on the remote; resume runs
+  `cd <remote-cwd> && <resume-command>` on the remote inside a new *local*
+  tmux window (or local session + attach when outside tmux).
+- **Hosts**: each `[hosts.<name>]` entry is listed over ssh and mirrored to
+  `~/.cache/psst/hosts/<name>/<absolute-remote-path>` (only changed files
+  are fetched, checked against the shared metadata cache). The mirror backs
+  the detail pane, so remotes stay browsable while offline. Running
+  detection runs `ps` + `tmux list-panes` + one batch `/proc` probe per host
+  (cwd from `/proc/<pid>/cwd`, `TMUX_PANE` from `/proc/<pid>/environ`),
+  plus peer names from `~/.claude/sessions/<pid>.json` and status from
+  `~/.cache/agent-link/summaries/<pid>.json` when present. Matching is
+  partitioned by host, so identical cwds on two machines never cross-match.
+  Minted fallback names are host-prefixed (`pi-coop-agent`).
 - **Cache**: parsed metadata is cached at `~/.cache/psst/cache.json`, keyed by
-  path+mtime+size, so rescans only reparse changed files.
+  host+path+mtime+size, so rescans only reparse changed files.
 
 ## Config — `~/.config/psst/config.toml`
 
@@ -108,17 +129,34 @@ command = 'pi --session {file}'
 active_secs = 120
 
 [ui]
-# grouping on launch: "day" (default), "project", or "flat"
+# grouping on launch: "day" (default), "project", "flat", or "host"
 group = "day"
+
+[hosts.coop]
+# ssh target as in `ssh <target>` (key-based, BatchMode — no passwords)
+ssh = "coop"
+# enabled = true (default when the table exists; false hides the host)
+# sessions_dir = ".pi/agent/sessions" (default; $PI_CODING_AGENT_DIR wins
+#   on the remote when set; absolute or ~/ paths also allowed)
+
+[hosts.gfe]
+# display name and ssh target may differ: this entry shows as `gfe` but
+# dials the wired alias (only one of gfe/gfew is reachable at a time).
+ssh = "gfew"
 ```
+
+Linux and macOS remotes both work: session listing uses GNU `find -printf`
+with a BSD `stat` fallback, and the process probe reads `/proc` on Linux
+vs `lsof` + `ps eww` on macOS (same sources as local detection).
 
 If you launch pi through mise or a wrapper, point `command` at it, e.g.
 `command = 'mise x -- pi --session {file}'`.
 
 ## Non-goals (v1)
 
-No editing/deleting sessions, no forking, no cross-machine sync, no analytics
-dashboards. psst lists, inspects, and opens — session mutation stays in pi.
+No editing/deleting sessions, no forking, no analytics dashboards. Host
+mirrors are read-only (list/inspect/open over ssh) — session mutation stays
+in pi.
 
 ## Status
 

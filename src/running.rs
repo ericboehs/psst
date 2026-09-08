@@ -14,7 +14,7 @@
 //!      write, so there is no recency gate — a live process is enough.
 //!      Parallel agents in one project claim distinct files (newest-first).
 
-use crate::scan::SessionMeta;
+use crate::scan::{SessionKey, SessionMeta, LOCAL_HOST};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -30,6 +30,8 @@ pub struct TmuxTarget {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PiProc {
+    /// Host owning the process: "local" or a `[hosts.<name>]` key.
+    pub host: String,
     pub pid: u32,
     pub ppid: u32,
     pub cwd: Option<PathBuf>,
@@ -150,20 +152,9 @@ pub fn looks_like_pi(cmd: &str) -> bool {
         || cmd.ends_with("/shims/pi")
 }
 
-/// Snapshot running pi processes, their cwds, and tmux targets.
-pub fn detect() -> Vec<PiProc> {
-    let mut procs = Vec::new();
-
-    let ps = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,etime=,command="])
-        .output();
-    let ps_out = match ps {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => return procs,
-    };
-
-    // pid -> (ppid, cmd, started_at)
-    let now = chrono::Utc::now().timestamp();
+/// Parse `ps -axo pid=,ppid=,etime=,command=` output into
+/// pid -> (ppid, cmd, started_at). Pure for tests and remote reuse.
+pub(crate) fn parse_ps_table(ps_out: &str, now: i64) -> HashMap<u32, (u32, String, Option<i64>)> {
     let mut table: HashMap<u32, (u32, String, Option<i64>)> = HashMap::new();
     for line in ps_out.lines() {
         let parts: Vec<&str> = line.trim().split_whitespace().collect();
@@ -176,11 +167,94 @@ pub fn detect() -> Vec<PiProc> {
         let cmd = parts[3..].join(" ");
         table.insert(pid, (ppid, cmd, started_at));
     }
+    table
+}
 
-    // tmux panes: pane_pid (shell) -> target, pane_id ("%N") -> target
+/// Parse `tmux list-panes -a -F ...` output into
+/// (pane_pid -> target, pane_id -> target). Pure for tests and remote reuse.
+pub(crate) fn parse_tmux_panes(
+    tmux_out: &str,
+) -> (HashMap<u32, TmuxTarget>, HashMap<String, TmuxTarget>) {
     let mut panes: HashMap<u32, TmuxTarget> = HashMap::new();
     let mut panes_by_id: HashMap<String, TmuxTarget> = HashMap::new();
-    if let Ok(o) = std::process::Command::new("tmux")
+    for line in tmux_out.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        if let (Ok(ppid), Ok(win)) =
+            (parts[0].trim().parse::<u32>(), parts[3].trim().parse::<u32>())
+        {
+            let attention = parts.get(4).map(|s| s.trim() == "on").unwrap_or(false);
+            let t = TmuxTarget {
+                session: parts[2].to_string(),
+                window: Some(win),
+                attention,
+            };
+            panes.insert(ppid, t.clone());
+            panes_by_id.insert(parts[1].to_string(), t);
+        }
+    }
+    (panes, panes_by_id)
+}
+
+pub(crate) fn session_arg_from_cmd(cmd: &str) -> Option<String> {
+    cmd.split_whitespace()
+        .skip(1)
+        .zip(cmd.split_whitespace().skip(2))
+        .find(|(flag, _)| *flag == "--session")
+        .map(|(_, val)| val.to_string())
+}
+
+pub(crate) fn continue_flag_from_cmd(cmd: &str) -> bool {
+    cmd.split_whitespace()
+        .skip(1)
+        .any(|t| t == "-c" || t == "--continue")
+}
+
+/// Resolve a process's tmux target: exact `TMUX_PANE` first, then a walk up
+/// the parent chain to a pane shell, then the process's own pid.
+fn resolve_tmux(
+    pid: u32,
+    ppid: u32,
+    table: &HashMap<u32, (u32, String, Option<i64>)>,
+    panes: &HashMap<u32, TmuxTarget>,
+    panes_by_id: &HashMap<String, TmuxTarget>,
+    tmux_pane: Option<String>,
+) -> Option<TmuxTarget> {
+    if let Some(t) = tmux_pane.and_then(|pane| panes_by_id.get(&pane).cloned()) {
+        return Some(t);
+    }
+    let mut cur = ppid;
+    for _ in 0..5 {
+        if let Some(t) = panes.get(&cur) {
+            return Some(t.clone());
+        }
+        match table.get(&cur) {
+            Some((next_ppid, _, _)) if *next_ppid != 0 && *next_ppid != cur => {
+                cur = *next_ppid
+            }
+            _ => break,
+        }
+    }
+    panes.get(&pid).cloned()
+}
+
+/// Snapshot local running pi processes, their cwds, and tmux targets.
+pub fn detect() -> Vec<PiProc> {
+    let ps_out = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,etime=,command="])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    if ps_out.is_empty() {
+        return Vec::new();
+    }
+    let now = chrono::Utc::now().timestamp();
+    let table = parse_ps_table(&ps_out, now);
+    let tmux_out = std::process::Command::new("tmux")
         .args([
             "list-panes",
             "-a",
@@ -188,84 +262,239 @@ pub fn detect() -> Vec<PiProc> {
             "#{pane_pid}\t#{pane_id}\t#{session_name}\t#{window_index}\t#{@special_activity}",
         ])
         .output()
-    {
-        if o.status.success() {
-            for line in String::from_utf8_lossy(&o.stdout).lines() {
-                let parts: Vec<&str> = line.split('\t').collect();
-                if parts.len() < 4 {
-                    continue;
-                }
-                if let (Ok(ppid), Ok(win)) =
-                    (parts[0].trim().parse::<u32>(), parts[3].trim().parse::<u32>())
-                {
-                    // #{pane_pid} is the pane's shell pid; pi spawned from that
-                    // shell has ppid == pane_pid. (If the pane command exec'd
-                    // pi directly, pane_pid == pi pid, handled below.)
-                    let attention = parts.get(4).map(|s| s.trim() == "on").unwrap_or(false);
-                    let t = TmuxTarget {
-                        session: parts[2].to_string(),
-                        window: Some(win),
-                        attention,
-                    };
-                    panes.insert(ppid, t.clone());
-                    panes_by_id.insert(parts[1].to_string(), t);
-                }
-            }
-        }
-    }
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let (panes, panes_by_id) = parse_tmux_panes(&tmux_out);
 
+    let mut procs = Vec::new();
     for (pid, (ppid, cmd, started_at)) in &table {
         if !looks_like_pi(cmd) {
             continue;
         }
-        let cwd = proc_cwd(*pid);
-        // Exact pane via TMUX_PANE inherited from the pane environment
-        // (survives shim/exec chains that defeat parent walking).
-        let mut tmux = proc_tmux_pane(*pid).and_then(|pane| panes_by_id.get(&pane).cloned());
-        // Fallback: walk up a few levels (pi -> shell -> ...) to a pane shell.
-        if tmux.is_none() {
-            let mut cur = *ppid;
-            for _ in 0..5 {
-                if let Some(t) = panes.get(&cur) {
-                    tmux = Some(t.clone());
-                    break;
-                }
-                match table.get(&cur) {
-                    Some((next_ppid, _, _)) if *next_ppid != 0 && *next_ppid != cur => {
-                        cur = *next_ppid
-                    }
-                    _ => break,
-                }
-            }
-        }
-        // Also match the process's own pid directly (pi exec'd as pane command).
-        if tmux.is_none() {
-            if let Some(t) = panes.get(pid) {
-                tmux = Some(t.clone());
-            }
-        }
-        let session_arg = cmd
-            .split_whitespace()
-            .skip(1)
-            .zip(cmd.split_whitespace().skip(2))
-            .find(|(flag, _)| *flag == "--session")
-            .map(|(_, val)| val.to_string());
-        let continue_flag = cmd
-            .split_whitespace()
-            .skip(1)
-            .any(|t| t == "-c" || t == "--continue");
+        let tmux = resolve_tmux(
+            *pid,
+            *ppid,
+            &table,
+            &panes,
+            &panes_by_id,
+            proc_tmux_pane(*pid),
+        );
         procs.push(PiProc {
+            host: LOCAL_HOST.to_string(),
             pid: *pid,
             ppid: *ppid,
-            cwd,
+            cwd: proc_cwd(*pid),
             cmd: cmd.clone(),
-            session_arg,
-            continue_flag,
+            session_arg: session_arg_from_cmd(cmd),
+            continue_flag: continue_flag_from_cmd(cmd),
             started_at: *started_at,
             tmux,
         });
     }
     procs
+}
+
+fn ssh_run(target: &str, remote_cmd: &str) -> anyhow::Result<String> {
+    let out = std::process::Command::new("ssh")
+        .args([
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectionAttempts=1",
+            target,
+            remote_cmd,
+        ])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!("ssh {}: {}", target, String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Build [`detect_remote`]'s batch probe: one shell loop over the pi pids
+/// emitting `PID:`/`CWD:`/`PANE:` blocks. Linux reads /proc; macOS remotes
+/// (no /proc) use lsof + `ps eww`, same as local detect. Pure for tests.
+pub(crate) fn remote_probe_script(pids: &[u32]) -> String {
+    let mut script = String::from("OS=$(uname -s); for pid in");
+    for pid in pids {
+        script.push_str(&format!(" {} ", pid));
+    }
+    script.push_str(
+        "; do echo PID:$pid; \
+         if [ \"$OS\" = Darwin ]; then \
+           lsof -a -p $pid -d cwd -Fn 2>/dev/null | grep ^n | sed 's/^n/CWD:/'; \
+           ps eww -p $pid 2>/dev/null | tr ' ' '\\n' | grep ^TMUX_PANE= | sed 's/^TMUX_PANE=/PANE:/'; \
+         else \
+           readlink /proc/$pid/cwd 2>/dev/null | sed 's/^/CWD:/'; \
+           tr '\\0' '\\n' < /proc/$pid/environ 2>/dev/null | grep ^TMUX_PANE= | sed 's/^TMUX_PANE=/PANE:/'; \
+         fi; done",
+    );
+    script
+}
+
+/// Parse `PID:<pid>`, `CWD:<path>`, `PANE:<%N>` blocks from [`detect_remote`]'s
+/// batch probe. Pure for tests.
+pub(crate) fn parse_remote_probe(out: &str) -> HashMap<u32, (Option<PathBuf>, Option<String>)> {
+    let mut map: HashMap<u32, (Option<PathBuf>, Option<String>)> = HashMap::new();
+    let mut cur: Option<u32> = None;
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix("PID:") {
+            cur = rest.trim().parse::<u32>().ok();
+            if let Some(pid) = cur {
+                map.entry(pid).or_insert((None, None));
+            }
+        } else if let Some(pid) = cur {
+            if let Some(cwd) = line.strip_prefix("CWD:") {
+                let cwd = cwd.trim();
+                if !cwd.is_empty() {
+                    if let Some(e) = map.get_mut(&pid) {
+                        e.0 = Some(PathBuf::from(cwd));
+                    }
+                }
+            } else if let Some(pane) = line.strip_prefix("PANE:") {
+                let pane = pane.trim();
+                if !pane.is_empty() {
+                    if let Some(e) = map.get_mut(&pid) {
+                        e.1 = Some(pane.to_string());
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Snapshot pi processes on a remote host over ssh. Linux remotes read
+/// `/proc/<pid>/cwd` and `/proc/<pid>/environ`; macOS remotes (no /proc)
+/// use lsof + `ps eww` — all in a single batch probe (no per-pid roundtrips).
+pub fn detect_remote(ssh_target: &str, host_name: &str) -> anyhow::Result<Vec<PiProc>> {
+    let ps_out = ssh_run(ssh_target, "ps -axo pid=,ppid=,etime=,command=")?;
+    let now = chrono::Utc::now().timestamp();
+    let table = parse_ps_table(&ps_out, now);
+    let pi_pids: Vec<u32> = table
+        .iter()
+        .filter(|(_, (_, cmd, _))| looks_like_pi(cmd))
+        .map(|(pid, _)| *pid)
+        .collect();
+    if pi_pids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tmux_out = ssh_run(
+        ssh_target,
+        "tmux list-panes -a -F '#{pane_pid}\t#{pane_id}\t#{session_name}\t#{window_index}\t#{@special_activity}' 2>/dev/null || true",
+    )
+    .unwrap_or_default();
+    let (panes, panes_by_id) = parse_tmux_panes(&tmux_out);
+    // Batch cwd + TMUX_PANE for just the pi pids (one ssh call).
+    let script = remote_probe_script(&pi_pids);
+    let probe_out = ssh_run(ssh_target, &script).unwrap_or_default();
+    let probe = parse_remote_probe(&probe_out);
+    let mut procs = Vec::new();
+    for pid in pi_pids {
+        let Some((ppid, cmd, started_at)) = table.get(&pid) else { continue };
+        let (cwd, pane) = probe.get(&pid).cloned().unwrap_or((None, None));
+        let tmux = resolve_tmux(pid, *ppid, &table, &panes, &panes_by_id, pane);
+        procs.push(PiProc {
+            host: host_name.to_string(),
+            pid,
+            ppid: *ppid,
+            cwd,
+            cmd: cmd.clone(),
+            session_arg: session_arg_from_cmd(cmd),
+            continue_flag: continue_flag_from_cmd(cmd),
+            started_at: *started_at,
+            tmux,
+        });
+    }
+    Ok(procs)
+}
+
+/// Remote peer names from `~/.claude/sessions/<pid>.json` (one ssh call).
+/// Missing files are skipped; empty map means "mint from cwd" downstream.
+pub fn fetch_remote_names(ssh_target: &str, pids: &[u32]) -> HashMap<u32, String> {
+    if pids.is_empty() {
+        return HashMap::new();
+    }
+    let mut script = String::new();
+    for pid in pids {
+        script.push_str(&format!(
+            "echo PID:{pid}; cat ~/.claude/sessions/{pid}.json 2>/dev/null; echo; ",
+            pid = pid
+        ));
+    }
+    let Ok(out) = ssh_run(ssh_target, &script) else { return HashMap::new() };
+    let mut names = HashMap::new();
+    let mut cur: Option<u32> = None;
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix("PID:") {
+            cur = rest.trim().parse::<u32>().ok();
+        } else if let Some(pid) = cur {
+            let line = line.trim();
+            if line.starts_with('{') {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(n) = v
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                    {
+                        names.insert(pid, n);
+                    }
+                }
+                cur = None;
+            }
+        }
+    }
+    names
+}
+
+/// Remote agent-link summaries (`~/.cache/agent-link/summaries/<pid>.json`).
+/// Absent on hosts without pi-agent-link — then empty.
+pub fn fetch_remote_summaries(ssh_target: &str, pids: &[u32]) -> HashMap<u32, CacheFields> {
+    if pids.is_empty() {
+        return HashMap::new();
+    }
+    let mut script = String::new();
+    for pid in pids {
+        script.push_str(&format!(
+            "echo PID:{pid}; cat ~/.cache/agent-link/summaries/{pid}.json 2>/dev/null || cat \"$XDG_CACHE_HOME/agent-link/summaries/{pid}.json\" 2>/dev/null; echo; ",
+            pid = pid
+        ));
+    }
+    let Ok(out) = ssh_run(ssh_target, &script) else { return HashMap::new() };
+    let mut map = HashMap::new();
+    let mut cur: Option<u32> = None;
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix("PID:") {
+            cur = rest.trim().parse::<u32>().ok();
+        } else if let Some(pid) = cur {
+            let line = line.trim();
+            if line.starts_with('{') {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    let get = |k: &str| {
+                        v.get(k)
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                    };
+                    map.insert(
+                        pid,
+                        CacheFields {
+                            name: get("name"),
+                            summary: get("summary"),
+                            status: get("status"),
+                        },
+                    );
+                }
+                cur = None;
+            }
+        }
+    }
+    map
 }
 
 /// Read TMUX_PANE from a process environment (macOS/Linux `ps eww`).
@@ -324,7 +553,7 @@ fn summary_cache_dir() -> Option<PathBuf> {
 
 /// (summary, status) for the detected pids, from the shared activity cache.
 #[derive(Debug, Clone, PartialEq)]
-struct CacheFields {
+pub struct CacheFields {
     name: Option<String>,
     summary: Option<String>,
     status: Option<String>,
@@ -387,41 +616,6 @@ fn first_free_name(base: &str, taken: &HashSet<String>) -> String {
     format!("{}-x", base)
 }
 
-fn fill_missing_peer_names(
-    hits: &mut HashMap<PathBuf, RunningHit>,
-    procs: &[PiProc],
-    sessions: &[SessionMeta],
-) {
-    let cwd_by_path: HashMap<&PathBuf, &str> =
-        sessions.iter().map(|s| (&s.path, s.cwd.as_str())).collect();
-    let start_by_pid: HashMap<u32, i64> = procs
-        .iter()
-        .filter_map(|p| p.started_at.map(|t| (p.pid, t)))
-        .collect();
-    let mut taken: HashSet<String> = hits
-        .values()
-        .filter_map(|h| h.peer_name.clone())
-        .collect();
-    let mut unnamed: Vec<PathBuf> = hits
-        .iter()
-        .filter(|(_, h)| h.peer_name.as_ref().map_or(true, |n| n.is_empty()))
-        .map(|(p, _)| p.clone())
-        .collect();
-    unnamed.sort_by_key(|path| {
-        hits.get(path)
-            .and_then(|h| start_by_pid.get(&h.pid).copied())
-            .unwrap_or(0)
-    });
-    for path in unnamed {
-        let cwd = cwd_by_path.get(&path).copied().unwrap_or("");
-        let name = first_free_name(&peer_slug(cwd), &taken);
-        taken.insert(name.clone());
-        if let Some(h) = hits.get_mut(&path) {
-            h.peer_name = Some(name);
-        }
-    }
-}
-
 fn summary_cache_lookup(pids: &[u32]) -> HashMap<u32, CacheFields> {
     let mut out: HashMap<u32, CacheFields> = HashMap::new();
     let dir = match summary_cache_dir() {
@@ -479,17 +673,40 @@ fn prune_summary_cache(live: &HashSet<u32>) {
     }
 }
 
-/// Map detected processes to concrete session files.
-pub fn map_running(
+/// Attach remote names/summaries (fetched via ssh) to already-matched hits.
+/// Local enrichment lives in [`map_running`]; this keeps ssh out of the
+/// pure matcher so tests stay offline.
+pub fn attach_remote_enrichment(
+    hits: &mut HashMap<SessionKey, RunningHit>,
+    names: &HashMap<u32, String>,
+    summaries: &HashMap<u32, CacheFields>,
+) {
+    for h in hits.values_mut() {
+        if let Some(c) = summaries.get(&h.pid) {
+            h.summary = c.summary.clone();
+            h.status = c.status.clone();
+            if c.name.is_some() {
+                h.peer_name = c.name.clone();
+            }
+        }
+        if h.peer_name.is_none() {
+            h.peer_name = names.get(&h.pid).cloned();
+        }
+    }
+}
+
+/// Pure per-host matcher: claim sessions for procs without any enrichment.
+/// Keys are host-qualified so identical paths on different hosts never collide.
+fn match_one_host(
     procs: &[PiProc],
     sessions: &[SessionMeta],
     active_secs: i64,
-) -> HashMap<PathBuf, RunningHit> {
-    let mut hits: HashMap<PathBuf, RunningHit> = HashMap::new();
-    if procs.is_empty() {
-        return hits;
+    hits: &mut HashMap<SessionKey, RunningHit>,
+) {
+    if procs.is_empty() || sessions.is_empty() {
+        return;
     }
-    let mut claimed: HashSet<PathBuf> = HashSet::new();
+    let mut claimed: HashSet<SessionKey> = HashSet::new();
 
     // sessions by cwd for the cwd+recency heuristic
     let mut by_cwd: HashMap<&str, Vec<&SessionMeta>> = HashMap::new();
@@ -508,17 +725,18 @@ pub fn map_running(
         by_id.insert(s.id.as_str(), s);
     }
 
-    let claim = |hits: &mut HashMap<PathBuf, RunningHit>,
-                 claimed: &mut HashSet<PathBuf>,
+    let claim = |hits: &mut HashMap<SessionKey, RunningHit>,
+                 claimed: &mut HashSet<SessionKey>,
                  s: &SessionMeta,
                  p: &PiProc,
                  direct: bool| {
-        if claimed.contains(&s.path) {
+        let key = s.key();
+        if claimed.contains(&key) {
             return false;
         }
-        claimed.insert(s.path.clone());
+        claimed.insert(key.clone());
         hits.insert(
-            s.path.clone(),
+            key,
             RunningHit {
                 pid: p.pid,
                 tmux: p.tmux.clone(),
@@ -541,7 +759,7 @@ pub fn map_running(
                 by_id.get(arg.as_str()).copied()
             };
             if let Some(s) = found {
-                claim(&mut hits, &mut claimed, s, p, true);
+                claim(&mut *hits, &mut claimed, s, p, true);
                 continue;
             }
         }
@@ -557,7 +775,7 @@ pub fn map_running(
             if let Some(candidates) = by_cwd.get(cwd_str.as_ref()) {
                 let mut best: Option<(&SessionMeta, i64)> = None;
                 for s in candidates {
-                    if claimed.contains(&s.path) {
+                    if claimed.contains(&s.key()) {
                         continue;
                     }
                     let Some(created) = s.created else { continue };
@@ -570,7 +788,7 @@ pub fn map_running(
                     }
                 }
                 if let Some((s, _)) = best {
-                    claim(&mut hits, &mut claimed, s, p, false);
+                    claim(&mut *hits, &mut claimed, s, p, false);
                     paired = true;
                 }
             }
@@ -586,44 +804,132 @@ pub fn map_running(
         if let Some(cwd) = &p.cwd {
             let cwd_str = cwd.to_string_lossy();
             if let Some(candidates) = by_cwd.get(cwd_str.as_ref()) {
-                if let Some(s) = candidates.iter().find(|s| !claimed.contains(&s.path)).copied() {
-                    claim(&mut hits, &mut claimed, s, p, p.continue_flag);
+                if let Some(s) = candidates.iter().find(|s| !claimed.contains(&s.key())).copied() {
+                    claim(&mut *hits, &mut claimed, s, p, p.continue_flag);
                 }
             }
         }
     }
 
-    // Attach live activity summaries / names. Prefer the cache (written by
-    // current pi-agent-link); fall back to Claude's registry entry, which
-    // older in-memory sessions still update with their unique peer name.
-    let pids: Vec<u32> = hits.values().map(|h| h.pid).collect();
-    let cache = summary_cache_lookup(&pids);
-    let registry = registry_peer_names(&pids);
-    for h in hits.values_mut() {
-        if let Some(c) = cache.get(&h.pid) {
-            h.summary = c.summary.clone();
-            h.status = c.status.clone();
-            h.peer_name = c.name.clone();
-        }
-        if h.peer_name.is_none() {
-            h.peer_name = registry.get(&h.pid).cloned();
+}
+
+/// Map detected processes to concrete session files, partitioned by host so
+/// identical cwds/paths on different machines never cross-match.
+/// Local hits get summary-cache + registry enrichment and prune the cache;
+/// remote hits get unique minted names here and ssh enrichment via
+/// [`attach_remote_enrichment`] by the caller.
+pub fn map_running(
+    procs: &[PiProc],
+    sessions: &[SessionMeta],
+    active_secs: i64,
+) -> HashMap<SessionKey, RunningHit> {
+    let mut hits: HashMap<SessionKey, RunningHit> = HashMap::new();
+    if procs.is_empty() || sessions.is_empty() {
+        return hits;
+    }
+    // Partition both sides by host.
+    let mut hosts: HashSet<&str> = HashSet::new();
+    for p in procs {
+        hosts.insert(p.host.as_str());
+    }
+    for s in sessions {
+        hosts.insert(s.host.as_str());
+    }
+    // Owned views per host for the pure matcher (proc/session counts are
+    // small; cloning keeps lifetimes simple).
+    for host in hosts {
+        let ps: Vec<PiProc> = procs.iter().filter(|p| p.host.as_str() == host).cloned().collect();
+        let ss: Vec<SessionMeta> = sessions.iter().filter(|s| s.host.as_str() == host).cloned().collect();
+        match_one_host(&ps, &ss, active_secs, &mut hits);
+    }
+    // Enrich local hits from the on-disk caches.
+    let local_pids: Vec<u32> = hits
+        .iter()
+        .filter(|(k, _)| k.host == LOCAL_HOST)
+        .map(|(_, h)| h.pid)
+        .collect();
+    if !local_pids.is_empty() {
+        let cache = summary_cache_lookup(&local_pids);
+        let registry = registry_peer_names(&local_pids);
+        for (k, h) in hits.iter_mut().filter(|(k, _)| k.host == LOCAL_HOST) {
+            let _ = k;
+            if let Some(c) = cache.get(&h.pid) {
+                h.summary = c.summary.clone();
+                h.status = c.status.clone();
+                h.peer_name = c.name.clone();
+            }
+            if h.peer_name.is_none() {
+                h.peer_name = registry.get(&h.pid).cloned();
+            }
         }
     }
-    // Last resort: mint unique pi-<cwd> names in start-time order so two live
-    // agents in one repo don't both show up as "pi-dotfiles".
-    fill_missing_peer_names(&mut hits, procs, sessions);
-    // Reap cache files for sessions that are gone.
-    prune_summary_cache(&procs.iter().map(|p| p.pid).collect());
+    // Mint fallback names (global `taken` so coop can't claim `pi-dotfiles`
+    // when local owns it; pid-start ordering may interleave across hosts but
+    // stays unique, which is all the suffix numbering needs).
+    {
+        let start_by_pid: HashMap<(String, u32), i64> = procs
+            .iter()
+            .filter_map(|p| p.started_at.map(|t| ((p.host.clone(), p.pid), t)))
+            .collect();
+        let cwd_by_key: HashMap<SessionKey, &str> =
+            sessions.iter().map(|s| (s.key(), s.cwd.as_str())).collect();
+        let mut taken: HashSet<String> =
+            hits.values().filter_map(|h| h.peer_name.clone()).collect();
+        let mut unnamed: Vec<SessionKey> = hits
+            .iter()
+            .filter(|(_, h)| h.peer_name.as_ref().map_or(true, |n| n.is_empty()))
+            .map(|(k, _)| k.clone())
+            .collect();
+        unnamed.sort_by_key(|k| {
+            hits.get(k)
+                .and_then(|h| start_by_pid.get(&(k.host.clone(), h.pid)).copied())
+                .unwrap_or(0)
+        });
+        for key in unnamed {
+            let cwd = cwd_by_key.get(&key).copied().unwrap_or("");
+            // Prefix remote mints with the host so `pi-dotfiles` (local) and
+            // `pi-coop-dotfiles` never collide even before the UI badge.
+            let base = if key.host == LOCAL_HOST {
+                peer_slug(cwd)
+            } else {
+                format!("pi-{}-{}", key.host, peer_slug(cwd).trim_start_matches("pi-"))
+            };
+            let name = first_free_name(&base, &taken);
+            taken.insert(name.clone());
+            if let Some(h) = hits.get_mut(&key) {
+                h.peer_name = Some(name);
+            }
+        }
+    }
+    // Reap local cache files for sessions that are gone (local only; remote
+    // pruning happens on the remote via its own sync).
+    let live_local: HashSet<u32> = procs
+        .iter()
+        .filter(|p| p.host == LOCAL_HOST)
+        .map(|p| p.pid)
+        .collect();
+    prune_summary_cache(&live_local);
     hits
 }
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // HOME is process-global; serialize the tests that repoint it.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn summary_cache_lookup_and_prune() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Point HOME at a throwaway dir so the test never touches real caches.
-        let tmp = std::env::temp_dir().join(format!("psst-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!(
+            "psst-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
         let dir = tmp.join(".cache").join("agent-link").join("summaries");
         std::fs::create_dir_all(&dir).unwrap();
         let prev_home = std::env::var("HOME").ok();
@@ -740,5 +1046,136 @@ mod tests {
         assert!(!looks_like_pi("vim src/main.rs"));
         assert!(!looks_like_pi("rg -r pi something"));
         assert!(!looks_like_pi("grep pi-coding-agent README.md"));
+    }
+
+    #[test]
+    fn ps_table_parses() {
+        let out = "  123   100 00:05 hello pi --session /tmp/x.jsonl\n  bad line\n  124   100 01:02:03 vim foo\n";
+        let now = 1_000_000;
+        let t = parse_ps_table(out, now);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[&123].1, "hello pi --session /tmp/x.jsonl");
+        assert_eq!(t[&123].2, Some(now - 5));
+        assert_eq!(t[&124].2, Some(now - 3723));
+    }
+
+    #[test]
+    fn tmux_panes_parse() {
+        let out = "100\t%1\tcode\t2\ton\nbad\n101\t%2\tsess\t0\n";
+        let (by_pid, by_id) = parse_tmux_panes(out);
+        assert_eq!(by_pid[&100].session, "code");
+        assert!(by_pid[&100].attention);
+        assert_eq!(by_id["%2"].window, Some(0));
+        assert!(!by_id["%2"].attention);
+    }
+
+    #[test]
+    fn remote_probe_parses() {
+        let out = "PID:1\nCWD:/home/agent\nPANE:%3\nPID:2\nCWD:\nPID:bad\nCWD:/x\n";
+        let m = parse_remote_probe(out);
+        assert_eq!(m[&1].0, Some(PathBuf::from("/home/agent")));
+        assert_eq!(m[&1].1, Some("%3".to_string()));
+        assert_eq!(m[&2].0, None);
+        assert!(!m.contains_key(&0));
+    }
+
+    #[test]
+    fn probe_script_covers_both_oses() {
+        let s = remote_probe_script(&[11, 22]);
+        assert!(s.contains("for pid in 11  22"), "got {}", s);
+        assert!(s.contains("uname -s"));
+        assert!(s.contains("/proc/$pid/cwd"));
+        assert!(s.contains("lsof -a -p $pid"));
+        assert!(s.contains("echo PID:$pid"));
+    }
+
+    #[test]
+    fn cmd_flags_parse() {
+        assert_eq!(
+            session_arg_from_cmd("pi --session /tmp/x.jsonl"),
+            Some("/tmp/x.jsonl".to_string())
+        );
+        assert_eq!(session_arg_from_cmd("pi -c"), None);
+        assert!(continue_flag_from_cmd("pi -c"));
+        assert!(continue_flag_from_cmd("pi --continue"));
+        assert!(!continue_flag_from_cmd("pi --session x"));
+    }
+
+    fn proc_for(host: &str, pid: u32, cwd: &str) -> PiProc {
+        PiProc {
+            host: host.to_string(),
+            pid,
+            ppid: 1,
+            cwd: Some(PathBuf::from(cwd)),
+            cmd: "pi".to_string(),
+            session_arg: None,
+            continue_flag: false,
+            started_at: None,
+            tmux: None,
+        }
+    }
+
+    fn sess_for(host: &str, id: &str, cwd: &str) -> SessionMeta {
+        SessionMeta {
+            path: PathBuf::from(format!("/tmp/{}-{}.jsonl", host, id)),
+            host: host.to_string(),
+            id: id.to_string(),
+            cwd: cwd.to_string(),
+            created: None,
+            last_activity: Some(100),
+            last_user: Some(100),
+            name: None,
+            first_prompt: None,
+            last_prompt: None,
+            model: None,
+            cost_total: 0.0,
+            tokens_in: 0,
+            tokens_out: 0,
+            messages: 1,
+            branches: 0,
+            parent_session: None,
+            mtime: 100,
+            size: 10,
+        }
+    }
+
+    #[test]
+    fn map_partitions_by_host() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Same cwd on two hosts must not cross-match: each proc claims its
+        // own host's session even with identical cwd strings.
+        let procs = vec![
+            proc_for("local", 11, "/proj/a"),
+            proc_for("coop", 11, "/proj/a"),
+        ];
+        let sessions = vec![
+            sess_for("local", "a", "/proj/a"),
+            sess_for("coop", "b", "/proj/a"),
+        ];
+        // Point HOME away so prune never touches the real cache.
+        let tmp = std::env::temp_dir().join(format!(
+            "psst-part-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &tmp);
+        let hits = map_running(&procs, &sessions, 120);
+        if let Some(h) = prev {
+            std::env::set_var("HOME", h);
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(hits.len(), 2);
+        let local_key = sessions[0].key();
+        let coop_key = sessions[1].key();
+        assert_eq!(hits[&local_key].pid, 11);
+        assert_eq!(hits[&coop_key].pid, 11);
+        // Remote mints carry the host prefix so they can't collide with local.
+        let coop_name = hits[&coop_key].peer_name.clone().unwrap();
+        assert!(coop_name.starts_with("pi-coop-"), "got {}", coop_name);
     }
 }

@@ -1,8 +1,12 @@
 //! ratatui TUI: list -> filter -> inspect -> open (resume in tmux).
 
 use crate::config::Config;
-use crate::running::{detect, live_mark, map_running, LiveMark, RunningHit};
-use crate::scan::{in_scope, recent_messages, scan, sessions_root, SessionMeta};
+use crate::hosts::{self, local_path_for};
+use crate::running::{
+    attach_remote_enrichment, detect, detect_remote, fetch_remote_names,
+    fetch_remote_summaries, live_mark, map_running, LiveMark, RunningHit,
+};
+use crate::scan::{in_scope, recent_messages_from_str, scan, sessions_root, SessionKey, SessionMeta, LOCAL_HOST};
 use anyhow::Result;
 use chrono::Timelike;
 use serde::{Deserialize, Serialize};
@@ -50,6 +54,7 @@ pub enum Group {
     Flat,
     Project,
     Day,
+    Host,
 }
 
 impl Group {
@@ -58,13 +63,15 @@ impl Group {
             Group::Flat => "flat",
             Group::Project => "project",
             Group::Day => "day",
+            Group::Host => "host",
         }
     }
     fn next(self) -> Group {
         match self {
             Group::Flat => Group::Project,
             Group::Project => Group::Day,
-            Group::Day => Group::Flat,
+            Group::Day => Group::Host,
+            Group::Host => Group::Flat,
         }
     }
     fn from_label(s: &str) -> Option<Group> {
@@ -72,6 +79,7 @@ impl Group {
             "flat" => Some(Group::Flat),
             "project" => Some(Group::Project),
             "day" => Some(Group::Day),
+            "host" => Some(Group::Host),
             _ => None,
         }
     }
@@ -111,10 +119,26 @@ impl ViewFilter {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OpenAction {
-    /// Switch/attach to an existing tmux session (`session[:window]`).
+    /// Switch/attach to an existing local tmux session (`session[:window]`).
     TmuxAttach { target: String, inside: bool },
-    /// Create a tmux window/session running the resume command.
+    /// Create a local tmux window/session running the resume command.
     TmuxNew {
+        cwd: String,
+        name: String,
+        command: String,
+        inside: bool,
+    },
+    /// Attach to a remote tmux target via `ssh -t <ssh_target> ...`.
+    /// `target` is `session[:window]` on the remote.
+    SshAttach {
+        ssh_target: String,
+        target: String,
+        inside: bool,
+    },
+    /// Resume a remote session via `ssh -t <ssh_target> 'cd <cwd> && <command>'`.
+    /// `command` is the remote resume command; `cwd` is the remote cwd.
+    SshNew {
+        ssh_target: String,
         cwd: String,
         name: String,
         command: String,
@@ -124,7 +148,10 @@ pub enum OpenAction {
 
 pub struct App {
     pub sessions: Vec<SessionMeta>,
-    pub running: HashMap<PathBuf, RunningHit>,
+    pub running: HashMap<SessionKey, RunningHit>,
+    /// Mirror/sync errors per host (e.g. `coop: ssh failed`); shown in the
+    /// header until the next successful refresh.
+    pub host_errors: Vec<String>,
     /// Indices into `sessions` after filter+sort; `sel` indexes this.
     pub order: Vec<usize>,
     pub sel: usize,
@@ -144,7 +171,8 @@ pub struct App {
     /// `psst .` — only sessions whose cwd is this project.
     pub cwd_scope: Option<PathBuf>,
     /// Restored once after the first refresh from ui-state.json.
-    pending_sel: Option<PathBuf>,
+    /// Host-qualified (`host:path`); legacy path-only values read as local.
+    pending_sel: Option<SessionKey>,
     /// Collapsed group keys (project cwd, or day label). h/l toggles.
     pub collapsed: HashSet<String>,
     /// Parked-on header key: j/k stop on headers, Enter toggles the fold.
@@ -152,9 +180,9 @@ pub struct App {
     header_park: Option<String>,
     /// ? help overlay.
     pub show_help: bool,
-    /// Detail pane messages: (path, mtime, turns). Recomputed when the
-    /// selection moves or the file grows.
-    recent_cache: Option<(PathBuf, i64, Vec<(String, String)>)>,
+    /// Detail pane messages: (host-qualified key, mtime, turns). Recomputed
+    /// when the selection moves or the file grows.
+    recent_cache: Option<(SessionKey, i64, Vec<(String, String)>)>,
 }
 
 /// One rendered row: a session (index into `sessions`) or a group header.
@@ -221,9 +249,29 @@ fn project_base(cwd: &str) -> String {
     c.rsplit('/').next().unwrap_or(c).to_string()
 }
 
-/// Status-friendly group name: project basename, day label as-is.
+/// Status-friendly group name: project basename (`coop:dotfiles` for remote
+/// projects), host/day labels as-is.
 fn short_group(key: &str) -> String {
-    project_base(key)
+    match key.split_once(':') {
+        Some((host, cwd)) if cwd.starts_with('/') => {
+            format!("{}:{}", host, project_base(cwd))
+        }
+        _ => project_base(key),
+    }
+}
+
+/// Parse a persisted selection (`host:path`); legacy bare paths read as local.
+fn parse_selected(s: &str) -> SessionKey {
+    match s.split_once(':') {
+        Some((host, path)) if !host.contains('/') && path.starts_with('/') => SessionKey {
+            host: host.to_string(),
+            path: PathBuf::from(path),
+        },
+        _ => SessionKey {
+            host: LOCAL_HOST.to_string(),
+            path: PathBuf::from(s),
+        },
+    }
 }
 
 impl App {
@@ -234,9 +282,11 @@ impl App {
             order: Vec::new(),
             sel: 0,
             filter: String::new(),
+            host_errors: Vec::new(),
             group: match config.group_default() {
                 "project" => Group::Project,
                 "flat" => Group::Flat,
+                "host" => Group::Host,
                 _ => Group::Day,
             },
             sort: Sort::Activity,
@@ -258,63 +308,137 @@ impl App {
         app
     }
 
-    /// Rescan sessions (cache-aware) and re-detect running processes.
-    pub fn refresh(&mut self, force: bool) {
-        let root = sessions_root();
-        let sel_path = self
-            .order
-            .get(self.sel)
-            .map(|&i| self.sessions[i].path.clone());
-        if let Ok(s) = scan(&root, force) {
-            self.sessions = s;
+    /// Lookup helper so call sites never forget the host qualifier.
+    fn hit_for(&self, s: &SessionMeta) -> Option<&RunningHit> {
+        self.running.get(&s.key())
+    }
+
+    fn ssh_target_for(&self, host: &str) -> Option<String> {
+        if host == LOCAL_HOST {
+            return None;
         }
-        let procs = detect();
-        self.running = map_running(&procs, &self.sessions, self.config.active_secs());
+        self.config
+            .hosts()
+            .iter()
+            .find(|h| h.name == host)
+            .map(|h| h.ssh_target.clone())
+    }
+
+    /// Rescan everything: local sessions, host mirrors, and local + remote
+    /// running processes. Selection is pinned by host-qualified key so it
+    /// survives the list changing underneath it.
+    pub fn refresh(&mut self, force: bool) {
+        let sel_key = self.order.get(self.sel).map(|&i| self.sessions[i].key());
+        let mut sessions = scan(&sessions_root(), force).unwrap_or_default();
+        let mut errors = Vec::new();
+        for h in self.config.hosts() {
+            let sync = hosts::sync_host(h, force);
+            sessions.extend(sync.sessions);
+            if let Some(e) = sync.error {
+                errors.push(e);
+            }
+        }
+        let mut procs = detect();
+        for h in self.config.hosts() {
+            match detect_remote(&h.ssh_target, &h.name) {
+                Ok(rp) => procs.extend(rp),
+                Err(e) => errors.push(format!("{}: {}", h.name, e)),
+            }
+        }
+        let mut hits = map_running(&procs, &sessions, self.config.active_secs());
+        for h in self.config.hosts() {
+            let pids: Vec<u32> = hits
+                .iter()
+                .filter(|(k, _)| k.host == h.name)
+                .map(|(_, hit)| hit.pid)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            if pids.is_empty() {
+                continue;
+            }
+            let names = fetch_remote_names(&h.ssh_target, &pids);
+            let summaries = fetch_remote_summaries(&h.ssh_target, &pids);
+            let mut sub: HashMap<SessionKey, RunningHit> = hits
+                .iter()
+                .filter(|(k, _)| k.host == h.name)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            attach_remote_enrichment(&mut sub, &names, &summaries);
+            for (k, v) in sub {
+                hits.insert(k, v);
+            }
+        }
+        self.sessions = sessions;
+        self.running = hits;
+        self.host_errors = errors;
         self.apply_filter_sort();
-        let restore = sel_path.or_else(|| self.pending_sel.take());
-        if let Some(p) = restore {
-            if let Some(pos) = self.order.iter().position(|&i| self.sessions[i].path == p) {
+        let restore = sel_key.or_else(|| self.pending_sel.take());
+        if let Some(k) = restore {
+            if let Some(pos) = self.order.iter().position(|&i| self.sessions[i].key() == k) {
                 self.sel = pos;
             }
         }
         self.clamp_sel();
     }
+}
 
-    /// Turns for the detail pane, cached by path+mtime so live sessions update.
+impl App {
+    /// Turns for the detail pane, cached by host-qualified key+mtime so live
+    /// sessions update. Remote sessions read from their ssh mirror.
     fn recent_for_selected(&mut self) -> Vec<(String, String)> {
-        let (path, mtime) = match self.selected() {
+        let (key, local_path, mtime) = match self.selected() {
             Some(s) => {
-                let mt = std::fs::metadata(&s.path)
+                let lp = local_path_for(s);
+                let mt = std::fs::metadata(&lp)
                     .ok()
                     .and_then(|m| m.modified().ok())
                     .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                (s.path.clone(), mt)
+                (s.key(), lp, mt)
             }
             None => return Vec::new(),
         };
-        if let Some((p, m, msgs)) = &self.recent_cache {
-            if p == &path && *m == mtime {
+        if let Some((k, m, msgs)) = &self.recent_cache {
+            if k == &key && *m == mtime {
                 return msgs.clone();
             }
         }
-        let msgs = recent_messages(&path, 6);
-        self.recent_cache = Some((path, mtime, msgs.clone()));
+        let Ok(raw) = std::fs::read_to_string(&local_path) else {
+            return Vec::new();
+        };
+        let msgs = recent_messages_from_str(&raw, 6);
+        self.recent_cache = Some((key, mtime, msgs.clone()));
         msgs
     }
 
-    /// Cheap tick: re-detect running processes without reparsing session files.
+    /// Cheap 1s tick: re-detect *local* running processes without reparsing
+    /// session files or touching ssh. Remote running state refreshes on the
+    /// 10s `refresh` (and `r`/`R`) so a slow host can't stall the list.
     pub fn refresh_running(&mut self) {
-        let sel_path = self
-            .order
-            .get(self.sel)
-            .map(|&i| self.sessions[i].path.clone());
-        let procs = detect();
-        self.running = map_running(&procs, &self.sessions, self.config.active_secs());
+        let sel_key = self.order.get(self.sel).map(|&i| self.sessions[i].key());
+        // Preserve remote hits across local ticks: re-map local procs against
+        // local sessions, then merge over the previous remote entries.
+        let local_procs = detect();
+        let local_sessions: Vec<SessionMeta> = self
+            .sessions
+            .iter()
+            .filter(|s| s.is_local())
+            .cloned()
+            .collect();
+        let local_hits = map_running(&local_procs, &local_sessions, self.config.active_secs());
+        self.running.retain(|k, _| k.host != LOCAL_HOST);
+        for (k, v) in local_hits {
+            self.running.insert(k, v);
+        }
         self.apply_filter_sort();
-        if let Some(p) = sel_path {
-            if let Some(pos) = self.order.iter().position(|&i| self.sessions[i].path == p) {
+        if let Some(k) = sel_key {
+            if let Some(pos) = self
+                .order
+                .iter()
+                .position(|&i| self.sessions[i].key() == k)
+            {
                 self.sel = pos;
             }
         }
@@ -337,16 +461,14 @@ impl App {
         }
         self.show_prompts = st.show_prompts;
         self.detail = st.detail;
-        self.pending_sel = st.selected.map(PathBuf::from);
+        self.pending_sel = st.selected.as_deref().map(parse_selected);
         self.collapsed = st.collapsed.into_iter().collect();
     }
 
     pub fn save_ui_state(&self) {
         let selected = self.order.get(self.sel).map(|&i| {
-            self.sessions[i]
-                .path
-                .to_string_lossy()
-                .into_owned()
+            let s = &self.sessions[i];
+            format!("{}:{}", s.host, s.path.to_string_lossy())
         });
         let st = UiState {
             view_filter: self.view_filter.label().to_string(),
@@ -371,7 +493,7 @@ impl App {
         let mut idx: Vec<usize> = (0..self.sessions.len())
             .filter(|&i| {
                 let s = &self.sessions[i];
-                let hit = self.running.get(&s.path);
+                let hit = self.hit_for(s);
                 if let Some(scope) = &self.cwd_scope {
                     if !in_scope(&s.cwd, scope) {
                         return false;
@@ -398,8 +520,9 @@ impl App {
                 let peer = hit.and_then(|h| h.peer_name.as_deref()).unwrap_or("");
                 let mark = live_mark(hit);
                 let hay = format!(
-                    "{} {} {} {} {} {} {} {}",
+                    "{} {} {} {} {} {} {} {} {}",
                     display_title(s, hit),
+                    s.host,
                     s.first_prompt.as_deref().unwrap_or(""),
                     s.last_prompt.as_deref().unwrap_or(""),
                     s.cwd,
@@ -423,7 +546,7 @@ impl App {
                 idx.sort_by(|&a, &b| {
                     let key =
                         |i: usize| -> (u8, String, u32, std::cmp::Reverse<i64>) {
-                            match self.running.get(&self.sessions[i].path) {
+                            match self.running.get(&self.sessions[i].key()) {
                                 Some(h) => (
                                     0u8,
                                     h.tmux
@@ -505,10 +628,20 @@ impl App {
     }
 
     /// Bucket key of session `i` under the current grouping (empty when flat).
+    /// Project keys are host-qualified for remotes (`coop:/home/...`) so two
+    /// hosts never share a fold; local keys stay bare cwds.
     fn group_label(&self, i: usize) -> String {
         match self.group {
             Group::Flat => String::new(),
-            Group::Project => self.sessions[i].cwd.clone(),
+            Group::Host => self.sessions[i].host.clone(),
+            Group::Project => {
+                let s = &self.sessions[i];
+                if s.is_local() {
+                    s.cwd.clone()
+                } else {
+                    format!("{}:{}", s.host, s.cwd)
+                }
+            }
             Group::Day => {
                 let today = chrono::Local::now().date_naive();
                 let ts = self.sessions[i].last_user_or_activity();
@@ -577,14 +710,32 @@ impl App {
         }
         match self.group {
             Group::Flat => vec![(String::new(), (0..self.order.len()).collect())],
-            Group::Project => {
-                // bucket by cwd; groups ordered by most recent activity.
+            Group::Host => {
+                // bucket by host; local first, then by most recent activity.
                 let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
                 for (pos, &i) in self.order.iter().enumerate() {
-                    buckets
-                        .entry(self.sessions[i].cwd.clone())
-                        .or_default()
-                        .push(pos);
+                    buckets.entry(self.sessions[i].host.clone()).or_default().push(pos);
+                }
+                let mut groups: Vec<(String, Vec<usize>)> = buckets.into_iter().collect();
+                groups.sort_by_key(|(host, v)| {
+                    let newest = v
+                        .iter()
+                        .map(|&pos| self.sessions[self.order[pos]].last_user_or_activity())
+                        .max()
+                        .unwrap_or(0);
+                    (
+                        if host == LOCAL_HOST { 0u8 } else { 1u8 },
+                        std::cmp::Reverse(newest),
+                        host.clone(),
+                    )
+                });
+                groups
+            }
+            Group::Project => {
+                // bucket by (host-qualified) cwd; groups ordered by most recent activity.
+                let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
+                for (pos, &i) in self.order.iter().enumerate() {
+                    buckets.entry(self.group_label(i)).or_default().push(pos);
                 }
                 let mut groups: Vec<(String, Vec<usize>)> = buckets.into_iter().collect();
                 groups.sort_by_key(|(_, v)| {
@@ -680,13 +831,22 @@ impl App {
     pub fn open_selected(&self) -> Option<OpenAction> {
         let s = self.selected()?;
         let inside = std::env::var("TMUX").is_ok();
-        if let Some(hit) = self.running.get(&s.path) {
+        // Remote sessions open over ssh; local ones use tmux directly.
+        let ssh_target = self.ssh_target_for(&s.host);
+        if let Some(hit) = self.hit_for(s) {
             if let Some(t) = &hit.tmux {
                 let target = match t.window {
                     Some(w) => format!("{}:{}", t.session, w),
                     None => t.session.clone(),
                 };
-                return Some(OpenAction::TmuxAttach { target, inside });
+                return match ssh_target {
+                    Some(ssh) => Some(OpenAction::SshAttach {
+                        ssh_target: ssh,
+                        target,
+                        inside,
+                    }),
+                    None => Some(OpenAction::TmuxAttach { target, inside }),
+                };
             }
             // running without a tmux target: fall through to a fresh resume window
         }
@@ -696,17 +856,26 @@ impl App {
             .replace("{file}", &s.path.to_string_lossy())
             .replace("{id}", &s.id)
             .replace("{cwd}", &s.cwd);
-        Some(OpenAction::TmuxNew {
-            cwd: s.cwd.clone(),
-            name: project_base(&s.cwd),
-            command,
-            inside,
-        })
+        match ssh_target {
+            Some(ssh) => Some(OpenAction::SshNew {
+                ssh_target: ssh,
+                cwd: s.cwd.clone(),
+                name: project_base(&s.cwd),
+                command,
+                inside,
+            }),
+            None => Some(OpenAction::TmuxNew {
+                cwd: s.cwd.clone(),
+                name: project_base(&s.cwd),
+                command,
+                inside,
+            }),
+        }
     }
 
     fn row_line(&self, i: usize, w: usize) -> Line<'static> {
         let s = &self.sessions[i];
-        let hit = self.running.get(&s.path);
+        let hit = self.hit_for(s);
         let mark = live_mark(hit);
         let dot = match mark {
             LiveMark::Working => Span::styled("● ", Style::default().fg(Color::Yellow)),
@@ -737,6 +906,14 @@ impl App {
             Span::raw(pad(&label, title_w))
         };
         let proj = Span::raw(pad(&project_base(&s.cwd), (w / 6).max(10)));
+        let host_badge = if s.is_local() {
+            Span::raw("")
+        } else {
+            Span::styled(
+                format!(" [{}]", s.host),
+                Style::default().fg(Color::Magenta),
+            )
+        };
         // Don't paint age DarkGray: highlight_style keeps span fg, so DarkGray-on-DarkGray
         // made last-activity invisible on the selected row.
         let ts = s.last_user_or_activity();
@@ -757,7 +934,7 @@ impl App {
             None => Span::raw(""),
         };
         Line::from(vec![
-            dot, fork, title, Span::raw(" "), proj, Span::raw(" "), age, tmux,
+            dot, fork, title, Span::raw(" "), proj, Span::raw(" "), age, tmux, host_badge,
         ])
     }
 
@@ -795,7 +972,7 @@ impl App {
                     });
                 }
             }
-            Group::Project | Group::Day => {
+            Group::Project | Group::Day | Group::Host => {
                 for (label, positions) in self.groups_in_order() {
                     let members: Vec<usize> =
                         positions.iter().map(|&pos| self.order[pos]).collect();
@@ -874,8 +1051,23 @@ fn detail_lines(
             Span::styled(display_title(s, hit), bold),
         ]),
         Line::from(vec![
+            Span::styled("host:    ", dim),
+            Span::styled(
+                s.host.clone(),
+                if s.is_local() {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::Magenta)
+                },
+            ),
+        ]),
+        Line::from(vec![
             Span::styled("project: ", dim),
             Span::raw(s.cwd.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("path:    ", dim),
+            Span::raw(s.path.to_string_lossy().into_owned()),
         ]),
     ];
     if let Some(p) = &s.parent_session {
@@ -968,7 +1160,7 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
     let mut idle = 0usize;
     let mut has_prompt = false;
     for &i in &app.order {
-        match live_mark(app.running.get(&app.sessions[i].path)) {
+        match live_mark(app.running.get(&app.sessions[i].key())) {
             LiveMark::Working => working += 1,
             LiveMark::Prompt => {
                 attention += 1;
@@ -1034,6 +1226,32 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
             .unwrap_or_else(|| p.display().to_string());
         header_spans.push(Span::styled(" · ", dim));
         header_spans.push(Span::styled(name, Style::default().fg(Color::Cyan)));
+    }
+    // Per-host session counts when remotes are configured (e.g. `coop:10`).
+    if !app.config.hosts().is_empty() {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for &i in &app.order {
+            *counts.entry(app.sessions[i].host.as_str()).or_default() += 1;
+        }
+        let mut names: Vec<&str> = counts.keys().copied().collect();
+        names.sort();
+        for name in names {
+            if name == LOCAL_HOST {
+                continue;
+            }
+            header_spans.push(Span::styled(" · ", dim));
+            header_spans.push(Span::styled(
+                format!("{}:{}", name, counts[name]),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+    }
+    if !app.host_errors.is_empty() {
+        header_spans.push(Span::styled(" · ", dim));
+        header_spans.push(Span::styled(
+            app.host_errors.join("; "),
+            Style::default().fg(Color::Red),
+        ));
     }
     f.render_widget(Paragraph::new(Line::from(header_spans)), header);
 
@@ -1102,7 +1320,7 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
         f.render_stateful_widget(list, list_area, list_state);
         let recent = app.recent_for_selected();
         if let Some(s) = app.selected() {
-            let hit = app.running.get(&s.path);
+            let hit = app.running.get(&s.key());
             let detail = Paragraph::new(detail_lines(s, hit, &recent))
                 .wrap(Wrap { trim: false })
                 .block(
@@ -1347,7 +1565,6 @@ pub fn run(app: &mut App) -> Result<Option<OpenAction>> {
     let mut last_full = std::time::Instant::now();
     let mut last_running = std::time::Instant::now();
     let mut result: Option<OpenAction> = None;
-
     loop {
         if last_full.elapsed() > std::time::Duration::from_secs(10) {
             app.refresh(false);
@@ -1498,7 +1715,7 @@ fn help_lines() -> Vec<Line<'static>> {
     vec![
         row("/", "search (type anything, Esc unfocuses)"),
         row("f", "filter: all → named → active"),
-        row("g / Tab", "group: flat → project → day"),
+        row("g / Tab", "group: flat → project → day → host"),
         row("s", "sort: activity → tmux"),
         row("j / k", "move"),
         row("J / K", "next / previous group"),
@@ -1554,6 +1771,7 @@ mod tests {
     fn fake_session(name: &str, cwd: &str, ts: i64) -> SessionMeta {
         SessionMeta {
             path: PathBuf::from(format!("/tmp/{}.jsonl", name)),
+            host: LOCAL_HOST.to_string(),
             id: name.to_string(),
             cwd: cwd.to_string(),
             created: Some(ts),
@@ -1574,6 +1792,13 @@ mod tests {
         }
     }
 
+    fn fake_remote(name: &str, cwd: &str, ts: i64) -> SessionMeta {
+        let mut s = fake_session(name, cwd, ts);
+        s.host = "coop".to_string();
+        s.path = PathBuf::from(format!("/home/agent/{}.jsonl", name));
+        s
+    }
+
     fn fold_app() -> App {
         App {
             sessions: vec![
@@ -1583,6 +1808,7 @@ mod tests {
                 fake_session("c1", "/proj/c", 1200),
             ],
             running: HashMap::new(),
+            host_errors: Vec::new(),
             order: Vec::new(),
             sel: 0,
             filter: String::new(),
@@ -1830,6 +2056,8 @@ mod tests {
         assert_eq!(app.header_park, None);
         assert_eq!(app.status, "group:day");
         assert_eq!(press(&mut app, key(KeyCode::Tab)), KeyOutcome::Continue);
+        assert_eq!(app.group, Group::Host);
+        assert_eq!(press(&mut app, key(KeyCode::Tab)), KeyOutcome::Continue);
         assert_eq!(app.group, Group::Flat);
         assert_eq!(press(&mut app, key(KeyCode::Char('s'))), KeyOutcome::Continue);
         assert_eq!(app.status, "sort:tmux");
@@ -1978,5 +2206,94 @@ mod tests {
         let back: UiState = serde_json::from_str(&raw).unwrap();
         assert_eq!(back.collapsed, vec!["/proj/a".to_string()]);
         assert_eq!(back.view_filter, "named");
+    }
+
+    #[test]
+    fn selected_keys_round_trip_with_host() {
+        let k = parse_selected("coop:/home/agent/x.jsonl");
+        assert_eq!(k.host, "coop");
+        assert_eq!(k.path, PathBuf::from("/home/agent/x.jsonl"));
+        // legacy bare paths read as local
+        let k = parse_selected("/tmp/x.jsonl");
+        assert_eq!(k.host, LOCAL_HOST);
+    }
+
+    #[test]
+    fn short_group_qualifies_remote_projects() {
+        assert_eq!(short_group("/proj/a"), "a");
+        assert_eq!(short_group("coop:/home/agent/dotfiles"), "coop:dotfiles");
+        assert_eq!(short_group("Today"), "Today");
+    }
+
+    #[test]
+    fn host_grouping_buckets_by_host() {
+        let mut app = fold_app();
+        app.sessions.push(fake_remote("r1", "/home/agent", 5000));
+        app.group = Group::Host;
+        app.apply_filter_sort();
+        let groups = app.groups_in_order();
+        assert_eq!(groups.len(), 2);
+        // local first even though the remote is newest
+        assert_eq!(groups[0].0, LOCAL_HOST);
+        assert_eq!(groups[1].0, "coop");
+        assert_eq!(groups[1].1.len(), 1);
+    }
+
+    #[test]
+    fn project_grouping_qualifies_remote_cwds() {
+        let mut app = fold_app();
+        // Same cwd string on both hosts must form two groups, not one.
+        let mut dup = fake_remote("r1", "/proj/a", 5000);
+        dup.cwd = "/proj/a".to_string();
+        app.sessions.push(dup);
+        app.group = Group::Project;
+        app.apply_filter_sort();
+        let groups = app.groups_in_order();
+        let keys: Vec<&str> = groups.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"/proj/a"), "got {:?}", keys);
+        assert!(keys.contains(&"coop:/proj/a"), "got {:?}", keys);
+    }
+
+    #[test]
+    fn remote_rows_carry_badge_and_detail_host() {
+        let mut app = fold_app();
+        app.sessions.push(fake_remote("r1", "/home/agent", 5000));
+        app.apply_filter_sort();
+        let items = app.build_items(120);
+        let badge = items.iter().any(|it| {
+            it.lines.iter().any(|l| {
+                l.spans.iter().any(|sp| sp.content.contains("[coop]"))
+            })
+        });
+        assert!(badge, "remote row should carry a [coop] badge");
+        let idx = app.sessions.iter().position(|s| s.host == "coop").unwrap();
+        let hit_lines = detail_lines(&app.sessions[idx], None, &[]);
+        assert!(hit_lines.iter().any(|l| l.spans.iter().any(|sp| sp.content == "coop")));
+    }
+
+    #[test]
+    fn open_remote_session_uses_ssh() {
+        use crate::config::HostConfig;
+        let cfg = Config::with_hosts_for_test(vec![HostConfig {
+            name: "coop".to_string(),
+            ssh_target: "coop".to_string(),
+            sessions_dir: None,
+        }]);
+        assert_eq!(cfg.hosts().len(), 1);
+        let mut app = fold_app();
+        app.config = cfg;
+        app.sessions.push(fake_remote("r1", "/home/agent", 5000));
+        app.apply_filter_sort();
+        // Select the remote session (newest activity sorts first).
+        let pos = app.order.iter().position(|&i| app.sessions[i].host == "coop").unwrap();
+        app.sel = pos;
+        app.header_park = None;
+        match app.open_selected() {
+            Some(OpenAction::SshNew { ssh_target, cwd, .. }) => {
+                assert_eq!(ssh_target, "coop");
+                assert_eq!(cwd, "/home/agent");
+            }
+            other => panic!("expected SshNew, got {:?}", other),
+        }
     }
 }

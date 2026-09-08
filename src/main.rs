@@ -2,17 +2,23 @@
 //!
 //! Browse, inspect, and resume pi coding-agent sessions:
 //!   - lists every session under ~/.pi/agent/sessions (respects PI_CODING_AGENT_DIR)
+//!     plus `[hosts.<name>]` remotes mirrored over ssh
 //!   - live dot for sessions with an active pi process (cwd + recent-write match,
 //!     exact when the process cmdline carries --session)
 //!   - Enter: attach to the running tmux session, or spawn `pi --session <file>`
-//!     in a new tmux window
+//!     in a new tmux window (remote sessions open via `ssh -t <host> ...`)
 
 use psst::config;
-use psst::running::{self, detect, live_mark, map_running};
-use psst::scan::{in_scope, resolve_scope, scan, sessions_root, SessionMeta};
+use psst::hosts;
+use psst::running::{
+    self, attach_remote_enrichment, detect, detect_remote, fetch_remote_names,
+    fetch_remote_summaries, live_mark, map_running,
+};
+use psst::scan::{in_scope, resolve_scope, scan, sessions_root, SessionKey, SessionMeta};
 use psst::tui;
 
 use anyhow::{bail, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -48,12 +54,12 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
                     "psst — pi session tui\n\n\
                      usage: psst [.] [--list] [--json] [--refresh] [--debug-running]\n\n\
                      .                 only this project (git root, else cwd)\n\
-                     --list            plain table\n\
-                     --json            JSON array (implies list)\n\
-                     --refresh         rebuild the metadata cache\n\
-                     --debug-running   dump detected pi processes\n\n\
+                     --list            plain table (host column; pipe-friendly)\n\
+                     --json            JSON array (implies list; adds host)\n\
+                     --refresh         rebuild the metadata cache (re-mirrors hosts)\n\
+                     --debug-running   dump detected pi processes (local + hosts)\n\n\
                      no flags opens the TUI. /=search, ?=keys, enter=open\n\
-                     config: ~/.config/psst/config.toml"
+                     config: ~/.config/psst/config.toml ([hosts.coop] ssh=\"coop\")"
                 );
                 std::process::exit(0);
             }
@@ -77,18 +83,17 @@ fn scoped<'a>(sessions: &'a [SessionMeta], scope: Option<&Path>) -> Vec<&'a Sess
         .collect()
 }
 
-fn print_list(sessions: &[&SessionMeta], hits: &std::collections::HashMap<PathBuf, running::RunningHit>) {
+type Hits = HashMap<SessionKey, running::RunningHit>;
+
+fn print_list(sessions: &[&SessionMeta], hits: &Hits) {
     print!("{}", list_text(sessions, hits));
 }
 
-fn list_text(
-    sessions: &[&SessionMeta],
-    hits: &std::collections::HashMap<PathBuf, running::RunningHit>,
-) -> String {
+fn list_text(sessions: &[&SessionMeta], hits: &Hits) -> String {
     use std::fmt::Write;
-    let mut out = format!("{:<2} {:<50} {:<28} {:>7}\n", "", "title", "project", "age");
+    let mut out = format!("{:<2} {:<42} {:<8} {:<22} {:>7}\n", "", "title", "host", "project", "age");
     for s in sessions {
-        let hit = hits.get(&s.path);
+        let hit = hits.get(&s.key());
         let mark = live_mark(hit);
         let age = chrono::Utc::now().timestamp() - s.last_user_or_activity();
         let title = hit
@@ -96,17 +101,18 @@ fn list_text(
             .unwrap_or_else(|| s.title());
         let _ = writeln!(
             out,
-            "{} {:<50} {:<28} {:>5}",
+            "{} {:<42} {:<8} {:<22} {:>5}",
             mark.glyph(),
-            crate::list_helpers::trunc(&title, 48),
-            crate::list_helpers::trunc(&project_base(&s.cwd), 26),
+            crate::list_helpers::trunc(&title, 40),
+            crate::list_helpers::trunc(&s.host, 8),
+            crate::list_helpers::trunc(&project_base(&s.cwd), 20),
             crate::list_helpers::fmt_age(age),
         );
     }
     out
 }
 
-fn print_json(sessions: &[&SessionMeta], hits: &std::collections::HashMap<PathBuf, running::RunningHit>) {
+fn print_json(sessions: &[&SessionMeta], hits: &Hits) {
     println!(
         "{}",
         serde_json::to_string_pretty(&sessions_json(sessions, hits))
@@ -114,18 +120,16 @@ fn print_json(sessions: &[&SessionMeta], hits: &std::collections::HashMap<PathBu
     );
 }
 
-fn sessions_json(
-    sessions: &[&SessionMeta],
-    hits: &std::collections::HashMap<PathBuf, running::RunningHit>,
-) -> serde_json::Value {
+fn sessions_json(sessions: &[&SessionMeta], hits: &Hits) -> serde_json::Value {
     let now = chrono::Utc::now().timestamp();
     let rows: Vec<serde_json::Value> = sessions
         .iter()
         .map(|s| {
-            let hit = hits.get(&s.path);
+            let hit = hits.get(&s.key());
             let mark = live_mark(hit);
             serde_json::json!({
                 "path": s.path,
+                "host": s.host,
                 "id": s.id,
                 "cwd": s.cwd,
                 "name": s.name,
@@ -160,12 +164,27 @@ fn project_base(cwd: &str) -> String {
 
 fn main() -> Result<()> {
     let args = parse_args()?;
-    let (sessions, hits) = load_sessions(args.refresh)?;
+    let cfg = config::Config::load();
+    let (sessions, hits, host_errors) = load_sessions(&cfg, args.refresh)?;
+    for e in &host_errors {
+        eprintln!("psst: {}", e);
+    }
 
     if args.debug_running {
-        let procs = detect();
+        let mut procs = detect();
+        for h in cfg.hosts() {
+            match detect_remote(&h.ssh_target, &h.name) {
+                Ok(mut rp) => procs.append(&mut rp),
+                Err(e) => eprintln!("psst: {}: {}", h.name, e),
+            }
+        }
         println!("pi processes: {}", serde_json::to_string_pretty(&procs)?);
-        println!("hits: {}", serde_json::to_string_pretty(&hits)?);
+        // SessionKey serializes as a struct; JSON map keys must be strings.
+        let hits_dbg: HashMap<String, &running::RunningHit> = hits
+            .iter()
+            .map(|(k, v)| (format!("{}:{}", k.host, k.path.to_string_lossy()), v))
+            .collect();
+        println!("hits: {}", serde_json::to_string_pretty(&hits_dbg)?);
         return Ok(());
     }
 
@@ -179,20 +198,63 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let cfg = config::Config::load();
     let mut app = tui::App::new(sessions, cfg, args.scope);
+    // Surface mirror errors on the first frame instead of only stderr.
+    if !host_errors.is_empty() {
+        app.status = host_errors.join("; ");
+    }
     match tui::run(&mut app)? {
         Some(action) => perform(action),
         None => Ok(()),
     }
 }
 
-fn load_sessions(force: bool) -> Result<(Vec<SessionMeta>, std::collections::HashMap<PathBuf, running::RunningHit>)> {
-    let sessions = scan(&sessions_root(), force)?;
-    let procs = detect();
-    let cfg = config::Config::load();
-    let hits = map_running(&procs, &sessions, cfg.active_secs());
-    Ok((sessions, hits))
+fn load_sessions(
+    cfg: &config::Config,
+    force: bool,
+) -> Result<(Vec<SessionMeta>, Hits, Vec<String>)> {
+    let mut sessions = scan(&sessions_root(), force)?;
+    let (mut remote_sessions, mut errors) = hosts::sync_all(cfg.hosts(), force);
+    sessions.append(&mut remote_sessions);
+
+    let mut procs = detect();
+    for h in cfg.hosts() {
+        match detect_remote(&h.ssh_target, &h.name) {
+            Ok(rp) => procs.extend(rp),
+            Err(e) => errors.push(format!("{}: {}", h.name, e)),
+        }
+    }
+    let mut hits = map_running(&procs, &sessions, cfg.active_secs());
+    // Second pass: ssh enrichment for remote hits (names/status).
+    for h in cfg.hosts() {
+        let remote_pids: Vec<u32> = hits
+            .iter()
+            .filter(|(k, _)| k.host == h.name)
+            .map(|(_, hit)| hit.pid)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        if remote_pids.is_empty() {
+            continue;
+        }
+        let summaries = fetch_remote_summaries(&h.ssh_target, &remote_pids);
+        let names = fetch_remote_names(&h.ssh_target, &remote_pids);
+        // Restrict to this host's hits.
+        let mut sub: HashMap<SessionKey, running::RunningHit> = hits
+            .iter()
+            .filter(|(k, _)| k.host == h.name)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        attach_remote_enrichment(&mut sub, &names, &summaries);
+        for (k, v) in sub {
+            hits.insert(k, v);
+        }
+    }
+    Ok((sessions, hits, errors))
+}
+
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 fn perform(action: tui::OpenAction) -> Result<()> {
@@ -219,9 +281,32 @@ fn perform(action: tui::OpenAction) -> Result<()> {
             command,
             inside,
         } => {
+            tmux_new_local(&cwd, &name, &command, inside)?;
+            Ok(())
+        }
+        tui::OpenAction::SshAttach {
+            ssh_target,
+            target,
+            inside,
+        } => {
+            // `target` is `session[:window]` on the remote.
+            let (session, window) = match target.split_once(':') {
+                Some((s, w)) => (s.to_string(), Some(w.to_string())),
+                None => (target.clone(), None),
+            };
+            // Select the window first (detached), then attach lands on it.
+            let remote = match window {
+                Some(w) => format!(
+                    "tmux select-window -t {} \\; attach -t {}",
+                    sh_quote(&format!("{}:{}", session, w)),
+                    sh_quote(&session)
+                ),
+                None => format!("tmux attach -t {}", sh_quote(&session)),
+            };
             if inside {
+                let label = format!("ssh-{}", session);
                 let st = Command::new("tmux")
-                    .args(["new-window", "-c", &cwd, "-n", &name, &command])
+                    .args(["new-window", "-n", &label, "ssh", "-t", &ssh_target, &remote])
                     .status();
                 match st {
                     Ok(s) if s.success() => Ok(()),
@@ -229,11 +314,36 @@ fn perform(action: tui::OpenAction) -> Result<()> {
                     Err(e) => bail!("tmux new-window: {}", e),
                 }
             } else {
-                // unique session name; if it exists, suffix it
-                let mut sess = format!("psst-{}", name);
+                let _ = Command::new("ssh")
+                    .args(["-t", &ssh_target, &remote])
+                    .exec();
+                bail!("ssh attach failed for {}:{}", ssh_target, target);
+            }
+        }
+        tui::OpenAction::SshNew {
+            ssh_target,
+            cwd,
+            name,
+            command,
+            inside,
+        } => {
+            let remote = format!("cd {} && exec {}", sh_quote(&cwd), command);
+            if inside {
+                let st = Command::new("tmux")
+                    .args(["new-window", "-n", &name, "ssh", "-t", &ssh_target, &remote])
+                    .status();
+                match st {
+                    Ok(s) if s.success() => Ok(()),
+                    Ok(s) => bail!("tmux new-window exited with {}", s),
+                    Err(e) => bail!("tmux new-window: {}", e),
+                }
+            } else {
+                let mut sess = format!("psst-{}-{}", ssh_target, name);
+                sess = sess.replace(['.', ':'], "-");
                 for n in 2..50 {
+                    let probe = sess.clone();
                     let exists = Command::new("tmux")
-                        .args(["has-session", "-t", &sess])
+                        .args(["has-session", "-t", &probe])
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
                         .status()
@@ -242,10 +352,12 @@ fn perform(action: tui::OpenAction) -> Result<()> {
                     if !exists {
                         break;
                     }
-                    sess = format!("psst-{}-{}", name, n);
+                    sess = format!("psst-{}-{}-{}", ssh_target, name, n).replace(['.', ':'], "-");
                 }
                 let st = Command::new("tmux")
-                    .args(["new-session", "-d", "-s", &sess, "-c", &cwd, &command])
+                    .args([
+                        "new-session", "-d", "-s", &sess, "ssh", "-t", &ssh_target, &remote,
+                    ])
                     .status();
                 if let Err(e) = st {
                     bail!("tmux new-session: {}", e);
@@ -254,6 +366,44 @@ fn perform(action: tui::OpenAction) -> Result<()> {
                 bail!("tmux attach failed");
             }
         }
+    }
+}
+
+fn tmux_new_local(cwd: &str, name: &str, command: &str, inside: bool) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    if inside {
+        let st = Command::new("tmux")
+            .args(["new-window", "-c", cwd, "-n", name, command])
+            .status();
+        match st {
+            Ok(s) if s.success() => Ok(()),
+            Ok(s) => bail!("tmux new-window exited with {}", s),
+            Err(e) => bail!("tmux new-window: {}", e),
+        }
+    } else {
+        // unique session name; if it exists, suffix it
+        let mut sess = format!("psst-{}", name);
+        for n in 2..50 {
+            let exists = Command::new("tmux")
+                .args(["has-session", "-t", &sess])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !exists {
+                break;
+            }
+            sess = format!("psst-{}-{}", name, n);
+        }
+        let st = Command::new("tmux")
+            .args(["new-session", "-d", "-s", &sess, "-c", cwd, command])
+            .status();
+        if let Err(e) = st {
+            bail!("tmux new-session: {}", e);
+        }
+        let _ = Command::new("tmux").args(["attach-session", "-t", &sess]).exec();
+        bail!("tmux attach failed");
     }
 }
 
@@ -288,10 +438,12 @@ mod list_helpers {
 mod tests {
     use super::*;
     use psst::running::{RunningHit, TmuxTarget};
+    use psst::scan::LOCAL_HOST;
 
     fn meta(id: &str, cwd: &str, ts: i64) -> SessionMeta {
         SessionMeta {
             path: PathBuf::from(format!("/tmp/{}.jsonl", id)),
+            host: LOCAL_HOST.to_string(),
             id: id.into(),
             cwd: cwd.into(),
             created: Some(ts),
@@ -404,6 +556,7 @@ mod tests {
         let v = sessions_json(&refs, &std::collections::HashMap::new());
         let row = &v.as_array().unwrap()[0];
         assert_eq!(row["title"], "a-name");
+        assert_eq!(row["host"], "local");
         assert_eq!(row["running"], false);
         assert!(row["pid"].is_null());
         assert!(row["tmux"].is_null());
@@ -419,7 +572,7 @@ mod tests {
     fn json_running_session_prefers_peer_and_tmux() {
         let sessions = vec![meta("a", "/proj/a", 1000)];
         let refs: Vec<&SessionMeta> = sessions.iter().collect();
-        let hits = std::collections::HashMap::from([(sessions[0].path.clone(), hit("pi-x-1"))]);
+        let hits = std::collections::HashMap::from([(sessions[0].key(), hit("pi-x-1"))]);
         let v = sessions_json(&refs, &hits);
         let row = &v.as_array().unwrap()[0];
         assert_eq!(row["title"], "pi-x-1");
@@ -438,8 +591,20 @@ mod tests {
         let mut lines = out.lines();
         let header = lines.next().unwrap();
         assert!(header.contains("title") && header.contains("project") && header.contains("age"));
+        assert!(header.contains("host"));
         let row = lines.next().unwrap();
         assert!(row.contains("a-name") && row.contains('a') && row.contains("○"));
+        assert!(row.contains("local"));
         assert!(lines.next().is_none());
+    }
+
+    #[test]
+    fn list_text_shows_remote_host() {
+        let mut m = meta("a", "/home/agent", 1000);
+        m.host = "coop".to_string();
+        let sessions = vec![m];
+        let refs: Vec<&SessionMeta> = sessions.iter().collect();
+        let out = list_text(&refs, &std::collections::HashMap::new());
+        assert!(out.lines().nth(1).unwrap().contains("coop"));
     }
 }

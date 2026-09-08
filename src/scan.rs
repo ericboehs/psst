@@ -11,10 +11,29 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Host key for the local machine. Remote hosts use their config name (e.g. "coop").
+pub const LOCAL_HOST: &str = "local";
+
+fn default_host() -> String {
+    LOCAL_HOST.to_string()
+}
+
+/// Identity of a session across hosts: (host, path-on-that-host).
+/// Two hosts can share the same path string (e.g. `/home/agent/...`),
+/// so the path alone is not a unique key.
+#[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize)]
+pub struct SessionKey {
+    pub host: String,
+    pub path: PathBuf,
+}
+
 /// Metadata extracted from one session file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub path: PathBuf,
+    /// Host that owns the session: "local" or a `[hosts.<name>]` key.
+    #[serde(default = "default_host")]
+    pub host: String,
     /// UUID from the session header.
     pub id: String,
     /// Working directory recorded in the header (authoritative project dir).
@@ -51,6 +70,18 @@ pub struct SessionMeta {
 }
 
 impl SessionMeta {
+    /// Host-qualified identity for running-hit maps and UI restore.
+    pub fn key(&self) -> SessionKey {
+        SessionKey {
+            host: self.host.clone(),
+            path: self.path.clone(),
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.host == LOCAL_HOST
+    }
+
     /// When you last sent a message, falling back to any activity.
     pub fn last_user_or_activity(&self) -> i64 {
         self.last_user.or(self.last_activity).unwrap_or(0)
@@ -72,16 +103,16 @@ impl SessionMeta {
 }
 
 #[derive(Serialize, Deserialize)]
-struct CacheEntry {
-    mtime: i64,
-    size: u64,
-    meta: SessionMeta,
+pub(crate) struct CacheEntry {
+    pub(crate) mtime: i64,
+    pub(crate) size: u64,
+    pub(crate) meta: SessionMeta,
 }
 
 #[derive(Serialize, Deserialize, Default)]
-struct Cache(HashMap<String, CacheEntry>);
+pub(crate) struct Cache(pub(crate) HashMap<String, CacheEntry>);
 
-fn cache_path() -> PathBuf {
+pub(crate) fn cache_path() -> PathBuf {
     if let Ok(x) = std::env::var("PSST_CACHE") {
         return PathBuf::from(x);
     }
@@ -89,14 +120,30 @@ fn cache_path() -> PathBuf {
     PathBuf::from(home).join(".cache/psst/cache.json")
 }
 
-fn load_cache() -> Cache {
+/// Cache key namespaces entries by host: "<host>\0<path>".
+/// Pre-host cache files used the bare path; those read back as local.
+pub(crate) fn cache_key(host: &str, path: &Path) -> String {
+    format!("{}\0{}", host, path.to_string_lossy())
+}
+
+pub(crate) fn cache_lookup<'a>(cache: &'a Cache, host: &str, path: &Path) -> Option<&'a CacheEntry> {
+    if let Some(e) = cache.0.get(&cache_key(host, path)) {
+        return Some(e);
+    }
+    if host == LOCAL_HOST {
+        return cache.0.get(&path.to_string_lossy().to_string());
+    }
+    None
+}
+
+pub(crate) fn load_cache() -> Cache {
     std::fs::read_to_string(cache_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-fn save_cache(c: &Cache) {
+pub(crate) fn save_cache(c: &Cache) {
     let p = cache_path();
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -142,8 +189,13 @@ fn content_text(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Parse a single session JSONL file into metadata.
+/// Parse a single session JSONL file into metadata (local host).
 pub fn parse_file(path: &Path) -> Result<SessionMeta> {
+    parse_file_with_host(path, LOCAL_HOST)
+}
+
+/// Parse a session file and tag it with `host` (`local` or a remote name).
+pub fn parse_file_with_host(path: &Path, host: &str) -> Result<SessionMeta> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading {}", path.display()))?;
 
@@ -154,41 +206,24 @@ pub fn parse_file(path: &Path) -> Result<SessionMeta> {
         .and_then(|m: SystemTime| m.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    Ok(parse_full(&raw, path, mtime, stat.len(), host))
+}
 
-    let mut meta = SessionMeta {
-        path: path.to_path_buf(),
-        id: String::new(),
-        cwd: String::new(),
-        created: None,
-        last_activity: None,
-        last_user: None,
-        name: None,
-        first_prompt: None,
-        last_prompt: None,
-        model: None,
-        cost_total: 0.0,
-        tokens_in: 0,
-        tokens_out: 0,
-        messages: 0,
-        branches: 0,
-        parent_session: None,
-        mtime,
-        size: stat.len(),
+/// Fold one JSONL line into `meta` (shared by fresh and incremental parses).
+fn fold_line(
+    meta: &mut SessionMeta,
+    child_counts: &mut HashMap<String, u32>,
+    line: &str,
+) {
+    if line.is_empty() {
+        return;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
     };
-
-    // children-count per parentId, to find branch points at the end
-    let mut child_counts: HashMap<String, u32> = HashMap::new();
-
-    for line in raw.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        match typ {
-            "session" => {
+    let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match typ {
+        "session" => {
                 meta.id = v
                     .get("id")
                     .and_then(|i| i.as_str())
@@ -210,9 +245,8 @@ pub fn parse_file(path: &Path) -> Result<SessionMeta> {
             }
             "message" => {
                 meta.messages += 1;
-                let msg = match v.get("message") {
-                    Some(m) => m,
-                    None => continue,
+                let Some(msg) = v.get("message") else {
+                    return;
                 };
                 let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
                 match role {
@@ -280,17 +314,79 @@ pub fn parse_file(path: &Path) -> Result<SessionMeta> {
                 meta.last_activity = Some(ts);
             }
         }
-    }
+}
 
+/// Finish a fold: branch points from the child counts; a file with no
+/// timestamps falls back to its mtime for activity sorting.
+fn finalize(meta: &mut SessionMeta, child_counts: &HashMap<String, u32>, mtime: i64) {
     meta.branches = child_counts.values().filter(|&&c| c > 1).count() as u64;
     if meta.last_activity.is_none() {
         meta.last_activity = Some(mtime);
     }
-    Ok(meta)
 }
 
-/// Discover and parse all sessions under `root`. `force` bypasses the cache.
+fn fresh_meta(path: &Path, mtime: i64, size: u64, host: &str) -> SessionMeta {
+    SessionMeta {
+        path: path.to_path_buf(),
+        host: host.to_string(),
+        id: String::new(),
+        cwd: String::new(),
+        created: None,
+        last_activity: None,
+        last_user: None,
+        name: None,
+        first_prompt: None,
+        last_prompt: None,
+        model: None,
+        cost_total: 0.0,
+        tokens_in: 0,
+        tokens_out: 0,
+        messages: 0,
+        branches: 0,
+        parent_session: None,
+        mtime,
+        size,
+    }
+}
+
+pub(crate) fn parse_full(
+    raw: &str,
+    path: &Path,
+    mtime: i64,
+    size: u64,
+    host: &str,
+) -> SessionMeta {
+    let mut meta = fresh_meta(path, mtime, size, host);
+    let mut child_counts: HashMap<String, u32> = HashMap::new();
+    for line in raw.lines() {
+        fold_line(&mut meta, &mut child_counts, line);
+    }
+    finalize(&mut meta, &child_counts, mtime);
+    meta
+}
+
+/// Parse session JSONL already in memory (e.g. fetched over ssh).
+/// `path` is the canonical path *on its host*; `mtime`/`size` are the
+/// remote file's attributes so the shared cache stays valid.
+pub fn parse_content(
+    raw: &str,
+    path: &Path,
+    mtime: i64,
+    size: u64,
+    host: &str,
+) -> Result<SessionMeta> {
+    Ok(parse_full(raw, path, mtime, size, host))
+}
+
+/// Discover and parse all local sessions under `root`. `force` bypasses the cache.
 pub fn scan(root: &Path, force: bool) -> anyhow::Result<Vec<SessionMeta>> {
+    scan_with_host(root, LOCAL_HOST, force)
+}
+
+/// Same as [`scan`], tagging every session with `host`.
+/// Used for remote mirrors (the mirror dir is scanned locally, then each
+/// meta is rewritten to its remote path by the caller when needed).
+pub fn scan_with_host(root: &Path, host: &str, force: bool) -> anyhow::Result<Vec<SessionMeta>> {
     let mut out = Vec::new();
     if !root.exists() {
         return Ok(out);
@@ -325,9 +421,9 @@ pub fn scan(root: &Path, force: bool) -> anyhow::Result<Vec<SessionMeta>> {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             let size = md.len();
-            let key = path.to_string_lossy().to_string();
+            let key = cache_key(host, &path);
 
-            if let Some(entry) = cache.0.get(&key) {
+            if let Some(entry) = cache_lookup(&cache, host, &path) {
                 if entry.mtime == mtime && entry.size == size {
                     // Reparse once after last_user was added so activity sort
                     // isn't stuck on None until the file next changes.
@@ -336,13 +432,23 @@ pub fn scan(root: &Path, force: bool) -> anyhow::Result<Vec<SessionMeta>> {
                     if (entry.meta.last_user.is_some() || entry.meta.messages == 0)
                         && !missing_last
                     {
-                        out.push(entry.meta.clone());
+                        let mut meta = entry.meta.clone();
+                        if meta.host.is_empty() {
+                            meta.host = host.to_string();
+                        }
+                        out.push(meta);
                         continue;
                     }
                 }
             }
-            match parse_file(&path) {
-                Ok(meta) => {
+            match parse_file_with_host(&path, host) {
+                Ok(mut meta) => {
+                    // Old cache entries predate `host`; normalize on rewrite
+                    // and drop the legacy bare-path key.
+                    meta.host = host.to_string();
+                    if host == LOCAL_HOST {
+                        cache.0.remove(&path.to_string_lossy().to_string());
+                    }
                     cache.0.insert(
                         key,
                         CacheEntry {
@@ -443,6 +549,12 @@ pub fn recent_messages(path: &Path, n: usize) -> Vec<(String, String)> {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
+    recent_messages_from_str(&raw, n)
+}
+
+/// Same as [`recent_messages`] over already-loaded JSONL (e.g. a remote
+/// mirror read through [`crate::hosts::local_path_for`]).
+pub fn recent_messages_from_str(raw: &str, n: usize) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut push = |role: &str, text: String| {
         let one = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -516,6 +628,30 @@ pub fn recent_messages(path: &Path, n: usize) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_content_tags_host() {
+        let raw = r#"{"type":"session","version":3,"id":"abc","timestamp":"2025-06-01T10:00:00.000Z","cwd":"/home/agent"}"#;
+        let m = parse_content(raw, Path::new("/home/agent/x.jsonl"), 123, 45, "coop").unwrap();
+        assert_eq!(m.host, "coop");
+        assert_eq!(m.id, "abc");
+        assert_eq!(m.mtime, 123);
+        assert_eq!(m.size, 45);
+        assert_eq!(
+            m.key(),
+            SessionKey {
+                host: "coop".to_string(),
+                path: PathBuf::from("/home/agent/x.jsonl"),
+            }
+        );
+        assert!(!m.is_local());
+    }
+
+    #[test]
+    fn cache_keys_namespace_hosts() {
+        let p = Path::new("/same/path.jsonl");
+        assert_ne!(cache_key("local", p), cache_key("coop", p));
+    }
 
     #[test]
     fn in_scope_matches_exact_and_children() {

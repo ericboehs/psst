@@ -11,13 +11,21 @@
 //! active_secs = 120
 //!
 //! [ui]
-//! # grouping on launch: "day" (default), "project", or "flat"
+//! # grouping on launch: "day" (default), "project", "flat", or "host"
 //! group = "day"
 //! # show the right-hand detail pane on launch (default: false; toggle with Ctrl+D)
 //! detail = false
+//!
+//! [hosts.coop]
+//! # ssh target for the remote host (as in `ssh <target>`)
+//! ssh = "coop"
+//! # enabled = true (default when the table is present; set false to hide)
+//! # sessions_dir = ".pi/agent/sessions" (default; relative to remote $HOME
+//! #   unless absolute or starting with ~/; $PI_CODING_AGENT_DIR wins when set)
 //! ```
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Deserialize, Default)]
@@ -28,6 +36,8 @@ struct FileConfig {
     detection: Option<DetectCfg>,
     #[serde(default)]
     ui: Option<UiCfg>,
+    #[serde(default)]
+    hosts: HashMap<String, HostFileCfg>,
 }
 
 #[derive(Deserialize)]
@@ -50,11 +60,32 @@ struct UiCfg {
     detail: Option<bool>,
 }
 
+#[derive(Deserialize, Default)]
+struct HostFileCfg {
+    #[serde(default)]
+    ssh: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    sessions_dir: Option<String>,
+}
+
+/// One remote host psst mirrors over ssh. `name` is the display key
+/// (`local` is reserved for this machine); `ssh_target` is the `ssh <target>`
+/// destination; `sessions_dir` optionally overrides the remote sessions dir.
+#[derive(Debug, Clone)]
+pub struct HostConfig {
+    pub name: String,
+    pub ssh_target: String,
+    pub sessions_dir: Option<String>,
+}
+
 pub struct Config {
     resume_command: String,
     active_secs: i64,
     group: String,
     detail: bool,
+    hosts: Vec<HostConfig>,
 }
 
 impl Default for Config {
@@ -64,6 +95,7 @@ impl Default for Config {
             active_secs: 120,
             group: "day".to_string(),
             detail: false,
+            hosts: Vec::new(),
         }
     }
 }
@@ -99,6 +131,27 @@ impl Config {
                 cfg.detail = d;
             }
         }
+        let mut names: Vec<String> = fc.hosts.keys().cloned().collect();
+        names.sort();
+        for name in names {
+            if name == "local" {
+                continue;
+            }
+            if let Some(h) = fc.hosts.get(&name) {
+                if h.enabled == Some(false) {
+                    continue;
+                }
+                let ssh_target = h.ssh.clone().unwrap_or_else(|| name.clone());
+                if ssh_target.is_empty() {
+                    continue;
+                }
+                cfg.hosts.push(HostConfig {
+                    name,
+                    ssh_target,
+                    sessions_dir: h.sessions_dir.clone(),
+                });
+            }
+        }
         cfg
     }
 
@@ -110,7 +163,7 @@ impl Config {
         self.active_secs
     }
 
-    /// Launch grouping: "day" (default), "project", or "flat".
+    /// Launch grouping: "day" (default), "project", "flat", or "host".
     pub fn group_default(&self) -> &str {
         &self.group
     }
@@ -118,5 +171,46 @@ impl Config {
     /// Whether the right-hand detail pane is shown on launch (default: false).
     pub fn detail_default(&self) -> bool {
         self.detail
+    }
+
+    /// Remote hosts from `[hosts.<name>]` tables, sorted by name.
+    pub fn hosts(&self) -> &[HostConfig] {
+        &self.hosts
+    }
+
+    /// Test helper: build a config with the given remote hosts.
+    #[cfg(test)]
+    pub fn with_hosts_for_test(hosts: Vec<HostConfig>) -> Config {
+        let mut cfg = Config::default();
+        cfg.hosts = hosts;
+        cfg
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_hosts_tables() {
+        let raw = r#"
+[hosts.coop]
+ssh = "coop"
+
+[hosts.nas]
+ssh = "nas"
+enabled = false
+
+[hosts.gfe]
+sessions_dir = "/data/sessions"
+"#;
+        let fc: FileConfig = toml::from_str(raw).unwrap();
+        assert_eq!(fc.hosts.len(), 3);
+        assert_eq!(fc.hosts["coop"].ssh.as_deref(), Some("coop"));
+        assert_eq!(fc.hosts["nas"].enabled, Some(false));
+        assert_eq!(
+            fc.hosts["gfe"].sessions_dir.as_deref(),
+            Some("/data/sessions")
+        );
     }
 }
