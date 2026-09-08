@@ -389,6 +389,9 @@ fn sync_host_inner(host: &HostConfig, force: bool) -> anyhow::Result<Vec<Session
                         mtime: f.mtime,
                         size: f.size,
                         meta: meta.clone(),
+                        // Remote files are KBs; full reparse on change.
+                        lines: 0,
+                        child_counts: HashMap::new(),
                     },
                 );
                 changed = true;

@@ -131,7 +131,10 @@ then remotes by recency.
   stale `idle` cache entry loses to live CPU. The detail pane shows the
   reading (`working pid 80608 @ code:1 (heuristic) · cpu 9%`).
 - **Cache**: parsed metadata is cached at `~/.cache/psst/cache.json`, keyed by
-  host+path+mtime+size, so rescans only reparse changed files.
+  host+path+mtime+size, so rescans only reparse changed files. Files ≥5MB
+  additionally persist fold state (lines folded + parent→child counts), so a
+  rescan folds only appended tail lines instead of re-reading megabytes —
+  exact, including branch points, since session files are append-only.
 
 ## Config — `~/.config/psst/config.toml`
 

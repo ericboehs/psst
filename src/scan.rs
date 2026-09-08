@@ -107,6 +107,30 @@ pub(crate) struct CacheEntry {
     pub(crate) mtime: i64,
     pub(crate) size: u64,
     pub(crate) meta: SessionMeta,
+    /// Lines folded into `meta` (including empty/skipped ones). Zero means
+    /// "no incremental state" — full reparse on next change. Pre-incremental
+    /// cache files deserialize here as 0 and upgrade on their next parse.
+    #[serde(default)]
+    pub(crate) lines: u64,
+    /// Parent→child counts backing exact branch points across appends.
+    /// Only stored for files at or above [`INCREMENTAL_MIN_BYTES`]; omitted
+    /// from the JSON otherwise so small-file entries stay lean.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) child_counts: HashMap<String, u32>,
+}
+
+/// Split a fresh [`Parsed`] into storable incremental state: kept whole for
+/// big files, dropped for small ones (cheap to reparse anyway).
+fn stored_state(
+    size: u64,
+    parsed: Parsed,
+    min_bytes: u64,
+) -> (SessionMeta, u64, HashMap<String, u32>) {
+    if size >= min_bytes {
+        (parsed.meta, parsed.lines, parsed.child_counts)
+    } else {
+        (parsed.meta, 0, HashMap::new())
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -196,6 +220,11 @@ pub fn parse_file(path: &Path) -> Result<SessionMeta> {
 
 /// Parse a session file and tag it with `host` (`local` or a remote name).
 pub fn parse_file_with_host(path: &Path, host: &str) -> Result<SessionMeta> {
+    Ok(parse_file_full(path, host)?.meta)
+}
+
+/// [`parse_file_with_host`], keeping fold state for the incremental cache.
+pub(crate) fn parse_file_full(path: &Path, host: &str) -> Result<Parsed> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading {}", path.display()))?;
 
@@ -209,21 +238,40 @@ pub fn parse_file_with_host(path: &Path, host: &str) -> Result<SessionMeta> {
     Ok(parse_full(&raw, path, mtime, stat.len(), host))
 }
 
-/// Fold one JSONL line into `meta` (shared by fresh and incremental parses).
+/// Files at or above this size keep incremental parse state (`lines` +
+/// parent→child counts) in the cache, so a rescan folds only appended tail
+/// lines instead of re-reading megabytes. Smaller files reparse wholesale —
+/// microseconds either way, and their entries stay lean.
+pub(crate) const INCREMENTAL_MIN_BYTES: u64 = 5_000_000;
+
+/// A fully folded parse: metadata plus the state a later [`parse_tail`]
+/// needs to continue from exactly this point (append-only files only).
+pub(crate) struct Parsed {
+    meta: SessionMeta,
+    /// Total JSONL lines folded (including empty/skipped ones).
+    lines: u64,
+    /// Children per parentId, backing exact branch counts across appends.
+    child_counts: HashMap<String, u32>,
+}
+
+/// Fold one JSONL line into `meta`. Returns true for a `session` header
+/// line, which is only valid at offset 0 (see [`parse_tail`]).
 fn fold_line(
     meta: &mut SessionMeta,
     child_counts: &mut HashMap<String, u32>,
     line: &str,
-) {
+) -> bool {
     if line.is_empty() {
-        return;
+        return false;
     }
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-        return;
+        return false;
     };
     let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let mut saw_session = false;
     match typ {
         "session" => {
+            saw_session = true;
                 meta.id = v
                     .get("id")
                     .and_then(|i| i.as_str())
@@ -246,7 +294,7 @@ fn fold_line(
             "message" => {
                 meta.messages += 1;
                 let Some(msg) = v.get("message") else {
-                    return;
+                    return saw_session;
                 };
                 let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
                 match role {
@@ -314,6 +362,7 @@ fn fold_line(
                 meta.last_activity = Some(ts);
             }
         }
+    saw_session
 }
 
 /// Finish a fold: branch points from the child counts; a file with no
@@ -349,20 +398,72 @@ fn fresh_meta(path: &Path, mtime: i64, size: u64, host: &str) -> SessionMeta {
     }
 }
 
+/// Fold a whole session file from scratch.
 pub(crate) fn parse_full(
     raw: &str,
     path: &Path,
     mtime: i64,
     size: u64,
     host: &str,
-) -> SessionMeta {
+) -> Parsed {
     let mut meta = fresh_meta(path, mtime, size, host);
     let mut child_counts: HashMap<String, u32> = HashMap::new();
+    let mut lines = 0u64;
     for line in raw.lines() {
+        lines += 1;
         fold_line(&mut meta, &mut child_counts, line);
     }
     finalize(&mut meta, &child_counts, mtime);
-    meta
+    Parsed {
+        meta,
+        lines,
+        child_counts,
+    }
+}
+
+/// Continue a previous fold over a grown file, skipping the `skip_lines`
+/// already folded into `base`. Session files are append-only, so sums,
+/// counts, prompts, models, and activity all fold forward exactly, and the
+/// persisted child counts keep branch points exact too. Returns `None` when
+/// the file doesn't look like a pure append (fewer lines than skipped, or a
+/// second `session` header in the tail) — the caller must reparse fully.
+pub(crate) fn parse_tail(
+    base: &SessionMeta,
+    base_counts: &HashMap<String, u32>,
+    skip_lines: u64,
+    raw: &str,
+    path: &Path,
+    mtime: i64,
+    size: u64,
+    host: &str,
+) -> Option<Parsed> {
+    let mut meta = base.clone();
+    meta.path = path.to_path_buf();
+    meta.host = host.to_string();
+    meta.mtime = mtime;
+    meta.size = size;
+    let mut child_counts = base_counts.clone();
+    let mut lines = 0u64;
+    let mut skipped = 0u64;
+    for line in raw.lines() {
+        lines += 1;
+        if skipped < skip_lines {
+            skipped += 1;
+            continue;
+        }
+        if fold_line(&mut meta, &mut child_counts, line) {
+            return None;
+        }
+    }
+    if lines < skip_lines {
+        return None;
+    }
+    finalize(&mut meta, &child_counts, mtime);
+    Some(Parsed {
+        meta,
+        lines,
+        child_counts,
+    })
 }
 
 /// Parse session JSONL already in memory (e.g. fetched over ssh).
@@ -375,7 +476,7 @@ pub fn parse_content(
     size: u64,
     host: &str,
 ) -> Result<SessionMeta> {
-    Ok(parse_full(raw, path, mtime, size, host))
+    Ok(parse_full(raw, path, mtime, size, host).meta)
 }
 
 /// Discover and parse all local sessions under `root`. `force` bypasses the cache.
@@ -387,6 +488,18 @@ pub fn scan(root: &Path, force: bool) -> anyhow::Result<Vec<SessionMeta>> {
 /// Used for remote mirrors (the mirror dir is scanned locally, then each
 /// meta is rewritten to its remote path by the caller when needed).
 pub fn scan_with_host(root: &Path, host: &str, force: bool) -> anyhow::Result<Vec<SessionMeta>> {
+    scan_with_host_and_threshold(root, host, force, INCREMENTAL_MIN_BYTES)
+}
+
+/// [`scan_with_host`] with an explicit incremental-state size threshold.
+/// Production passes [`INCREMENTAL_MIN_BYTES`]; tests pass a small value so
+/// KB fixtures exercise the tail-fold path without MB fixtures.
+pub(crate) fn scan_with_host_and_threshold(
+    root: &Path,
+    host: &str,
+    force: bool,
+    min_bytes: u64,
+) -> anyhow::Result<Vec<SessionMeta>> {
     let mut out = Vec::new();
     if !root.exists() {
         return Ok(out);
@@ -439,10 +552,44 @@ pub fn scan_with_host(root: &Path, host: &str, force: bool) -> anyhow::Result<Ve
                         out.push(meta);
                         continue;
                     }
+                } else if size >= entry.size && entry.lines > 0 {
+                    // Grown append-only file with fold state: fold the tail
+                    // instead of re-reading megabytes. Any doubt (unreadable,
+                    // rewritten, second header) falls through to a full parse.
+                    if let Ok(raw) = std::fs::read_to_string(&path) {
+                        if let Some(parsed) = parse_tail(
+                            &entry.meta,
+                            &entry.child_counts,
+                            entry.lines,
+                            &raw,
+                            &path,
+                            mtime,
+                            size,
+                            host,
+                        ) {
+                            let (meta, lines, child_counts) =
+                                stored_state(size, parsed, min_bytes);
+                            cache.0.insert(
+                                key,
+                                CacheEntry {
+                                    mtime,
+                                    size,
+                                    meta: meta.clone(),
+                                    lines,
+                                    child_counts,
+                                },
+                            );
+                            changed = true;
+                            out.push(meta);
+                            continue;
+                        }
+                    }
                 }
             }
-            match parse_file_with_host(&path, host) {
-                Ok(mut meta) => {
+            match parse_file_full(&path, host) {
+                Ok(parsed) => {
+                    let (mut meta, lines, child_counts) =
+                        stored_state(size, parsed, min_bytes);
                     // Old cache entries predate `host`; normalize on rewrite
                     // and drop the legacy bare-path key.
                     meta.host = host.to_string();
@@ -455,6 +602,8 @@ pub fn scan_with_host(root: &Path, host: &str, force: bool) -> anyhow::Result<Ve
                             mtime,
                             size,
                             meta: meta.clone(),
+                            lines,
+                            child_counts,
                         },
                     );
                     changed = true;
@@ -628,6 +777,182 @@ pub fn recent_messages_from_str(raw: &str, n: usize) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PSST_CACHE is process-global; serialize the tests that repoint it.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn tail_fixture() -> Vec<&'static str> {
+        vec![
+            r#"{"type":"session","version":3,"id":"tail-1","timestamp":"2025-06-01T10:00:00.000Z","cwd":"/proj/t"}"#,
+            r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2025-06-01T10:00:01.000Z","message":{"role":"user","content":"first"}}"#,
+            r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2025-06-01T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ans"}],"model":"m1","usage":{"input":100,"output":50,"cost":{"total":0.01}}}}"#,
+            r#"{"type":"message","id":"u2","parentId":"a1","timestamp":"2025-06-01T10:00:03.000Z","message":{"role":"user","content":"second"}}"#,
+            // tail starts here: branch (a1's second child), cost, rename, model
+            r#"{"type":"message","id":"a2","parentId":"u2","timestamp":"2025-06-01T10:00:04.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{}}],"model":"m1","usage":{"input":10,"output":5,"cost":{"total":0.02}}}}"#,
+            r#"{"type":"message","id":"t1","parentId":"a2","timestamp":"2025-06-01T10:00:05.000Z","message":{"role":"toolResult","toolCallId":"c1","toolName":"bash","content":[{"type":"text","text":"ok"}],"usage":{"input":200,"output":20,"cost":{"total":0.03}}}}"#,
+            r#"{"type":"session_info","id":"s1","parentId":"t1","timestamp":"2025-06-01T10:00:06.000Z","name":"tail name"}"#,
+            r#"{"type":"model_change","id":"mc1","parentId":"s1","timestamp":"2025-06-01T10:00:07.000Z","modelId":"m2"}"#,
+            r#"{"type":"message","id":"u3","parentId":"a1","timestamp":"2025-06-01T10:00:08.000Z","message":{"role":"user","content":"third"}}"#,
+            "",
+            "not json",
+        ]
+    }
+
+    fn meta_json(m: &SessionMeta) -> serde_json::Value {
+        serde_json::to_value(m).expect("meta serializes")
+    }
+
+    #[test]
+    fn tail_fold_matches_full_parse() {
+        let lines = tail_fixture();
+        let whole = lines.join("\n");
+        let full = parse_content(&whole, Path::new("/t.jsonl"), 9, 999, "local").unwrap();
+        // Sanity on the full parse itself.
+        assert_eq!(full.messages, 6);
+        assert_eq!(full.branches, 1);
+        assert!((full.cost_total - 0.06).abs() < 1e-9);
+        assert_eq!(full.name.as_deref(), Some("tail name"));
+        assert_eq!(full.model.as_deref(), Some("m2"));
+        assert_eq!(full.last_prompt.as_deref(), Some("third"));
+        // Split after u2 (line 4): prefix folds alone, tail continues it.
+        let prefix = lines[..4].join("\n");
+        let base = parse_full(&prefix, Path::new("/t.jsonl"), 0, 0, "local");
+        assert_eq!(base.lines, 4);
+        assert_eq!(base.meta.branches, 0);
+        let tail = parse_tail(
+            &base.meta,
+            &base.child_counts,
+            base.lines,
+            &whole,
+            Path::new("/t.jsonl"),
+            9,
+            999,
+            "local",
+        )
+        .expect("pure append folds");
+        assert_eq!(tail.lines as usize, lines.len());
+        assert_eq!(meta_json(&tail.meta), meta_json(&full));
+    }
+
+    #[test]
+    fn tail_fold_rejects_rewrites() {
+        let lines = tail_fixture();
+        let whole = lines.join("\n");
+        let base = parse_full(&whole, Path::new("/t.jsonl"), 0, 0, "local");
+        // Fewer lines than skipped: rewritten file, must reparse fully.
+        assert!(parse_tail(
+            &base.meta,
+            &base.child_counts,
+            base.lines + 10,
+            &whole,
+            Path::new("/t.jsonl"),
+            9,
+            999,
+            "local",
+        )
+        .is_none());
+        // A second session header in the tail: not an append.
+        let mut evil = whole.clone();
+        evil.push_str("\n{\"type\":\"session\",\"id\":\"evil\"}");
+        assert!(parse_tail(
+            &base.meta,
+            &base.child_counts,
+            base.lines,
+            &evil,
+            Path::new("/t.jsonl"),
+            9,
+            999,
+            "local",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn scan_stores_and_folds_tails() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("psst-incr-{}-{}", std::process::id(), stamp));
+        let enc = dir.join("--proj--");
+        std::fs::create_dir_all(&enc).unwrap();
+        let file = enc.join("s.jsonl");
+        // Pad past the 200-byte test threshold with a fat assistant line.
+        let mut body = tail_fixture()[..4].join("\n");
+        body.push_str(&format!(
+            "\n{{\"type\":\"message\",\"id\":\"pad\",\"parentId\":\"u2\",\"timestamp\":\"2025-06-01T10:00:03.500Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}",
+            "x".repeat(300)
+        ));
+        body.push('\n');
+        std::fs::write(&file, &body).unwrap();
+        assert!(std::fs::metadata(&file).unwrap().len() > 200);
+        // A small neighbor (one header line, well under threshold) stays stateless.
+        std::fs::write(enc.join("tiny.jsonl"), tail_fixture()[..1].join("\n")).unwrap();
+
+        let prev = std::env::var("PSST_CACHE").ok();
+        let cache_file = dir.join("cache.json");
+        std::env::set_var("PSST_CACHE", &cache_file);
+        let first = scan_with_host_and_threshold(&dir, "local", false, 200).unwrap();
+        assert_eq!(first.len(), 2);
+        let raw_cache: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cache_file).unwrap()).unwrap();
+        let big_key = raw_cache
+            .as_object()
+            .unwrap()
+            .keys()
+            .find(|k| k.contains("s.jsonl"))
+            .cloned()
+            .expect("big file cached");
+        let big_entry = &raw_cache[&big_key];
+        assert!(
+            big_entry["lines"].as_u64().unwrap() > 0,
+            "big file keeps fold state"
+        );
+        assert!(
+            !big_entry["child_counts"].as_object().unwrap().is_empty(),
+            "big file keeps child counts"
+        );
+        let tiny_key = raw_cache
+            .as_object()
+            .unwrap()
+            .keys()
+            .find(|k| k.contains("tiny.jsonl"))
+            .cloned()
+            .expect("tiny file cached");
+        assert_eq!(raw_cache[&tiny_key]["lines"], 0);
+        assert!(raw_cache[&tiny_key].get("child_counts").is_none());
+
+        // Append the rest: the rescan must fold the tail and match a fresh
+        // full parse exactly.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+        writeln!(f, "{}", tail_fixture()[4..].join("\n")).unwrap();
+        drop(f);
+        let second = scan_with_host_and_threshold(&dir, "local", false, 200).unwrap();
+        assert_eq!(second.len(), 2);
+        let grown = second.iter().find(|s| s.path == file).unwrap();
+        let expect =
+            parse_content(&std::fs::read_to_string(&file).unwrap(), &file, 0, 0, "local")
+                .unwrap();
+        // mtime/size differ (cache attrs), everything parsed must match.
+        let (mut got_v, mut exp_v) = (meta_json(grown), meta_json(&expect));
+        got_v["mtime"] = serde_json::Value::Null;
+        got_v["size"] = serde_json::Value::Null;
+        exp_v["mtime"] = serde_json::Value::Null;
+        exp_v["size"] = serde_json::Value::Null;
+        assert_eq!(got_v, exp_v);
+        // Pad (parent u2) plus a2 (parent u2) branch u2; u3 branches a1.
+        assert_eq!(grown.branches, 2);
+        assert_eq!(grown.name.as_deref(), Some("tail name"));
+
+        if let Some(v) = prev {
+            std::env::set_var("PSST_CACHE", v);
+        } else {
+            std::env::remove_var("PSST_CACHE");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parse_content_tags_host() {
