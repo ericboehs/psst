@@ -1,4 +1,4 @@
-//! psst — pi session tui.
+//! psst — pi session switcher for tmux.
 //!
 //! Browse, inspect, and resume pi coding-agent sessions:
 //!   - lists every session under ~/.pi/agent/sessions (respects PI_CODING_AGENT_DIR)
@@ -54,7 +54,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "--debug-focus" => parsed.debug_focus = true,
             "-h" | "--help" => {
                 println!(
-                    "psst — pi session tui\n\n\
+                    "psst — pi session switcher for tmux\n\n\
                      usage: psst [.] [--list] [--json] [--refresh] [--debug-running] [--debug-focus]\n\n\
                      .                 only this project (git root, else cwd)\n\
                      --list            plain table (host column; pipe-friendly)\n\

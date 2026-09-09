@@ -1,18 +1,11 @@
 # psst
 
-**p**i **s**ession **s**ort-of-**t**erminal-ui — browse, inspect, and resume
+**p**i **s**ession **s**witcher for **t**mux — browse, inspect, and resume
 [pi coding-agent](https://github.com/earendil-works/pi-mono) sessions from one
 TUI. Built because nothing combined both halves: mining the full session
 archive *and* showing which agents are running right now.
 
-```
-▾ Today  12 sessions · last 2s
-● readme-and-help         psst           2:04p  [code:3]
-◎ dotfiles-review         dotfiles       2:01p  [future:1]
-○ ⎇ wiki-session-sync     dotfiles       1:58p
-▾ Yesterday  8 sessions · last 22h
-● getting-started         home           9:12a  [code:1] [coop]
-```
+![psst TUI: session list grouped by day, with live tmux badges and remote hosts](docs/screenshot.png)
 
 - `●` yellow = live, working (`thinking` / `tool:*` from agent-link, except the prompt tools below — or subtree CPU ≥5% when no hook status is present)
 - `●` red + bold title = blocking prompt (`tool:ask` / `tool:confirm` / `tool:input`)

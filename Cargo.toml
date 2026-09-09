@@ -2,7 +2,7 @@
 name = "psst"
 version = "0.1.0"
 edition = "2021"
-description = "psst — pi session tui: browse, inspect, and resume pi coding-agent sessions"
+description = "psst — pi session switcher for tmux: browse, inspect, and resume pi coding-agent sessions"
 license = "MIT"
 
 [dependencies]
