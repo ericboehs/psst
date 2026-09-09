@@ -78,6 +78,10 @@ working with the last mirror + local sessions.
 | wheel | scroll the selection (3 rows per notch) |
 | click | select a row; on a group header, fold or unfold it |
 | double-click | open, same as `Enter` |
+| click `sort:` / `group:` / `filter:` in the header | cycle that setting |
+| click the search row (or `/ search`) | focus search |
+| click `d details` / `p prompts` in the footer | toggle that pane; the label lights up while it is on |
+| click `? keys` / `enter=open` / `q quit` | as labelled |
 
 Capturing the mouse takes over the terminal's own drag-to-select, so hold
 Shift to select and copy text as usual (Ghostty, iTerm2, xterm). Set

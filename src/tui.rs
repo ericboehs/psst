@@ -223,6 +223,9 @@ pub struct App {
     /// Screen row (offset from `list_top`) to item index, as of the last
     /// frame drawn. Clicks are resolved against this.
     row_map: Vec<Option<usize>>,
+    /// Clickable labels in the header, filter bar, and footer, as of the
+    /// last frame drawn.
+    hotspots: Vec<HotZone>,
     list_top: u16,
     /// Row and time of the last left click. Terminals report presses, not
     /// double clicks, so the pairing is done here.
@@ -349,6 +352,7 @@ impl App {
             pending_sel: None,
             recent_cache: None,
             row_map: Vec::new(),
+            hotspots: Vec::new(),
             list_top: 0,
             last_click: None,
             collapsed: HashSet::new(),
@@ -748,6 +752,48 @@ impl App {
         }
     }
 
+    /// f: cycle the list filter.
+    fn cycle_filter(&mut self) {
+        self.view_filter = self.view_filter.next();
+        self.apply_filter_sort();
+        self.status = format!("filter:{}", self.view_filter.label());
+    }
+
+    /// g / Tab: cycle the grouping.
+    fn cycle_group(&mut self) {
+        self.group = self.group.next();
+        // parked headers belong to the old grouping
+        self.header_park = None;
+        self.status = format!("group:{}", self.group.label());
+    }
+
+    /// s: cycle the sort.
+    fn cycle_sort(&mut self) {
+        self.sort = self.sort.next();
+        self.apply_filter_sort();
+        self.status = format!("sort:{}", self.sort.label());
+    }
+
+    /// d: show or hide the detail pane.
+    fn toggle_detail(&mut self) {
+        self.detail = !self.detail;
+        self.status = if self.detail {
+            "details shown".into()
+        } else {
+            "details hidden".into()
+        };
+    }
+
+    /// p: show or hide the prompt line under each row.
+    fn toggle_prompts(&mut self) {
+        self.show_prompts = !self.show_prompts;
+        self.status = if self.show_prompts {
+            "prompts shown".into()
+        } else {
+            "prompts hidden".into()
+        };
+    }
+
     /// Item drawn at screen row `y`, if the list covers it.
     fn item_at(&self, y: u16) -> Option<usize> {
         let row = y.checked_sub(self.list_top)? as usize;
@@ -760,6 +806,14 @@ impl App {
             self.sel = pos;
             self.header_park = None;
         }
+    }
+
+    /// The clickable label at these coordinates, if any.
+    fn hotspot_at(&self, x: u16, y: u16) -> Option<Hotspot> {
+        self.hotspots
+            .iter()
+            .find(|z| z.y == y && x >= z.x0 && x < z.x1)
+            .map(|z| z.spot)
     }
 
     /// Fold or unfold a group by key, whichever it is not already.
@@ -1286,6 +1340,78 @@ fn detail_lines(
     v
 }
 
+/// A clickable label in the header, filter bar, or footer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hotspot {
+    Search,
+    Sort,
+    Group,
+    Filter,
+    Detail,
+    Prompts,
+    Help,
+    Open,
+    Quit,
+}
+
+/// Where a clickable label was drawn: row `y`, columns `x0..x1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HotZone {
+    y: u16,
+    x0: u16,
+    x1: u16,
+    spot: Hotspot,
+}
+
+/// Builds a one-line bar while remembering where its clickable labels
+/// landed, so a click can be matched to the text actually drawn instead of
+/// to hardcoded columns that drift whenever the line changes.
+struct Bar {
+    spans: Vec<Span<'static>>,
+    zones: Vec<HotZone>,
+    x: u16,
+}
+
+impl Bar {
+    fn new() -> Bar {
+        Bar {
+            spans: Vec::new(),
+            zones: Vec::new(),
+            x: 0,
+        }
+    }
+
+    fn push(&mut self, span: Span<'static>) {
+        self.x += span.width() as u16;
+        self.spans.push(span);
+    }
+
+    fn extend(&mut self, spans: impl IntoIterator<Item = Span<'static>>) {
+        for s in spans {
+            self.push(s);
+        }
+    }
+
+    /// Push spans that together form one click target, e.g. `sort:` and its
+    /// value: clicking either half cycles the sort.
+    fn hot(&mut self, spot: Hotspot, spans: impl IntoIterator<Item = Span<'static>>) {
+        let x0 = self.x;
+        self.extend(spans);
+        self.zones.push(HotZone {
+            y: 0,
+            x0,
+            x1: self.x,
+            spot,
+        });
+    }
+
+    /// Finish the bar, stamping the row its zones were drawn on.
+    fn finish(self, y: u16) -> (Line<'static>, Vec<HotZone>) {
+        let zones = self.zones.into_iter().map(|z| HotZone { y, ..z }).collect();
+        (Line::from(self.spans), zones)
+    }
+}
+
 fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) {
     let area = f.area();
     let [header, filterbar, body, footer] = Layout::vertical([
@@ -1345,24 +1471,34 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
             Style::default().fg(Color::Cyan),
         ));
     }
-    header_spans.extend([
-        Span::styled(" · ", dim),
-        Span::styled("sort:", dim),
-        Span::raw(app.sort.label()),
-        Span::styled(" · ", dim),
-        Span::styled("group:", dim),
-        Span::raw(app.group.label()),
-        Span::styled(" · ", dim),
-        Span::styled("filter:", dim),
-        Span::styled(
-            app.view_filter.label(),
-            if app.view_filter == ViewFilter::All {
-                dim
-            } else {
-                Style::default().fg(Color::Cyan)
-            },
-        ),
-    ]);
+    let mut bar = Bar::new();
+    bar.extend(header_spans);
+    bar.push(Span::styled(" · ", dim));
+    bar.hot(
+        Hotspot::Sort,
+        [Span::styled("sort:", dim), Span::raw(app.sort.label())],
+    );
+    bar.push(Span::styled(" · ", dim));
+    bar.hot(
+        Hotspot::Group,
+        [Span::styled("group:", dim), Span::raw(app.group.label())],
+    );
+    bar.push(Span::styled(" · ", dim));
+    bar.hot(
+        Hotspot::Filter,
+        [
+            Span::styled("filter:", dim),
+            Span::styled(
+                app.view_filter.label(),
+                if app.view_filter == ViewFilter::All {
+                    dim
+                } else {
+                    Style::default().fg(Color::Cyan)
+                },
+            ),
+        ],
+    );
+    let mut header_spans: Vec<Span<'static>> = Vec::new();
     if let Some(p) = &app.cwd_scope {
         let name = p
             .file_name()
@@ -1401,8 +1537,18 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
             Style::default().fg(Color::Red),
         ));
     }
-    f.render_widget(Paragraph::new(Line::from(header_spans)), header);
+    bar.extend(header_spans);
+    let (header_line, header_zones) = bar.finish(header.y);
+    app.hotspots = header_zones;
+    f.render_widget(Paragraph::new(header_line), header);
 
+    // The whole filter row is a search target, not just the hint text.
+    app.hotspots.push(HotZone {
+        y: filterbar.y,
+        x0: 0,
+        x1: filterbar.width,
+        spot: Hotspot::Search,
+    });
     if !app.search_focus && app.filter.is_empty() {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -1508,17 +1654,40 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
         f.render_widget(help, area);
     }
 
-    let mut footer_spans = vec![Span::styled(
-        " / to search · ? keys · enter=open · q quit",
-        Style::default().fg(Color::DarkGray),
-    )];
+    // Every hint here is clickable, and toggles show their state so the
+    // footer doubles as an indicator for panes that are off.
+    let on = Style::default().fg(Color::Cyan);
+    let mut foot = Bar::new();
+    foot.push(Span::raw(" "));
+    foot.hot(Hotspot::Search, [Span::styled("/ search", dim)]);
+    foot.push(Span::styled(" · ", dim));
+    foot.hot(
+        Hotspot::Detail,
+        [Span::styled("d details", if app.detail { on } else { dim })],
+    );
+    foot.push(Span::styled(" · ", dim));
+    foot.hot(
+        Hotspot::Prompts,
+        [Span::styled(
+            "p prompts",
+            if app.show_prompts { on } else { dim },
+        )],
+    );
+    foot.push(Span::styled(" · ", dim));
+    foot.hot(Hotspot::Help, [Span::styled("? keys", dim)]);
+    foot.push(Span::styled(" · ", dim));
+    foot.hot(Hotspot::Open, [Span::styled("enter=open", dim)]);
+    foot.push(Span::styled(" · ", dim));
+    foot.hot(Hotspot::Quit, [Span::styled("q quit", dim)]);
     if !app.status.is_empty() {
-        footer_spans.push(Span::styled(
+        foot.push(Span::styled(
             format!("  {}", app.status),
             Style::default().fg(Color::Yellow),
         ));
     }
-    f.render_widget(Paragraph::new(Line::from(footer_spans)), footer);
+    let (footer_line, footer_zones) = foot.finish(footer.y);
+    app.hotspots.extend(footer_zones);
+    f.render_widget(Paragraph::new(footer_line), footer);
 }
 
 /// Which item is drawn on each visible screen row.
@@ -1569,6 +1738,27 @@ pub(crate) fn handle_mouse(
         MouseEventKind::ScrollDown => app.move_sel(SCROLL_ROWS),
         MouseEventKind::ScrollUp => app.move_sel(-SCROLL_ROWS),
         MouseEventKind::Down(MouseButton::Left) => {
+            // Chrome first: the header, filter row, and footer sit outside
+            // the list, so these never compete with row clicks.
+            if let Some(spot) = app.hotspot_at(ev.column, ev.row) {
+                app.last_click = None;
+                match spot {
+                    Hotspot::Search => app.search_focus = true,
+                    Hotspot::Sort => app.cycle_sort(),
+                    Hotspot::Group => app.cycle_group(),
+                    Hotspot::Filter => app.cycle_filter(),
+                    Hotspot::Detail => app.toggle_detail(),
+                    Hotspot::Prompts => app.toggle_prompts(),
+                    Hotspot::Help => app.show_help = !app.show_help,
+                    Hotspot::Open => {
+                        if let Some(action) = app.open_selected() {
+                            return KeyOutcome::Open(action);
+                        }
+                    }
+                    Hotspot::Quit => return KeyOutcome::Quit,
+                }
+                return KeyOutcome::Continue;
+            }
             let Some(item) = app.item_at(ev.row).and_then(|i| items.get(i)) else {
                 app.last_click = None;
                 return KeyOutcome::Continue;
@@ -1655,23 +1845,16 @@ pub(crate) fn handle_key(
         (KeyCode::Home, _) => app.sel = 0,
         (KeyCode::End, _) => app.sel = app.order.len().saturating_sub(1),
         (KeyCode::Tab, _) => {
-            app.group = app.group.next();
-            app.header_park = None;
+            app.cycle_group();
         }
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-            app.sort = app.sort.next();
-            app.apply_filter_sort();
+            app.cycle_sort();
         }
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-            app.detail = !app.detail;
+            app.toggle_detail();
         }
         (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-            app.show_prompts = !app.show_prompts;
-            app.status = if app.show_prompts {
-                "prompts shown".into()
-            } else {
-                "prompts hidden".into()
-            };
+            app.toggle_prompts();
         }
         (KeyCode::Enter, _) => {
             let header_key = selected
@@ -1712,33 +1895,11 @@ pub(crate) fn handle_key(
         },
         (KeyCode::Char('q'), _) => return KeyOutcome::Quit,
         (KeyCode::Char('?'), _) => app.show_help = !app.show_help,
-        (KeyCode::Char('f'), _) => {
-            app.view_filter = app.view_filter.next();
-            app.apply_filter_sort();
-            app.status = format!("filter:{}", app.view_filter.label());
-        }
-        (KeyCode::Char('g'), _) => {
-            app.group = app.group.next();
-            // parked headers belong to the old grouping
-            app.header_park = None;
-            app.status = format!("group:{}", app.group.label());
-        }
-        (KeyCode::Char('s'), _) => {
-            app.sort = app.sort.next();
-            app.apply_filter_sort();
-            app.status = format!("sort:{}", app.sort.label());
-        }
-        (KeyCode::Char('d'), _) => {
-            app.detail = !app.detail;
-        }
-        (KeyCode::Char('p'), _) => {
-            app.show_prompts = !app.show_prompts;
-            app.status = if app.show_prompts {
-                "prompts shown".into()
-            } else {
-                "prompts hidden".into()
-            };
-        }
+        (KeyCode::Char('f'), _) => app.cycle_filter(),
+        (KeyCode::Char('g'), _) => app.cycle_group(),
+        (KeyCode::Char('s'), _) => app.cycle_sort(),
+        (KeyCode::Char('d'), _) => app.toggle_detail(),
+        (KeyCode::Char('p'), _) => app.toggle_prompts(),
         (KeyCode::Char('J'), _) => app.move_group(1),
         (KeyCode::Char('K'), _) => app.move_group(-1),
         (KeyCode::Char('j'), KeyModifiers::SHIFT) => app.move_group(1),
@@ -1910,11 +2071,18 @@ pub fn run(app: &mut App, force_first: bool) -> Result<Option<OpenAction>> {
                     }
                 }
                 Event::Mouse(me) => {
-                    if let KeyOutcome::Open(a) =
-                        handle_mouse(app, me, &items, std::time::Instant::now())
-                    {
-                        result = Some(a);
-                        break;
+                    // Same outcomes as a keypress: a click on `q quit` has
+                    // to be able to end the loop, not just be computed.
+                    match handle_mouse(app, me, &items, std::time::Instant::now()) {
+                        KeyOutcome::Continue => {}
+                        KeyOutcome::Refresh(full) => {
+                            refresh_queued = Some(refresh_queued.unwrap_or(false) || full);
+                        }
+                        KeyOutcome::Open(a) => {
+                            result = Some(a);
+                            break;
+                        }
+                        KeyOutcome::Quit => break,
                     }
                 }
                 _ => {}
@@ -2152,6 +2320,7 @@ mod tests {
             pending_sel: None,
             recent_cache: None,
             row_map: Vec::new(),
+            hotspots: Vec::new(),
             list_top: 0,
             last_click: None,
             collapsed: HashSet::new(),
@@ -2168,9 +2337,13 @@ mod tests {
     }
 
     fn click(row: u16) -> MouseEvent {
+        click_at(4, row)
+    }
+
+    fn click_at(column: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: 4,
+            column,
             row,
             modifiers: KeyModifiers::NONE,
         }
@@ -2193,6 +2366,142 @@ mod tests {
             0,
             height,
         );
+    }
+
+    fn zone(app: &mut App, spot: Hotspot, y: u16, x0: u16, x1: u16) {
+        app.hotspots.push(HotZone { y, x0, x1, spot });
+    }
+
+    #[test]
+    fn bar_records_where_each_label_lands() {
+        let mut bar = Bar::new();
+        bar.push(Span::raw(" psst "));
+        bar.hot(Hotspot::Sort, [Span::raw("sort:"), Span::raw("activity")]);
+        bar.push(Span::raw(" · "));
+        bar.hot(Hotspot::Quit, [Span::raw("q quit")]);
+        let (line, zones) = bar.finish(7);
+        assert_eq!(line.width(), 6 + 13 + 3 + 6);
+        // Both halves of "sort:activity" are one target, and the zone ends
+        // where the separator begins.
+        assert_eq!(
+            zones[0],
+            HotZone {
+                y: 7,
+                x0: 6,
+                x1: 19,
+                spot: Hotspot::Sort
+            }
+        );
+        assert_eq!(
+            zones[1],
+            HotZone {
+                y: 7,
+                x0: 22,
+                x1: 28,
+                spot: Hotspot::Quit
+            }
+        );
+    }
+
+    #[test]
+    fn hotspot_lookup_respects_edges() {
+        let mut app = fold_app();
+        zone(&mut app, Hotspot::Sort, 0, 6, 19);
+        assert_eq!(
+            app.hotspot_at(6, 0),
+            Some(Hotspot::Sort),
+            "first column hits"
+        );
+        assert_eq!(
+            app.hotspot_at(18, 0),
+            Some(Hotspot::Sort),
+            "last column hits"
+        );
+        assert_eq!(app.hotspot_at(19, 0), None, "one past the end misses");
+        assert_eq!(app.hotspot_at(5, 0), None);
+        assert_eq!(app.hotspot_at(10, 1), None, "wrong row misses");
+    }
+
+    #[test]
+    fn clicking_the_header_cycles_sort_group_and_filter() {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        let items = app.build_items(100);
+        zone(&mut app, Hotspot::Sort, 0, 0, 10);
+        zone(&mut app, Hotspot::Group, 0, 10, 20);
+        zone(&mut app, Hotspot::Filter, 0, 20, 30);
+        let (sort0, group0, filter0) = (app.sort, app.group, app.view_filter);
+        handle_mouse(&mut app, click_at(2, 0), &items, Instant::now());
+        assert_ne!(app.sort, sort0, "clicking sort: cycles it");
+        handle_mouse(&mut app, click_at(12, 0), &items, Instant::now());
+        assert_ne!(app.group, group0);
+        handle_mouse(&mut app, click_at(22, 0), &items, Instant::now());
+        assert_ne!(app.view_filter, filter0);
+    }
+
+    #[test]
+    fn clicking_the_footer_toggles_panes_and_quits() {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        let items = app.build_items(100);
+        zone(&mut app, Hotspot::Detail, 9, 0, 10);
+        zone(&mut app, Hotspot::Prompts, 9, 10, 20);
+        zone(&mut app, Hotspot::Search, 9, 20, 30);
+        zone(&mut app, Hotspot::Quit, 9, 30, 40);
+
+        assert!(!app.detail);
+        handle_mouse(&mut app, click_at(2, 9), &items, Instant::now());
+        assert!(
+            app.detail,
+            "the detail pane can be opened without knowing d"
+        );
+        handle_mouse(&mut app, click_at(2, 9), &items, Instant::now());
+        assert!(!app.detail, "and closed again");
+
+        handle_mouse(&mut app, click_at(12, 9), &items, Instant::now());
+        assert!(app.show_prompts);
+
+        handle_mouse(&mut app, click_at(22, 9), &items, Instant::now());
+        assert!(app.search_focus, "clicking the search hint focuses it");
+
+        assert_eq!(
+            handle_mouse(&mut app, click_at(32, 9), &items, Instant::now()),
+            KeyOutcome::Quit
+        );
+    }
+
+    #[test]
+    fn chrome_clicks_never_land_on_a_row() {
+        // The footer sits below the list, but a stale row_map could still
+        // claim that row; the hotspot must win and the selection stay put.
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        let items = app.build_items(100);
+        lay_out(&mut app, &items, 0, 20);
+        app.sel = 1;
+        zone(&mut app, Hotspot::Detail, 3, 0, 10);
+        handle_mouse(&mut app, click_at(2, 3), &items, Instant::now());
+        assert!(app.detail);
+        assert_eq!(app.sel, 1, "the row under the hotspot was not selected");
+    }
+
+    #[test]
+    fn a_double_click_on_a_label_is_just_two_clicks() {
+        // Otherwise the second press of a fast toggle would open a session.
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        let items = app.build_items(100);
+        zone(&mut app, Hotspot::Detail, 9, 0, 10);
+        let t0 = Instant::now();
+        handle_mouse(&mut app, click_at(2, 9), &items, t0);
+        let out = handle_mouse(
+            &mut app,
+            click_at(2, 9),
+            &items,
+            t0 + Duration::from_millis(50),
+        );
+        assert_eq!(out, KeyOutcome::Continue);
+        assert!(!app.detail, "two clicks toggled it on and back off");
     }
 
     #[test]
