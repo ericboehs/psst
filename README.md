@@ -73,7 +73,9 @@ working with the last mirror + local sessions.
 | `Esc` | clear filter (quit if empty) |
 | `q` | quit |
 
-Local running detection ticks every 1s; the session archive rescans every
+Local running detection ticks every 1s (~40ms: process cwds are cached for
+30s, since re-reading them every second dominated the tick); the session
+archive rescans every
 10s. The first frame is drawn entirely from the cache — local sessions plus
 the host mirrors — so it lands in ~0.15s and already lists every host; only
 remote *running* state waits for the background worker. Remote hosts sync +

@@ -18,6 +18,8 @@ use crate::scan::{SessionKey, SessionMeta, LOCAL_HOST};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TmuxTarget {
@@ -305,7 +307,6 @@ fn resolve_tmux(
     panes.get(&pid).cloned()
 }
 
-/// Snapshot local running pi processes, their cwds, and tmux targets.
 /// Capture a command's stdout, or empty on any failure.
 fn run_out(cmd: &str, args: &[&str]) -> String {
     std::process::Command::new(cmd)
@@ -412,6 +413,60 @@ pub(crate) fn parse_ps_env_panes(out: &str) -> HashMap<u32, String> {
     map
 }
 
+/// A cwd reading and when it was taken.
+#[derive(Clone, Debug)]
+struct CwdEntry {
+    started_at: i64,
+    cwd: PathBuf,
+    probed_at: Instant,
+}
+
+/// How long a cached cwd is trusted before it is read again.
+///
+/// A pi process is not pinned to one directory: cross-spawn chdirs into a
+/// tool's cwd to resolve the command and chdirs back in a `finally`, so a
+/// probe landing inside that window reads a directory the session is not
+/// really in. Today a bad sample disappears on the next tick. Caching
+/// forever would freeze it in place instead, so entries expire: the 1s tick
+/// stops paying for `lsof`, and a wrong reading still corrects itself.
+const CWD_TTL: Duration = Duration::from_secs(30);
+
+/// Start times are derived from `ps` elapsed time, which has 1s granularity,
+/// so the computed value jitters by a second between samples. Anything
+/// larger means the pid was recycled onto a different process.
+const START_JITTER: i64 = 2;
+
+fn cwd_cache() -> &'static Mutex<HashMap<u32, CwdEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<u32, CwdEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Split `procs` (pid + start time) into cwds the cache can answer and pids
+/// that still need probing. Pure so the expiry rules can be tested without
+/// forking anything.
+fn cwd_plan(
+    cache: &HashMap<u32, CwdEntry>,
+    procs: &[(u32, i64)],
+    now: Instant,
+    ttl: Duration,
+) -> (HashMap<u32, PathBuf>, Vec<u32>) {
+    let mut known = HashMap::new();
+    let mut probe = Vec::new();
+    for &(pid, started_at) in procs {
+        match cache.get(&pid) {
+            Some(e)
+                if (e.started_at - started_at).abs() <= START_JITTER
+                    && now.saturating_duration_since(e.probed_at) < ttl =>
+            {
+                known.insert(pid, e.cwd.clone());
+            }
+            _ => probe.push(pid),
+        }
+    }
+    (known, probe)
+}
+
+/// Snapshot local running pi processes, their cwds, and tmux targets.
 pub fn detect() -> Vec<PiProc> {
     // These three probes do not depend on each other and each costs a
     // fork+exec of tens of ms, which the 1s tick pays in full. Run them
@@ -445,11 +500,12 @@ pub fn detect() -> Vec<PiProc> {
     let cpu_map = parse_ps_cpu(&cpu_out);
 
     let mut procs = Vec::new();
-    let pi_pids: Vec<u32> = table
+    let pi_procs: Vec<(u32, i64)> = table
         .iter()
         .filter(|(_, (_, cmd, _))| looks_like_pi(cmd))
-        .map(|(pid, _)| *pid)
+        .map(|(pid, (_, _, started_at))| (*pid, started_at.unwrap_or(0)))
         .collect();
+    let pi_pids: Vec<u32> = pi_procs.iter().map(|(pid, _)| *pid).collect();
     // The parent-chain walk places anything launched inside tmux, which is
     // nearly everything; only the leftovers justify the environment probe.
     let needs_env: Vec<u32> = pi_pids
@@ -460,11 +516,33 @@ pub fn detect() -> Vec<PiProc> {
             resolve_tmux(*pid, ppid, &table, &panes, &panes_by_id, None).is_none()
         })
         .collect();
-    let (cwds, env_panes) = std::thread::scope(|s| {
-        let c = s.spawn(|| local_cwds(&pi_pids));
+    let (mut cwds, to_probe) = {
+        let cache = cwd_cache().lock().unwrap_or_else(|e| e.into_inner());
+        cwd_plan(&cache, &pi_procs, Instant::now(), CWD_TTL)
+    };
+    let (fresh, env_panes) = std::thread::scope(|s| {
+        let c = s.spawn(|| local_cwds(&to_probe));
         let e = s.spawn(|| local_panes(&needs_env));
         (c.join().unwrap_or_default(), e.join().unwrap_or_default())
     });
+    {
+        let mut cache = cwd_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let starts: HashMap<u32, i64> = pi_procs.iter().copied().collect();
+        for (pid, cwd) in &fresh {
+            cache.insert(
+                *pid,
+                CwdEntry {
+                    started_at: starts.get(pid).copied().unwrap_or(0),
+                    cwd: cwd.clone(),
+                    probed_at: now,
+                },
+            );
+        }
+        // Exited agents must not accumulate for the life of the TUI.
+        cache.retain(|pid, _| starts.contains_key(pid));
+    }
+    cwds.extend(fresh);
     for (pid, (ppid, cmd, started_at)) in &table {
         if !looks_like_pi(cmd) {
             continue;
@@ -1377,6 +1455,77 @@ mod tests {
         h.status = None;
         h.cpu = CPU_WORKING_PCT - 0.1;
         assert_eq!(live_mark(Some(&h)), LiveMark::Waiting);
+    }
+
+    fn entry(started_at: i64, cwd: &str, age: Duration) -> CwdEntry {
+        CwdEntry {
+            started_at,
+            cwd: PathBuf::from(cwd),
+            probed_at: Instant::now().checked_sub(age).expect("clock too young"),
+        }
+    }
+
+    #[test]
+    fn cwd_cache_serves_fresh_entries_and_probes_the_rest() {
+        let mut cache = HashMap::new();
+        cache.insert(10, entry(100, "/a", Duration::from_secs(1)));
+        let (known, probe) = cwd_plan(
+            &cache,
+            &[(10, 100), (11, 200)],
+            Instant::now(),
+            Duration::from_secs(30),
+        );
+        assert_eq!(known[&10], PathBuf::from("/a"));
+        assert_eq!(probe, vec![11], "unknown pid must be probed");
+    }
+
+    #[test]
+    fn cwd_cache_expires_so_a_bad_sample_cannot_stick() {
+        // pi chdirs transiently while spawning tools, so a reading taken in
+        // that window is wrong; it must not outlive the TTL.
+        let mut cache = HashMap::new();
+        cache.insert(10, entry(100, "/wrong", Duration::from_secs(31)));
+        let (known, probe) = cwd_plan(
+            &cache,
+            &[(10, 100)],
+            Instant::now(),
+            Duration::from_secs(30),
+        );
+        assert!(known.is_empty());
+        assert_eq!(probe, vec![10]);
+    }
+
+    #[test]
+    fn cwd_cache_survives_start_time_jitter() {
+        // ps elapsed time is whole seconds, so a start time computed as
+        // now - etime wobbles by one between ticks. That is the same
+        // process, not a recycled pid, and must stay a cache hit.
+        let mut cache = HashMap::new();
+        cache.insert(10, entry(100, "/a", Duration::from_secs(1)));
+        let (known, probe) = cwd_plan(
+            &cache,
+            &[(10, 101)],
+            Instant::now(),
+            Duration::from_secs(30),
+        );
+        assert_eq!(known[&10], PathBuf::from("/a"));
+        assert!(probe.is_empty());
+    }
+
+    #[test]
+    fn cwd_cache_rejects_a_recycled_pid() {
+        // Same pid, started much later: a different process that must not
+        // inherit the dead one's directory.
+        let mut cache = HashMap::new();
+        cache.insert(10, entry(100, "/old", Duration::from_secs(1)));
+        let (known, probe) = cwd_plan(
+            &cache,
+            &[(10, 9000)],
+            Instant::now(),
+            Duration::from_secs(30),
+        );
+        assert!(known.is_empty(), "recycled pid must not reuse /old");
+        assert_eq!(probe, vec![10]);
     }
 
     #[test]
