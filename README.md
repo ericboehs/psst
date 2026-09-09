@@ -78,14 +78,17 @@ working with the last mirror + local sessions.
 | wheel | scroll the selection (3 rows per notch) |
 | click | select a row; on a group header, fold or unfold it |
 | double-click | open, same as `Enter` |
+| right-click a row | show details for it; the same row again hides them, another row keeps the pane up |
 | click `sort:` / `group:` / `filter:` in the header | cycle that setting |
 | click the search row (or `/ search`) | focus search |
 | click `d details` / `p prompts` in the footer | toggle that pane; the label lights up while it is on |
 | click `? keys` / `enter=open` / `q quit` | as labelled |
 
 Capturing the mouse takes over the terminal's own drag-to-select, so hold
-Shift to select and copy text as usual (Ghostty, iTerm2, xterm). Set
-`[ui] mouse = false` to leave the mouse entirely to the terminal.
+Shift to select and copy text as usual (Ghostty, iTerm2, xterm). Right-click
+goes to psst too, so the terminal's context menu will not appear while psst
+is focused. Set `[ui] mouse = false` to leave the mouse entirely to the
+terminal.
 
 Local running detection ticks every 1s (~40ms: process cwds are cached for
 30s, since re-reading them every second dominated the tick); the session

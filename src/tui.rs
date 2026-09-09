@@ -1786,6 +1786,26 @@ pub(crate) fn handle_mouse(
                 }
             }
         }
+        MouseEventKind::Down(MouseButton::Right) => {
+            // Inspect a row without committing to the pane: right-click
+            // shows details for whatever you point at, and the same row
+            // again hides them. Pointing at a different row keeps the pane
+            // up, so you can walk the list reading as you go.
+            let Some(item) = app.item_at(ev.row).and_then(|i| items.get(i)) else {
+                return KeyOutcome::Continue;
+            };
+            if let Some(idx) = item.session {
+                let same_row = app.order.get(app.sel).copied() == Some(idx);
+                if same_row && app.detail {
+                    app.toggle_detail();
+                } else {
+                    app.select_session(idx);
+                    if !app.detail {
+                        app.toggle_detail();
+                    }
+                }
+            }
+        }
         _ => {}
     }
     KeyOutcome::Continue
@@ -2222,6 +2242,10 @@ fn help_lines() -> Vec<Line<'static>> {
         row("esc", "clear filter / close / quit"),
         row("q", "quit"),
         Line::from(""),
+        row("mouse", "click selects, double-click opens"),
+        row("", "right-click a row for details"),
+        row("", "header and footer labels are clickable"),
+        Line::from(""),
         Line::from(Span::styled(
             "  ? / esc closes",
             Style::default().fg(Color::DarkGray),
@@ -2370,6 +2394,105 @@ mod tests {
 
     fn zone(app: &mut App, spot: Hotspot, y: u16, x0: u16, x1: u16) {
         app.hotspots.push(HotZone { y, x0, x1, spot });
+    }
+
+    fn right_click(row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 4,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Screen rows of the first two session rows, and the sessions on them.
+    fn two_rows(app: &mut App) -> (Vec<Item>, Vec<(u16, usize)>) {
+        app.apply_filter_sort();
+        let items = app.build_items(100);
+        let rows: Vec<(u16, usize)> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| it.session.map(|s| (i as u16, s)))
+            .take(2)
+            .collect();
+        (items, rows)
+    }
+
+    #[test]
+    fn right_click_shows_details_for_that_row() {
+        let mut app = fold_app();
+        let (items, rows) = two_rows(&mut app);
+        lay_out(&mut app, &items, 0, 20);
+        assert!(!app.detail);
+        handle_mouse(&mut app, right_click(rows[1].0), &items, Instant::now());
+        assert!(app.detail, "the pane opens");
+        assert_eq!(
+            app.order[app.sel], rows[1].1,
+            "and selects what was pointed at"
+        );
+    }
+
+    #[test]
+    fn right_click_on_the_same_row_hides_them_again() {
+        let mut app = fold_app();
+        let (items, rows) = two_rows(&mut app);
+        lay_out(&mut app, &items, 0, 20);
+        handle_mouse(&mut app, right_click(rows[0].0), &items, Instant::now());
+        handle_mouse(&mut app, right_click(rows[0].0), &items, Instant::now());
+        assert!(!app.detail, "same row is a toggle");
+    }
+
+    #[test]
+    fn right_click_along_the_list_keeps_the_pane_up() {
+        // Walking rows should read as browsing, not flicker the pane on and
+        // off, so only a repeat of the same row closes it.
+        let mut app = fold_app();
+        let (items, rows) = two_rows(&mut app);
+        lay_out(&mut app, &items, 0, 20);
+        handle_mouse(&mut app, right_click(rows[0].0), &items, Instant::now());
+        handle_mouse(&mut app, right_click(rows[1].0), &items, Instant::now());
+        assert!(app.detail, "moving to another row leaves it open");
+        assert_eq!(app.order[app.sel], rows[1].1);
+    }
+
+    #[test]
+    fn right_click_never_opens_a_session() {
+        let mut app = fold_app();
+        let (items, rows) = two_rows(&mut app);
+        lay_out(&mut app, &items, 0, 20);
+        let t0 = Instant::now();
+        let a = handle_mouse(&mut app, right_click(rows[0].0), &items, t0);
+        let b = handle_mouse(
+            &mut app,
+            right_click(rows[0].0),
+            &items,
+            t0 + Duration::from_millis(50),
+        );
+        assert_eq!((a, b), (KeyOutcome::Continue, KeyOutcome::Continue));
+    }
+
+    #[test]
+    fn right_click_on_a_header_does_nothing() {
+        // Headers have no details to show, and folding on right-click would
+        // duplicate the left-click gesture.
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        let items = app.build_items(100);
+        lay_out(&mut app, &items, 0, 20);
+        let (row, key) = items
+            .iter()
+            .enumerate()
+            .find_map(|(i, it)| {
+                it.session
+                    .is_none()
+                    .then(|| it.group_key.clone())
+                    .flatten()
+                    .map(|k| (i as u16, k))
+            })
+            .expect("a header row");
+        handle_mouse(&mut app, right_click(row), &items, Instant::now());
+        assert!(!app.detail);
+        assert!(!app.collapsed.contains(&key));
     }
 
     #[test]
