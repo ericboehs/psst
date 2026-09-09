@@ -12,7 +12,11 @@ use crate::scan::{
 use anyhow::Result;
 use chrono::Timelike;
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    crossterm::event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
+    crossterm::execute,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -216,6 +220,13 @@ pub struct App {
     /// Detail pane messages: (host-qualified key, mtime, turns). Recomputed
     /// when the selection moves or the file grows.
     recent_cache: Option<(SessionKey, i64, Vec<(String, String)>)>,
+    /// Screen row (offset from `list_top`) to item index, as of the last
+    /// frame drawn. Clicks are resolved against this.
+    row_map: Vec<Option<usize>>,
+    list_top: u16,
+    /// Row and time of the last left click. Terminals report presses, not
+    /// double clicks, so the pairing is done here.
+    last_click: Option<(u16, std::time::Instant)>,
 }
 
 /// One rendered row: a session (index into `sessions`) or a group header.
@@ -337,6 +348,9 @@ impl App {
             cwd_scope,
             pending_sel: None,
             recent_cache: None,
+            row_map: Vec::new(),
+            list_top: 0,
+            last_click: None,
             collapsed: HashSet::new(),
             header_park: None,
             show_help: false,
@@ -731,6 +745,30 @@ impl App {
                     .date_naive();
                 day_label(date, today)
             }
+        }
+    }
+
+    /// Item drawn at screen row `y`, if the list covers it.
+    fn item_at(&self, y: u16) -> Option<usize> {
+        let row = y.checked_sub(self.list_top)? as usize;
+        self.row_map.get(row).copied().flatten()
+    }
+
+    /// Move the selection onto session `idx` (an index into `sessions`).
+    fn select_session(&mut self, idx: usize) {
+        if let Some(pos) = self.order.iter().position(|&i| i == idx) {
+            self.sel = pos;
+            self.header_park = None;
+        }
+    }
+
+    /// Fold or unfold a group by key, whichever it is not already.
+    fn toggle_group(&mut self, key: &str) {
+        if !self.collapsed.remove(key) {
+            self.collapsed.insert(key.to_string());
+            // Park so the selection stays somewhere visible: it may have
+            // been on a row inside the group that just folded away.
+            self.header_park = Some(key.to_string());
         }
     }
 
@@ -1423,7 +1461,7 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
         .collect();
     let list = List::new(list_items).block(Block::new());
 
-    if app.detail {
+    let list_area = if app.detail {
         let [list_area, detail_area] =
             Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
         f.render_stateful_widget(list, list_area, list_state);
@@ -1441,9 +1479,21 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
                 );
             f.render_widget(detail, detail_area);
         }
+        list_area
     } else {
         f.render_stateful_widget(list, body, list_state);
-    }
+        body
+    };
+    // Record where each item landed. The widget decides the scroll offset
+    // while rendering, and rows are not a fixed height (prompts add a
+    // second line), so clicks are resolved against what was actually drawn
+    // rather than recomputed geometry.
+    app.list_top = list_area.y;
+    app.row_map = row_map(
+        &items.iter().map(|it| it.lines.len()).collect::<Vec<_>>(),
+        list_state.offset(),
+        list_area.height,
+    );
 
     if app.show_help {
         let lines = help_lines();
@@ -1469,6 +1519,86 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
         ));
     }
     f.render_widget(Paragraph::new(Line::from(footer_spans)), footer);
+}
+
+/// Which item is drawn on each visible screen row.
+///
+/// Items start at `offset` and fill downward; an item taller than the
+/// remaining space is clipped, so only the rows actually painted are
+/// mapped. Pure so click targeting can be tested without a terminal.
+fn row_map(heights: &[usize], offset: usize, height: u16) -> Vec<Option<usize>> {
+    let mut map = vec![None; height as usize];
+    let mut y = 0usize;
+    for (idx, &h) in heights.iter().enumerate().skip(offset) {
+        if y >= map.len() {
+            break;
+        }
+        for _ in 0..h.max(1) {
+            if y >= map.len() {
+                break;
+            }
+            map[y] = Some(idx);
+            y += 1;
+        }
+    }
+    map
+}
+
+/// Presses closer together than this on the same row are a double click.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// How many rows one wheel notch moves the selection.
+const SCROLL_ROWS: i32 = 3;
+
+/// Translate a mouse event into the same outcomes as a keypress.
+pub(crate) fn handle_mouse(
+    app: &mut App,
+    ev: MouseEvent,
+    items: &[Item],
+    now: std::time::Instant,
+) -> KeyOutcome {
+    // The help overlay covers the list, so a click under it would select a
+    // row the user cannot see.
+    if app.show_help {
+        if matches!(ev.kind, MouseEventKind::Down(_)) {
+            app.show_help = false;
+        }
+        return KeyOutcome::Continue;
+    }
+    match ev.kind {
+        MouseEventKind::ScrollDown => app.move_sel(SCROLL_ROWS),
+        MouseEventKind::ScrollUp => app.move_sel(-SCROLL_ROWS),
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(item) = app.item_at(ev.row).and_then(|i| items.get(i)) else {
+                app.last_click = None;
+                return KeyOutcome::Continue;
+            };
+            match item.session {
+                Some(idx) => {
+                    let again = matches!(app.last_click, Some((row, at))
+                        if row == ev.row && now.duration_since(at) < DOUBLE_CLICK);
+                    app.select_session(idx);
+                    app.last_click = Some((ev.row, now));
+                    if again {
+                        if let Some(action) = app.open_selected() {
+                            return KeyOutcome::Open(action);
+                        }
+                    }
+                }
+                None => {
+                    if let Some(key) = item.group_key.clone() {
+                        app.toggle_group(&key);
+                    }
+                    // A header is not a double-click target: folding and
+                    // unfolding in one gesture would look like nothing
+                    // happened.
+                    app.last_click = None;
+                }
+            }
+        }
+        _ => {}
+    }
+    KeyOutcome::Continue
 }
 
 /// What the event loop should do after one keypress.
@@ -1672,6 +1802,18 @@ pub(crate) fn handle_key(
 /// frame comes from the cache either way.
 pub fn run(app: &mut App, force_first: bool) -> Result<Option<OpenAction>> {
     let mut terminal = ratatui::init();
+    let mouse = app.config.mouse();
+    if mouse {
+        let _ = execute!(std::io::stdout(), EnableMouseCapture);
+        // ratatui's panic hook restores the screen but knows nothing about
+        // mouse capture; without this a panic leaves the terminal emitting
+        // escape sequences on every click.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+            hook(info);
+        }));
+    }
     let mut list_state = ListState::default();
     let mut last_full = std::time::Instant::now();
     let mut last_running = std::time::Instant::now();
@@ -1743,33 +1885,47 @@ pub fn run(app: &mut App, force_first: bool) -> Result<Option<OpenAction>> {
         terminal.draw(|f| ui(f, app, &items, &mut list_state))?;
 
         if event::poll(std::time::Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match handle_key(app, key, &items, list_state.selected()) {
-                    KeyOutcome::Continue => {}
-                    KeyOutcome::Refresh(full) => {
-                        // Queue behind any in-flight worker; the loop spawns
-                        // it (a force refresh wins over a queued routine one).
-                        refresh_queued = Some(refresh_queued.unwrap_or(false) || full);
-                        app.status = if full {
-                            "full rescan queued".into()
-                        } else {
-                            "rescan queued".into()
-                        };
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
                     }
-                    KeyOutcome::Open(a) => {
+                    match handle_key(app, key, &items, list_state.selected()) {
+                        KeyOutcome::Continue => {}
+                        KeyOutcome::Refresh(full) => {
+                            // Queue behind any in-flight worker; the loop spawns
+                            // it (a force refresh wins over a queued routine one).
+                            refresh_queued = Some(refresh_queued.unwrap_or(false) || full);
+                            app.status = if full {
+                                "full rescan queued".into()
+                            } else {
+                                "rescan queued".into()
+                            };
+                        }
+                        KeyOutcome::Open(a) => {
+                            result = Some(a);
+                            break;
+                        }
+                        KeyOutcome::Quit => break,
+                    }
+                }
+                Event::Mouse(me) => {
+                    if let KeyOutcome::Open(a) =
+                        handle_mouse(app, me, &items, std::time::Instant::now())
+                    {
                         result = Some(a);
                         break;
                     }
-                    KeyOutcome::Quit => break,
                 }
+                _ => {}
             }
         }
     }
 
     app.save_ui_state();
+    if mouse {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    }
     ratatui::restore();
     Ok(result)
 }
@@ -1919,6 +2075,7 @@ fn day_label(date: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn day_labels() {
@@ -1994,6 +2151,9 @@ mod tests {
             cwd_scope: None,
             pending_sel: None,
             recent_cache: None,
+            row_map: Vec::new(),
+            list_top: 0,
+            last_click: None,
             collapsed: HashSet::new(),
             header_park: None,
             show_help: false,
@@ -2005,6 +2165,217 @@ mod tests {
             .iter()
             .filter(|it| it.session.is_some())
             .count()
+    }
+
+    fn click(row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 4,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Draw-time geometry the click handler reads, without a terminal.
+    fn lay_out(app: &mut App, items: &[Item], top: u16, height: u16) {
+        app.list_top = top;
+        app.row_map = row_map(
+            &items.iter().map(|it| it.lines.len()).collect::<Vec<_>>(),
+            0,
+            height,
+        );
+    }
+
+    #[test]
+    fn row_map_tracks_taller_rows_and_scrolling() {
+        // Uniform single-line rows.
+        assert_eq!(row_map(&[1, 1, 1], 0, 3), vec![Some(0), Some(1), Some(2)]);
+        // With prompts shown a session row is two lines tall, so screen row
+        // and item index diverge - the reason clicks cannot use y - top.
+        assert_eq!(
+            row_map(&[1, 2, 2], 0, 5),
+            vec![Some(0), Some(1), Some(1), Some(2), Some(2)]
+        );
+        // Scrolled: the first drawn item is the one at the offset.
+        assert_eq!(row_map(&[1, 1, 1, 1], 2, 2), vec![Some(2), Some(3)]);
+        // Past the last item the rows belong to nobody.
+        assert_eq!(row_map(&[1], 0, 3), vec![Some(0), None, None]);
+        // An item taller than the space left is clipped, not skipped.
+        assert_eq!(row_map(&[1, 3], 0, 3), vec![Some(0), Some(1), Some(1)]);
+    }
+
+    #[test]
+    fn click_selects_the_row_under_the_pointer() {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        let items = app.build_items(100);
+        lay_out(&mut app, &items, 2, 20);
+        // Find a session row and click it.
+        let (row, want) = items
+            .iter()
+            .enumerate()
+            .find_map(|(i, it)| it.session.map(|s| (i as u16 + 2, s)))
+            .expect("a session row");
+        let out = handle_mouse(&mut app, click(row), &items, Instant::now());
+        assert_eq!(out, KeyOutcome::Continue, "one click selects, never opens");
+        assert_eq!(app.order[app.sel], want);
+        assert!(
+            app.header_park.is_none(),
+            "clicking a session leaves headers"
+        );
+    }
+
+    #[test]
+    fn double_click_opens_but_two_slow_clicks_do_not() {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        let items = app.build_items(100);
+        lay_out(&mut app, &items, 0, 20);
+        let row = items
+            .iter()
+            .position(|it| it.session.is_some())
+            .expect("a session row") as u16;
+        let t0 = Instant::now();
+        handle_mouse(&mut app, click(row), &items, t0);
+        let fast = handle_mouse(
+            &mut app,
+            click(row),
+            &items,
+            t0 + Duration::from_millis(200),
+        );
+        assert!(
+            matches!(fast, KeyOutcome::Open(_)),
+            "quick second click opens"
+        );
+
+        // Same row, but too slow to be one gesture.
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        lay_out(&mut app, &items, 0, 20);
+        handle_mouse(&mut app, click(row), &items, t0);
+        let slow = handle_mouse(
+            &mut app,
+            click(row),
+            &items,
+            t0 + Duration::from_millis(900),
+        );
+        assert_eq!(slow, KeyOutcome::Continue);
+    }
+
+    #[test]
+    fn double_click_needs_the_same_row() {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        let items = app.build_items(100);
+        lay_out(&mut app, &items, 0, 20);
+        let rows: Vec<u16> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| it.session.is_some())
+            .map(|(i, _)| i as u16)
+            .collect();
+        let t0 = Instant::now();
+        handle_mouse(&mut app, click(rows[0]), &items, t0);
+        let out = handle_mouse(
+            &mut app,
+            click(rows[1]),
+            &items,
+            t0 + Duration::from_millis(50),
+        );
+        assert_eq!(
+            out,
+            KeyOutcome::Continue,
+            "moving between rows is not a double click"
+        );
+    }
+
+    #[test]
+    fn clicking_a_header_folds_and_unfolds_it() {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        let items = app.build_items(100);
+        lay_out(&mut app, &items, 0, 20);
+        let (row, key) = items
+            .iter()
+            .enumerate()
+            .find_map(|(i, it)| {
+                it.session
+                    .is_none()
+                    .then(|| it.group_key.clone())
+                    .flatten()
+                    .map(|k| (i as u16, k))
+            })
+            .expect("a header row");
+        handle_mouse(&mut app, click(row), &items, Instant::now());
+        assert!(app.collapsed.contains(&key), "first click folds");
+        // Rebuild: folding changes which items exist.
+        let items = app.build_items(100);
+        lay_out(&mut app, &items, 0, 20);
+        let row = items
+            .iter()
+            .position(|it| it.group_key.as_deref() == Some(key.as_str()) && it.session.is_none())
+            .expect("header still drawn") as u16;
+        handle_mouse(&mut app, click(row), &items, Instant::now());
+        assert!(!app.collapsed.contains(&key), "second click unfolds");
+    }
+
+    #[test]
+    fn clicks_below_the_list_are_ignored() {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        let items = app.build_items(100);
+        lay_out(&mut app, &items, 2, 20);
+        let before = app.sel;
+        // Above the list (the header bar) and past the last row.
+        handle_mouse(&mut app, click(0), &items, Instant::now());
+        handle_mouse(&mut app, click(21), &items, Instant::now());
+        assert_eq!(app.sel, before);
+    }
+
+    #[test]
+    fn wheel_moves_the_selection() {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        let items = app.build_items(100);
+        lay_out(&mut app, &items, 0, 20);
+        app.sel = 0;
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollDown),
+            &items,
+            Instant::now(),
+        );
+        let after_down = app.sel;
+        assert!(after_down > 0, "wheel down moves down the list");
+        handle_mouse(
+            &mut app,
+            wheel(MouseEventKind::ScrollUp),
+            &items,
+            Instant::now(),
+        );
+        assert!(app.sel < after_down, "wheel up moves back");
+    }
+
+    #[test]
+    fn a_click_dismisses_help_instead_of_selecting_under_it() {
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        let items = app.build_items(100);
+        lay_out(&mut app, &items, 0, 20);
+        app.show_help = true;
+        let before = app.sel;
+        handle_mouse(&mut app, click(3), &items, Instant::now());
+        assert!(!app.show_help);
+        assert_eq!(app.sel, before, "the row under the overlay is not selected");
     }
 
     #[test]

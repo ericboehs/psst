@@ -73,10 +73,20 @@ working with the last mirror + local sessions.
 | `Esc` | clear filter (quit if empty) |
 | `q` | quit |
 
+| Mouse | Action |
+| --- | --- |
+| wheel | scroll the selection (3 rows per notch) |
+| click | select a row; on a group header, fold or unfold it |
+| double-click | open, same as `Enter` |
+
+Capturing the mouse takes over the terminal's own drag-to-select, so hold
+Shift to select and copy text as usual (Ghostty, iTerm2, xterm). Set
+`[ui] mouse = false` to leave the mouse entirely to the terminal.
+
 Local running detection ticks every 1s (~40ms: process cwds are cached for
 30s, since re-reading them every second dominated the tick); the session
-archive rescans every
-10s. The first frame is drawn entirely from the cache — local sessions plus
+archive rescans every 10s. The first frame is drawn entirely from the cache
+— local sessions plus
 the host mirrors — so it lands in ~0.15s and already lists every host; only
 remote *running* state waits for the background worker. Remote hosts sync +
 detect on the 10s rescan (and `r`/`R`) only, and the rescan runs on that
@@ -170,6 +180,9 @@ active_secs = 120
 group = "day"
 # terminal whose tabs are focused when opening a remote session
 terminal = "Ghostty"
+# mouse: click to select, double-click to open, wheel to scroll.
+# false leaves the mouse to the terminal (Shift+drag selects text either way)
+mouse = true
 
 [hosts.coop]
 # ssh target as in `ssh <target>` (key-based, BatchMode — no passwords)

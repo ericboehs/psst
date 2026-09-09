@@ -17,6 +17,8 @@
 //! detail = false
 //! # terminal whose tabs are focused when opening a remote session
 //! terminal = "Ghostty"
+//! # mouse: click to select, double-click to open, wheel to scroll
+//! mouse = true
 //!
 //! [hosts.coop]
 //! # ssh target for the remote host (as in `ssh <target>`)
@@ -64,6 +66,7 @@ struct UiCfg {
     detail: Option<bool>,
     #[serde(default)]
     terminal: Option<String>,
+    mouse: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -97,6 +100,7 @@ pub struct Config {
     group: String,
     detail: bool,
     terminal: String,
+    mouse: bool,
     hosts: Vec<HostConfig>,
 }
 
@@ -108,6 +112,7 @@ impl Default for Config {
             group: "day".to_string(),
             detail: false,
             terminal: crate::focus::DEFAULT_TERMINAL.to_string(),
+            mouse: true,
             hosts: Vec::new(),
         }
     }
@@ -149,6 +154,9 @@ impl Config {
                 .filter(|t| !t.is_empty())
             {
                 cfg.terminal = t;
+            }
+            if let Some(m) = ui.mouse {
+                cfg.mouse = m;
             }
         }
         let mut names: Vec<String> = fc.hosts.keys().cloned().collect();
@@ -199,6 +207,12 @@ impl Config {
         &self.terminal
     }
 
+    /// Whether to capture mouse events. Capture takes over the terminal's
+    /// own drag-to-select, so it is worth being able to turn off.
+    pub fn mouse(&self) -> bool {
+        self.mouse
+    }
+
     /// Remote hosts from `[hosts.<name>]` tables, sorted by name.
     pub fn hosts(&self) -> &[HostConfig] {
         &self.hosts
@@ -245,6 +259,7 @@ tab = "gfe box"
     #[test]
     fn terminal_defaults_to_ghostty() {
         assert_eq!(Config::default().terminal(), "Ghostty");
+        assert!(Config::default().mouse(), "mouse is on unless disabled");
         let ui: UiCfg = toml::from_str(r#"terminal = "WezTerm""#).unwrap();
         assert_eq!(ui.terminal.as_deref(), Some("WezTerm"));
     }
