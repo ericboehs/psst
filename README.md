@@ -6,11 +6,12 @@ TUI. Built because nothing combined both halves: mining the full session
 archive *and* showing which agents are running right now.
 
 ```
-● tmux-agent-restore-work   tmux-agent…  312m  [agents:3]
-◎ psst                      psst         2s
-⎇ wiki-session-sync         dotfiles     14d
 ▾ Today  12 sessions · last 2s
-▾ ~/Code/github.com/ericboehs/dotfiles  47 sessions · last 2s
+● readme-and-help         psst           2:04p  [code:3]
+◎ dotfiles-review         dotfiles       2:01p  [future:1]
+○ ⎇ wiki-session-sync     dotfiles       1:58p
+▾ Yesterday  8 sessions · last 22h
+● getting-started         home           9:12a  [code:1] [coop]
 ```
 
 - `●` yellow = live, working (`thinking` / `tool:*` from agent-link, except the prompt tools below — or subtree CPU ≥5% when no hook status is present)
@@ -18,7 +19,8 @@ archive *and* showing which agents are running right now.
 - `●` cyan + bold title = unread (tmux `@special_activity`, not focused yet)
 - `◎` cyan = live, waiting, already looked at
 - `○` gray = not running
-- `[agents:3]` = the tmux session/window the running agent lives in
+- `[code:3]` green = the tmux session/window the running agent lives in
+- `[coop]` magenta = remote host badge
 - `⎇` = session was forked from a parent (`/fork`, `/clone`)
 
 ## Install
