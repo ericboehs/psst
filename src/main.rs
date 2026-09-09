@@ -55,7 +55,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "-h" | "--help" => {
                 println!(
                     "psst — pi session tui\n\n\
-                     usage: psst [.] [--list] [--json] [--refresh] [--debug-running]\n\n\
+                     usage: psst [.] [--list] [--json] [--refresh] [--debug-running] [--debug-focus]\n\n\
                      .                 only this project (git root, else cwd)\n\
                      --list            plain table (host column; pipe-friendly)\n\
                      --json            JSON array (implies list; adds host)\n\

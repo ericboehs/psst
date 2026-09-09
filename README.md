@@ -13,8 +13,8 @@ archive *and* showing which agents are running right now.
 ▾ ~/Code/github.com/ericboehs/dotfiles  47 sessions · last 2s
 ```
 
-- `●` yellow = live, working (`thinking` / `tool:…` from agent-link, or hot subtree CPU ≥5% on hosts without the hook)
-- `●` red + bold title = blocking prompt (`ask` / confirm / input)
+- `●` yellow = live, working (`thinking` / `tool:*` from agent-link, except the prompt tools below — or subtree CPU ≥5% when no hook status is present)
+- `●` red + bold title = blocking prompt (`tool:ask` / `tool:confirm` / `tool:input`)
 - `●` cyan + bold title = unread (tmux `@special_activity`, not focused yet)
 - `◎` cyan = live, waiting, already looked at
 - `○` gray = not running
@@ -40,12 +40,13 @@ Rust via Homebrew is the only dependency. tmux is required for opening sessions.
 
 ```bash
 psst                  # TUI (local + configured hosts)
-psst .                # TUI, only this project (git root, else cwd; remotes filtered out)
+psst .                # TUI, only this project (git root, else cwd; any dir works the same)
 psst --list           # plain table with a host column (pipe-friendly)
 psst --json           # JSON array (same rows as --list; each row has "host")
 psst --refresh        # rebuild the metadata cache from scratch (re-mirrors hosts)
 psst --debug-running  # print detected pi processes + tmux targets (local + hosts)
 psst --debug-focus    # print terminal tabs and which host each one holds
+psst --help           # usage
 ```
 
 Remote sessions carry a magenta `[coop]` badge, show up in the header as
@@ -57,21 +58,22 @@ working with the last mirror + local sessions.
 
 | Key | Action |
 |-----|--------|
-| `/` | focus search (then type anything, including `j`/`k`; Esc unfocuses). Running sessions also match `active`. |
+| `/` | focus search (then type anything, including `j`/`k`; Esc unfocuses). Running sessions also match `active`/`running` (plus `working`, `waiting`, `prompt`, …). |
 | `f` | cycle list filter: all → named → active |
 | `g` or `Tab` | cycle grouping: flat → project → day → host |
 | `s` or `Ctrl+S` | cycle sort: activity → tmux |
-| `↑`/`↓` or `k`/`j`, PgUp/PgDn | navigate rows — group headers are stops too (j/k only when search is not focused) |
-| `J` / `K` | next / previous group (day or project; no-op when flat) |
+| `↑`/`↓` or `k`/`j`, PgUp/PgDn, Home/End | navigate rows — group headers are stops too (arrows/PgUp/PgDn/Home/End work while searching; `j`/`k` type into search when focused) |
+| `J` / `K` | next / previous group (project/day/host; no-op when flat) |
 | `h` / `l` | fold / unfold the current group |
 | `H` / `L` | fold / unfold all groups |
-| `?` | shortcut overlay (also in the TUI footer) |
+| `?` | shortcut overlay, also in the TUI footer (`?`/`Esc`/`q` closes it) |
 | `Enter` | **open**: attach to the running tmux session, or spawn `pi --session <file>` in a new tmux window (on a header: toggle fold). Remote sessions focus the terminal tab already holding that host's ssh (see below) |
-| `d` | toggle the bottom detail pane (off by default) |
-| `p` | hide/show last user prompt on a second line under each row |
+| `d` or `Ctrl+D` | toggle the right-hand detail pane (off by default) |
+| `p` or `Ctrl+P` | hide/show last user prompt on a second line under each row |
 | `r` / `R` | rescan (cache-aware) / full rescan |
-| `Esc` | clear filter (quit if empty) |
-| `q` | quit |
+| `Backspace` | delete the last search-filter character (even when search is not focused) |
+| `Esc` | unfocus search, then clear filter, then quit (closes the `?` overlay first) |
+| `q` or `Ctrl+C` | quit |
 
 | Mouse | Action |
 | --- | --- |
@@ -100,14 +102,15 @@ detect on the 10s rescan (and `r`/`R`) only, and the rescan runs on that
 worker thread — keys stay live while ssh is in flight (a dim `sync…` badge
 in the header shows work is pending, and the selection is preserved across
 the swap). `psst --refresh` forces a full rebuild on that worker too, so it
-no longer delays the first frame. Filter, grouping, sort, detail, prompts,
-and the selected row are restored the next time you open psst
-(`~/.cache/psst/ui-state.json`).
+no longer delays the first frame. View filter, grouping, sort, detail, prompts, the selected row, and folded
+groups are restored the next time you open psst
+(`~/.cache/psst/ui-state.json`); search text is not.
 
-Group headers (project, day, and host modes) show session count, total cost,
-and the newest activity in the group. Day buckets use local dates; within a
+Group headers (project, day, and host modes) show session count and the
+newest activity in the group. Day buckets use local dates; within a
 group, rows keep the active sort's order. In host mode local sorts first,
-then remotes by recency.
+then remotes by recency. In day mode rows show clock time (`2:04p`);
+otherwise they show age (`312m`).
 
 ## How it works
 
@@ -118,12 +121,15 @@ then remotes by recency.
   and branch points (entries with >1 children). Respects `PI_CODING_AGENT_DIR`.
 - **Running detection** (zero-config, per design): pi appends via
   `open/write/close`, so `lsof` only catches files mid-write. Instead psst
-  matches pi-like processes (via `ps`), resolves their tmux pane from the
+  matches pi-like processes (via `ps`), resolves cwds batched via `lsof`
+  (macOS, cached 30s) or `/proc` (Linux), resolves their tmux pane from the
   inherited `TMUX_PANE` env var (falling back to a parent-chain walk to
   `pane_pid`), and pins a session file: exactly when the cmdline carries
-  `--session`; the newest session in the process cwd when it carries
-  `-c`/`--continue` (even if idle); otherwise the newest file written in that
-  cwd within the active window (default 120s). Parallel agents in one project
+  `--session` (id or path); else the session whose `created` timestamp is
+  closest to the process start within `active_secs` (default 120s, for a
+  bare `pi` that writes its header at launch); else the newest unclaimed
+  session in that cwd — no recency gate, a live pid is enough, so idle
+  agents at a prompt still pin. Parallel agents in one project
   claim distinct files (newest-first), so each maps to its own tmux window.
 - **Open**: running sessions switch/attach to their tmux target (window, not
   just session); idle sessions spawn a new tmux window (or detached session
@@ -185,6 +191,8 @@ active_secs = 120
 [ui]
 # grouping on launch: "day" (default), "project", "flat", or "host"
 group = "day"
+# show the right-hand detail pane on launch (default: false; `d` toggles)
+detail = false
 # terminal whose tabs are focused when opening a remote session
 terminal = "Ghostty"
 # mouse: click to select, double-click to open, wheel to scroll.
@@ -221,6 +229,6 @@ in pi.
 
 ## Status
 
-Prototype. Parser is unit-tested against the documented v3 format; running
-detection is heuristic and tuned for macOS + tmux 3.x (pi launched from a
-shell pane).
+Prototype. Parser is unit-tested against the documented v3 format; local
+running detection is heuristic and tuned for macOS + tmux 3.x (pi launched
+from a shell pane). Remotes support Linux and macOS (see above).
