@@ -197,7 +197,7 @@ pub struct App {
     pub sort: Sort,
     pub config: Config,
     pub status: String,
-    /// Right-hand detail pane. Off by default so the list can use full width.
+    /// Bottom detail pane. Off by default so the list can use full height.
     pub detail: bool,
     /// When false, list titles skip first-prompt text and the ▸ last-message line.
     pub show_prompts: bool,
@@ -227,9 +227,6 @@ pub struct App {
     /// last frame drawn.
     hotspots: Vec<HotZone>,
     list_top: u16,
-    /// Row and time of the last left click. Terminals report presses, not
-    /// double clicks, so the pairing is done here.
-    last_click: Option<(u16, std::time::Instant)>,
 }
 
 /// One rendered row: a session (index into `sessions`) or a group header.
@@ -296,6 +293,32 @@ fn pad(s: &str, w: usize) -> String {
     format!("{}{}", t, " ".repeat(w.saturating_sub(n)))
 }
 
+/// Clip a multi-span line to `w` columns, cutting from the right (with an
+/// ellipsis when anything was cut). Spans left of the cut keep their style.
+/// Hotspot zones computed from the uncut line stay valid for everything
+/// still visible, since only the invisible tail is removed.
+fn trunc_line(line: Line<'static>, w: usize) -> Line<'static> {
+    if line.width() <= w {
+        return line;
+    }
+    let mut used = 0usize;
+    let mut spans = Vec::new();
+    for s in line.spans {
+        let n = s.content.chars().count();
+        if used + n <= w {
+            used += n;
+            spans.push(s);
+        } else {
+            let room = w.saturating_sub(used);
+            if room > 0 {
+                spans.push(Span::styled(trunc(&s.content, room), s.style));
+            }
+            break;
+        }
+    }
+    Line::from(spans)
+}
+
 fn project_base(cwd: &str) -> String {
     let c = cwd.trim_end_matches('/');
     c.rsplit('/').next().unwrap_or(c).to_string()
@@ -354,7 +377,6 @@ impl App {
             row_map: Vec::new(),
             hotspots: Vec::new(),
             list_top: 0,
-            last_click: None,
             collapsed: HashSet::new(),
             header_park: None,
             show_help: false,
@@ -1068,11 +1090,74 @@ impl App {
         } else {
             Span::raw("  ")
         };
-        let title_w = (w / 2).max(32);
+        // Responsive columns: title and project split whatever the fixed
+        // chrome (dot, fork, gaps, age) and the trailing badges leave over.
+        // Badges and age are never clipped — on a narrow terminal the project
+        // column shrinks, then drops out entirely, then the title gives way,
+        // so `[tmux:w]` / `[host]` stay visible instead of being the first
+        // thing cut off the edge.
+        let ts = s.last_user_or_activity();
+        let age_str = if self.group == Group::Day {
+            fmt_clock(ts)
+        } else {
+            fmt_age(now() - ts)
+        };
+        let age_w = if self.group == Group::Day { 7 } else { 5 };
+        let tmux_s = hit.and_then(|h| h.tmux.as_ref()).map(|t| {
+            format!(
+                " [{}{}]",
+                t.session,
+                t.window.map(|n| format!(":{}", n)).unwrap_or_default()
+            )
+        });
+        let host_s = if s.is_local() {
+            None
+        } else {
+            Some(format!(" [{}]", s.host))
+        };
+        let trailing: usize = tmux_s
+            .as_ref()
+            .map(|t| t.chars().count())
+            .unwrap_or(0)
+            + host_s
+                .as_ref()
+                .map(|h| h.chars().count())
+                .unwrap_or(0);
+        let mut title_w = (w / 2).max(32);
+        let mut proj_w = (w / 6).max(10);
+        if 4 + title_w + 1 + proj_w + 1 + age_w + trailing > w {
+            let mut over = 4 + title_w + 1 + proj_w + 1 + age_w + trailing - w;
+            if proj_w > 6 {
+                let take = (proj_w - 6).min(over);
+                proj_w -= take;
+                over -= take;
+            }
+            if over > 0 && proj_w > 0 {
+                over = over.saturating_sub(proj_w + 1);
+                proj_w = 0;
+            }
+            if over > 0 {
+                let floor = 8.min(title_w);
+                if title_w > floor {
+                    let take = (title_w - floor).min(over);
+                    title_w -= take;
+                    over -= take;
+                }
+                title_w = title_w.saturating_sub(over);
+            }
+        }
+        let title_w = title_w;
+        let proj_w = proj_w;
         let label = display_title(s, hit);
         let named = s.name.is_some() || hit.and_then(|h| h.peer_name.as_deref()).is_some();
         let attention = matches!(mark, LiveMark::Prompt | LiveMark::Unread);
-        let title = if named || attention {
+        let title = if title_w == 0 {
+            // pad() would still emit an ellipsis for width 0; an empty
+            // title keeps the fit math exact down to the absolute minimum
+            // (chrome + age + badges). Below that ratatui safely clips the
+            // tail — no wrap, so click mapping stays aligned.
+            Span::raw("")
+        } else if named || attention {
             Span::styled(
                 pad(&label, title_w),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -1080,45 +1165,21 @@ impl App {
         } else {
             Span::raw(pad(&label, title_w))
         };
-        let proj = Span::raw(pad(&project_base(&s.cwd), (w / 6).max(10)));
-        let host_badge = if s.is_local() {
-            Span::raw("")
-        } else {
-            Span::styled(
-                format!(" [{}]", s.host),
-                Style::default().fg(Color::Magenta),
-            )
-        };
         // Don't paint age DarkGray: highlight_style keeps span fg, so DarkGray-on-DarkGray
         // made last-activity invisible on the selected row.
-        let ts = s.last_user_or_activity();
-        let age = Span::raw(if self.group == Group::Day {
-            pad(&fmt_clock(ts), 7)
-        } else {
-            pad(&fmt_age(now() - ts), 5)
-        });
-        let tmux = match hit.and_then(|h| h.tmux.as_ref()) {
-            Some(t) => Span::styled(
-                format!(
-                    " [{}{}]",
-                    t.session,
-                    t.window.map(|w| format!(":{}", w)).unwrap_or_default()
-                ),
-                Style::default().fg(Color::Green),
-            ),
-            None => Span::raw(""),
-        };
-        Line::from(vec![
-            dot,
-            fork,
-            title,
-            Span::raw(" "),
-            proj,
-            Span::raw(" "),
-            age,
-            tmux,
-            host_badge,
-        ])
+        let mut spans = vec![dot, fork, title, Span::raw(" ")];
+        if proj_w > 0 {
+            spans.push(Span::raw(pad(&project_base(&s.cwd), proj_w)));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::raw(pad(&age_str, age_w)));
+        if let Some(t) = tmux_s {
+            spans.push(Span::styled(t, Style::default().fg(Color::Green)));
+        }
+        if let Some(h) = host_s {
+            spans.push(Span::styled(h, Style::default().fg(Color::Magenta)));
+        }
+        Line::from(spans)
     }
 
     fn member_lines(&self, i: usize, w: usize) -> Vec<Line<'static>> {
@@ -1142,7 +1203,6 @@ impl App {
     }
 
     fn build_items(&self, w: usize) -> Vec<Item> {
-        let w = w.max(80);
         let mut items = Vec::new();
 
         match self.group {
@@ -1181,6 +1241,12 @@ impl App {
             members.len(),
             fmt_age(now() - newest)
         );
+        // Narrow terminals clip the label first, never the counts.
+        let header = if header.chars().count() > w {
+            trunc(&header, w)
+        } else {
+            header
+        };
         items.push(Item {
             session: None,
             lines: vec![Line::from(Span::styled(
@@ -1363,65 +1429,90 @@ pub(crate) struct HotZone {
     spot: Hotspot,
 }
 
-/// Builds a one-line bar while remembering where its clickable labels
-/// landed, so a click can be matched to the text actually drawn instead of
-/// to hardcoded columns that drift whenever the line changes.
-struct Bar {
+/// One flow unit of a status bar: spans drawn together, optionally one
+/// click target covering all of them (e.g. `sort:` plus its value).
+struct Chunk {
     spans: Vec<Span<'static>>,
-    zones: Vec<HotZone>,
-    x: u16,
+    spot: Option<Hotspot>,
 }
 
-impl Bar {
-    fn new() -> Bar {
-        Bar {
-            spans: Vec::new(),
-            zones: Vec::new(),
-            x: 0,
+impl Chunk {
+    fn plain(spans: impl IntoIterator<Item = Span<'static>>) -> Chunk {
+        Chunk {
+            spans: spans.into_iter().collect(),
+            spot: None,
         }
     }
 
-    fn push(&mut self, span: Span<'static>) {
-        self.x += span.width() as u16;
-        self.spans.push(span);
-    }
-
-    fn extend(&mut self, spans: impl IntoIterator<Item = Span<'static>>) {
-        for s in spans {
-            self.push(s);
+    fn hot(spot: Hotspot, spans: impl IntoIterator<Item = Span<'static>>) -> Chunk {
+        Chunk {
+            spans: spans.into_iter().collect(),
+            spot: Some(spot),
         }
     }
 
-    /// Push spans that together form one click target, e.g. `sort:` and its
-    /// value: clicking either half cycles the sort.
-    fn hot(&mut self, spot: Hotspot, spans: impl IntoIterator<Item = Span<'static>>) {
-        let x0 = self.x;
-        self.extend(spans);
-        self.zones.push(HotZone {
-            y: 0,
-            x0,
-            x1: self.x,
-            spot,
-        });
-    }
-
-    /// Finish the bar, stamping the row its zones were drawn on.
-    fn finish(self, y: u16) -> (Line<'static>, Vec<HotZone>) {
-        let zones = self.zones.into_iter().map(|z| HotZone { y, ..z }).collect();
-        (Line::from(self.spans), zones)
+    fn width(&self) -> usize {
+        self.spans.iter().map(|s| s.width()).sum()
     }
 }
 
-fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) {
-    let area = f.area();
-    let [header, filterbar, body, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .areas(area);
+/// Separator glued between chunks sharing a line (never at a line start).
+const CHUNK_SEP: &str = " · ";
 
+/// Flow chunks into lines of at most `w` columns, breaking between chunks
+/// (a chunk longer than `w` is clipped with an ellipsis, its zone clipped
+/// to what is drawn). Zones come out with `y = 0`; callers stamp the drawn
+/// row. Bars grow taller instead of running off the edge, so everything
+/// stays visible no matter how narrow the terminal gets.
+fn flow_bar(chunks: Vec<Chunk>, w: usize) -> Vec<(Line<'static>, Vec<HotZone>)> {
+    let sep_w: usize = CHUNK_SEP.chars().count();
+    let sep_style = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<(Line<'static>, Vec<HotZone>)> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut zones: Vec<HotZone> = Vec::new();
+    let mut used = 0usize;
+    for ch in chunks {
+        let cw = ch.width();
+        if used > 0 && used + sep_w + cw.min(w) > w {
+            lines.push((
+                Line::from(std::mem::take(&mut spans)),
+                std::mem::take(&mut zones),
+            ));
+            used = 0;
+        }
+        if used > 0 {
+            spans.push(Span::styled(CHUNK_SEP, sep_style));
+            used += sep_w;
+        }
+        let room = w.saturating_sub(used);
+        let kept: Vec<Span<'static>> = if cw <= room {
+            ch.spans
+        } else {
+            trunc_line(Line::from(ch.spans), room).spans
+        };
+        let kept_w: usize = kept.iter().map(|s| s.width()).sum();
+        if let Some(spot) = ch.spot {
+            if kept_w > 0 {
+                zones.push(HotZone {
+                    y: 0,
+                    x0: used as u16,
+                    x1: (used + kept_w) as u16,
+                    spot,
+                });
+            }
+        }
+        spans.extend(kept);
+        used += kept_w;
+    }
+    if !spans.is_empty() || lines.is_empty() {
+        lines.push((Line::from(spans), zones));
+    }
+    lines
+}
+
+/// Header status chunks: identity + live counts, view options, then hosts
+/// and status. Pure content — ui() flows and draws them.
+fn header_chunks(app: &App) -> Vec<Chunk> {
     let dim = Style::default().fg(Color::DarkGray);
     let mut working = 0usize;
     let mut attention = 0usize;
@@ -1439,7 +1530,7 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
             LiveMark::Exited => {}
         }
     }
-    let mut header_spans = vec![
+    let mut chunks = vec![Chunk::plain([
         Span::styled(
             " psst ",
             Style::default()
@@ -1447,44 +1538,36 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(" {} sessions", app.order.len())),
-    ];
+    ])];
     if working > 0 {
-        header_spans.push(Span::styled(" · ", dim));
-        header_spans.push(Span::styled(
+        chunks.push(Chunk::plain([Span::styled(
             format!("{} running", working),
             Style::default().fg(Color::Yellow),
-        ));
+        )]));
     }
     if attention > 0 {
-        header_spans.push(Span::styled(" · ", dim));
-        header_spans.push(Span::styled(
+        chunks.push(Chunk::plain([Span::styled(
             format!("{} attention", attention),
             Style::default()
                 .fg(if has_prompt { Color::Red } else { Color::Cyan })
                 .add_modifier(Modifier::BOLD),
-        ));
+        )]));
     }
     if idle > 0 {
-        header_spans.push(Span::styled(" · ", dim));
-        header_spans.push(Span::styled(
+        chunks.push(Chunk::plain([Span::styled(
             format!("{} idle", idle),
             Style::default().fg(Color::Cyan),
-        ));
+        )]));
     }
-    let mut bar = Bar::new();
-    bar.extend(header_spans);
-    bar.push(Span::styled(" · ", dim));
-    bar.hot(
+    chunks.push(Chunk::hot(
         Hotspot::Sort,
         [Span::styled("sort:", dim), Span::raw(app.sort.label())],
-    );
-    bar.push(Span::styled(" · ", dim));
-    bar.hot(
+    ));
+    chunks.push(Chunk::hot(
         Hotspot::Group,
         [Span::styled("group:", dim), Span::raw(app.group.label())],
-    );
-    bar.push(Span::styled(" · ", dim));
-    bar.hot(
+    ));
+    chunks.push(Chunk::hot(
         Hotspot::Filter,
         [
             Span::styled("filter:", dim),
@@ -1497,15 +1580,16 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
                 },
             ),
         ],
-    );
-    let mut header_spans: Vec<Span<'static>> = Vec::new();
+    ));
     if let Some(p) = &app.cwd_scope {
         let name = p
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| p.display().to_string());
-        header_spans.push(Span::styled(" · ", dim));
-        header_spans.push(Span::styled(name, Style::default().fg(Color::Cyan)));
+        chunks.push(Chunk::plain([Span::styled(
+            name,
+            Style::default().fg(Color::Cyan),
+        )]));
     }
     // Per-host session counts when remotes are configured (e.g. `coop:10`).
     if !app.config.hosts().is_empty() {
@@ -1519,28 +1603,83 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
             if name == LOCAL_HOST {
                 continue;
             }
-            header_spans.push(Span::styled(" · ", dim));
-            header_spans.push(Span::styled(
+            chunks.push(Chunk::plain([Span::styled(
                 format!("{}:{}", name, counts[name]),
                 Style::default().fg(Color::Magenta),
-            ));
+            )]));
         }
     }
     if app.syncing {
-        header_spans.push(Span::styled(" · ", dim));
-        header_spans.push(Span::styled("sync…", dim));
+        chunks.push(Chunk::plain([Span::styled("sync…", dim)]));
     }
     if !app.host_errors.is_empty() {
-        header_spans.push(Span::styled(" · ", dim));
-        header_spans.push(Span::styled(
+        chunks.push(Chunk::plain([Span::styled(
             app.host_errors.join("; "),
             Style::default().fg(Color::Red),
-        ));
+        )]));
     }
-    bar.extend(header_spans);
-    let (header_line, header_zones) = bar.finish(header.y);
-    app.hotspots = header_zones;
-    f.render_widget(Paragraph::new(header_line), header);
+    chunks
+}
+
+/// Footer hint chunks. Pure content — ui() flows and draws them.
+fn footer_chunks(app: &App) -> Vec<Chunk> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let on = Style::default().fg(Color::Cyan);
+    let mut chunks = vec![
+        Chunk::hot(Hotspot::Search, [Span::styled("/ search", dim)]),
+        Chunk::hot(
+            Hotspot::Detail,
+            [Span::styled("d details", if app.detail { on } else { dim })],
+        ),
+        Chunk::hot(
+            Hotspot::Prompts,
+            [Span::styled(
+                "p prompts",
+                if app.show_prompts { on } else { dim },
+            )],
+        ),
+        Chunk::hot(Hotspot::Help, [Span::styled("? keys", dim)]),
+        Chunk::hot(Hotspot::Open, [Span::styled("enter=open", dim)]),
+        Chunk::hot(Hotspot::Quit, [Span::styled("q quit", dim)]),
+    ];
+    if !app.status.is_empty() {
+        chunks.push(Chunk::plain([Span::styled(
+            app.status.clone(),
+            Style::default().fg(Color::Yellow),
+        )]));
+    }
+    chunks
+}
+
+fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) {
+    let area = f.area();
+    let w = area.width as usize;
+    // Flow before layout: bars grow taller instead of running off the edge,
+    // so the header height is known before areas are cut.
+    let header_parts = flow_bar(header_chunks(app), w);
+    let footer_parts = flow_bar(footer_chunks(app), w);
+    let [header, filterbar, body, footer] = Layout::vertical([
+        Constraint::Length(header_parts.len() as u16),
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(footer_parts.len() as u16),
+    ])
+    .areas(area);
+
+    app.hotspots = Vec::new();
+    for (i, (line, zones)) in header_parts.into_iter().enumerate() {
+        let y = header.y + i as u16;
+        app.hotspots
+            .extend(zones.into_iter().map(|z| HotZone { y, ..z }));
+        f.render_widget(
+            Paragraph::new(line),
+            Rect {
+                y,
+                height: 1,
+                ..header
+            },
+        );
+    }
 
     // The whole filter row is a search target, not just the hint text.
     app.hotspots.push(HotZone {
@@ -1568,21 +1707,38 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
         } else {
             Span::styled("/", Style::default().fg(Color::DarkGray))
         };
+        let suffix = format!("  ({} shown)", app.order.len());
+        // A long query on a narrow terminal keeps its tail (what was just
+        // typed) plus the cursor visible, instead of scrolling them off.
+        let mut budget =
+            (filterbar.width as usize).saturating_sub(1 + suffix.chars().count());
+        if app.search_focus {
+            budget = budget.saturating_sub(1); // the ▏ cursor
+        }
+        let mut q = app.filter.clone();
+        let n = q.chars().count();
+        if n > budget {
+            q = if budget == 0 {
+                String::new()
+            } else {
+                format!(
+                    "…{}",
+                    q.chars().skip(n - (budget - 1)).collect::<String>()
+                )
+            };
+        }
+        if app.search_focus {
+            q.push('▏');
+        }
         let query = if app.search_focus {
-            Span::styled(
-                format!("{}▏", app.filter),
-                Style::default().add_modifier(Modifier::BOLD),
-            )
+            Span::styled(q, Style::default().add_modifier(Modifier::BOLD))
         } else {
-            Span::styled(app.filter.clone(), Style::default().fg(Color::DarkGray))
+            Span::styled(q, Style::default().fg(Color::DarkGray))
         };
         let filter_spans = vec![
             slash,
             query,
-            Span::styled(
-                format!("  ({} shown)", app.order.len()),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(suffix, Style::default().fg(Color::DarkGray)),
         ];
         f.render_widget(Paragraph::new(Line::from(filter_spans)), filterbar);
     }
@@ -1656,38 +1812,19 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
 
     // Every hint here is clickable, and toggles show their state so the
     // footer doubles as an indicator for panes that are off.
-    let on = Style::default().fg(Color::Cyan);
-    let mut foot = Bar::new();
-    foot.push(Span::raw(" "));
-    foot.hot(Hotspot::Search, [Span::styled("/ search", dim)]);
-    foot.push(Span::styled(" · ", dim));
-    foot.hot(
-        Hotspot::Detail,
-        [Span::styled("d details", if app.detail { on } else { dim })],
-    );
-    foot.push(Span::styled(" · ", dim));
-    foot.hot(
-        Hotspot::Prompts,
-        [Span::styled(
-            "p prompts",
-            if app.show_prompts { on } else { dim },
-        )],
-    );
-    foot.push(Span::styled(" · ", dim));
-    foot.hot(Hotspot::Help, [Span::styled("? keys", dim)]);
-    foot.push(Span::styled(" · ", dim));
-    foot.hot(Hotspot::Open, [Span::styled("enter=open", dim)]);
-    foot.push(Span::styled(" · ", dim));
-    foot.hot(Hotspot::Quit, [Span::styled("q quit", dim)]);
-    if !app.status.is_empty() {
-        foot.push(Span::styled(
-            format!("  {}", app.status),
-            Style::default().fg(Color::Yellow),
-        ));
+    for (i, (line, zones)) in footer_parts.into_iter().enumerate() {
+        let y = footer.y + i as u16;
+        app.hotspots
+            .extend(zones.into_iter().map(|z| HotZone { y, ..z }));
+        f.render_widget(
+            Paragraph::new(line),
+            Rect {
+                y,
+                height: 1,
+                ..footer
+            },
+        );
     }
-    let (footer_line, footer_zones) = foot.finish(footer.y);
-    app.hotspots.extend(footer_zones);
-    f.render_widget(Paragraph::new(footer_line), footer);
 }
 
 /// Which item is drawn on each visible screen row.
@@ -1713,9 +1850,6 @@ fn row_map(heights: &[usize], offset: usize, height: u16) -> Vec<Option<usize>> 
     map
 }
 
-/// Presses closer together than this on the same row are a double click.
-const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
-
 /// How many rows one wheel notch moves the selection.
 const SCROLL_ROWS: i32 = 3;
 
@@ -1724,7 +1858,7 @@ pub(crate) fn handle_mouse(
     app: &mut App,
     ev: MouseEvent,
     items: &[Item],
-    now: std::time::Instant,
+    _now: std::time::Instant,
 ) -> KeyOutcome {
     // The help overlay covers the list, so a click under it would select a
     // row the user cannot see.
@@ -1741,7 +1875,6 @@ pub(crate) fn handle_mouse(
             // Chrome first: the header, filter row, and footer sit outside
             // the list, so these never compete with row clicks.
             if let Some(spot) = app.hotspot_at(ev.column, ev.row) {
-                app.last_click = None;
                 match spot {
                     Hotspot::Search => app.search_focus = true,
                     Hotspot::Sort => app.cycle_sort(),
@@ -1760,29 +1893,23 @@ pub(crate) fn handle_mouse(
                 return KeyOutcome::Continue;
             }
             let Some(item) = app.item_at(ev.row).and_then(|i| items.get(i)) else {
-                app.last_click = None;
                 return KeyOutcome::Continue;
             };
             match item.session {
                 Some(idx) => {
-                    let again = matches!(app.last_click, Some((row, at))
-                        if row == ev.row && now.duration_since(at) < DOUBLE_CLICK);
+                    // A launcher: one click opens, like Enter. There is no
+                    // press-and-hold or double-tap to fumble (touchscreens
+                    // over ssh included). Inspecting without opening is
+                    // right-click's job (or `d` on the keyboard).
                     app.select_session(idx);
-                    app.last_click = Some((ev.row, now));
-                    if again {
-                        if let Some(action) = app.open_selected() {
-                            return KeyOutcome::Open(action);
-                        }
+                    if let Some(action) = app.open_selected() {
+                        return KeyOutcome::Open(action);
                     }
                 }
                 None => {
                     if let Some(key) = item.group_key.clone() {
                         app.toggle_group(&key);
                     }
-                    // A header is not a double-click target: folding and
-                    // unfolding in one gesture would look like nothing
-                    // happened.
-                    app.last_click = None;
                 }
             }
         }
@@ -2238,13 +2365,12 @@ fn help_lines() -> Vec<Line<'static>> {
         row("d", "detail pane"),
         row("p", "last-prompt subtitles"),
         row("r / R", "rescan / full rescan"),
-        row("enter", "open in tmux"),
+        row("enter / click", "open in tmux"),
         row("esc", "clear filter / close / quit"),
         row("q", "quit"),
         Line::from(""),
-        row("mouse", "click selects, double-click opens"),
-        row("", "right-click a row for details"),
-        row("", "header and footer labels are clickable"),
+        row("mouse", "click opens, right-click inspects"),
+        row("", "wheel scrolls, header and footer labels click"),
         Line::from(""),
         Line::from(Span::styled(
             "  ? / esc closes",
@@ -2346,7 +2472,6 @@ mod tests {
             row_map: Vec::new(),
             hotspots: Vec::new(),
             list_top: 0,
-            last_click: None,
             collapsed: HashSet::new(),
             header_park: None,
             show_help: false,
@@ -2416,6 +2541,115 @@ mod tests {
             .take(2)
             .collect();
         (items, rows)
+    }
+
+    fn live_remote_app() -> App {
+        let mut app = fold_app();
+        app.sessions.push(fake_remote("r1", "/home/agent/work", 3000));
+        let key = app.sessions.last().unwrap().key();
+        app.running.insert(
+            key,
+            RunningHit {
+                pid: 99,
+                cpu: 9.0,
+                tmux: Some(crate::running::TmuxTarget {
+                    session: "code".into(),
+                    window: Some(1),
+                    attention: false,
+                }),
+                direct: true,
+                summary: None,
+                status: Some("thinking".into()),
+                peer_name: Some("remote-peer".into()),
+            },
+        );
+        app
+    }
+
+    #[test]
+    fn rows_fit_narrow_widths_with_badges_intact() {
+        // Phone-terminal widths: every rendered line fits, and the tmux /
+        // host badges survive — they sit at the line end, where clipping
+        // used to eat them first.
+        let mut app = live_remote_app();
+        app.apply_filter_sort();
+        for w in [28usize, 32, 40, 48, 60, 80] {
+            let items = app.build_items(w);
+            assert!(!items.is_empty());
+            for it in &items {
+                for line in &it.lines {
+                    assert!(
+                        line.width() <= w,
+                        "w={w}: {line:?} is {} wide",
+                        line.width()
+                    );
+                }
+            }
+            let text: String = items
+                .iter()
+                .flat_map(|it| it.lines.iter().map(|l| format!("{l:?}")))
+                .collect();
+            assert!(text.contains("[code:1]"), "w={w}: tmux badge kept");
+            assert!(text.contains("[coop]"), "w={w}: host badge kept");
+        }
+    }
+
+    #[test]
+    fn wide_rows_keep_full_columns() {
+        // Locks the long-standing wide layout: nothing shrinks when it fits.
+        let mut app = fold_app();
+        app.apply_filter_sort();
+        let items = app.build_items(100);
+        let row = items
+            .iter()
+            .find_map(|it| it.session.map(|_| &it.lines[0]))
+            .unwrap();
+        // 4 chrome + 50 title + gap + 16 project + gap + 5 age, no badges.
+        assert_eq!(row.width(), 4 + 50 + 1 + 16 + 1 + 5);
+    }
+
+    #[test]
+    fn narrow_frame_shows_header_options_and_badges() {
+        // The phone case: at 48 columns the old single-line bars ran off
+        // the edge (sort:activit…, no group/filter/hosts, no tmux badges).
+        // Render a real frame and read back the cells.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = live_remote_app();
+        app.apply_filter_sort();
+        let items = app.build_items(48);
+        let mut state = ListState::default();
+        sync_selection(&items, &mut app, &mut state);
+        let mut terminal = Terminal::new(TestBackend::new(48, 30)).unwrap();
+        terminal
+            .draw(|f| ui(f, &mut app, &items, &mut state))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..30)
+            .map(|y| (0..48).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let top = rows[..6].join("\n");
+        assert!(top.contains("sort:"), "wrapped header shows sort:\n{top}");
+        assert!(top.contains("group:"), "wrapped header shows group:\n{top}");
+        let all = rows.join("\n");
+        assert!(all.contains("[coop]"), "remote badge visible:\n{all}");
+        assert!(all.contains("[code:1]"), "tmux badge visible:\n{all}");
+        assert!(all.contains("q quit"), "footer wraps, quit visible:\n{all}");
+    }
+
+    #[test]
+    fn trunc_line_clips_tail_with_ellipsis() {
+        let line = Line::from(vec![
+            Span::raw("hello "),
+            Span::styled("world", Style::default().fg(Color::Red)),
+        ]);
+        assert_eq!(trunc_line(line.clone(), 20).width(), 11);
+        let cut = trunc_line(line, 8);
+        assert_eq!(cut.width(), 8);
+        let texts: Vec<&str> =
+            cut.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, vec!["hello ", "w…"]);
+        assert_eq!(cut.spans[1].style, Style::default().fg(Color::Red));
     }
 
     #[test]
@@ -2496,34 +2730,87 @@ mod tests {
     }
 
     #[test]
-    fn bar_records_where_each_label_lands() {
-        let mut bar = Bar::new();
-        bar.push(Span::raw(" psst "));
-        bar.hot(Hotspot::Sort, [Span::raw("sort:"), Span::raw("activity")]);
-        bar.push(Span::raw(" · "));
-        bar.hot(Hotspot::Quit, [Span::raw("q quit")]);
-        let (line, zones) = bar.finish(7);
-        assert_eq!(line.width(), 6 + 13 + 3 + 6);
-        // Both halves of "sort:activity" are one target, and the zone ends
-        // where the separator begins.
+    fn flow_packs_chunks_and_tracks_zones() {
+        let chunks = vec![
+            Chunk::plain([Span::raw(" psst ")]),
+            Chunk::hot(
+                Hotspot::Sort,
+                [Span::raw("sort:"), Span::raw("activity")],
+            ),
+            Chunk::hot(Hotspot::Quit, [Span::raw("q quit")]),
+        ];
+        // 6 + 3 + 13 + 3 + 6 = 31 fits: one line, separators glued between.
+        let parts = flow_bar(chunks, 40);
+        assert_eq!(parts.len(), 1);
+        let (line, zones) = &parts[0];
+        assert_eq!(line.width(), 6 + 3 + 13 + 3 + 6);
+        // Both halves of "sort:activity" are one target.
         assert_eq!(
             zones[0],
             HotZone {
-                y: 7,
-                x0: 6,
-                x1: 19,
+                y: 0,
+                x0: 9,
+                x1: 22,
                 spot: Hotspot::Sort
             }
         );
         assert_eq!(
             zones[1],
             HotZone {
-                y: 7,
-                x0: 22,
-                x1: 28,
+                y: 0,
+                x0: 25,
+                x1: 31,
                 spot: Hotspot::Quit
             }
         );
+    }
+
+    #[test]
+    fn flow_wraps_between_chunks_not_inside_them() {
+        let chunks = vec![
+            Chunk::plain([Span::raw(" psst ")]),
+            Chunk::hot(
+                Hotspot::Sort,
+                [Span::raw("sort:"), Span::raw("activity")],
+            ),
+            Chunk::hot(Hotspot::Quit, [Span::raw("q quit")]),
+        ];
+        // " psst " + sort:activity = 22 fits in 25, but q quit would need
+        // 31, so it drops to line two whole — no separator strands at a
+        // line start.
+        let parts = flow_bar(chunks, 25);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].0.width(), 6 + 3 + 13);
+        assert_eq!(parts[1].0.width(), 6);
+        assert_eq!(parts[0].1.len(), 1, "sort zone stayed whole on line one");
+        assert_eq!(
+            parts[1].1,
+            vec![HotZone {
+                y: 0,
+                x0: 0,
+                x1: 6,
+                spot: Hotspot::Quit
+            }]
+        );
+    }
+
+    #[test]
+    fn flow_clips_an_overlong_chunk_with_ellipsis() {
+        let chunks = vec![Chunk::hot(
+            Hotspot::Quit,
+            [Span::raw("averylonglabelwithnovalue")],
+        )];
+        let parts = flow_bar(chunks, 10);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].0.width(), 10);
+        let text: String = parts[0]
+            .0
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text.chars().last(), Some('…'));
+        assert_eq!(parts[0].1[0].x1, 10, "zone clipped to what is drawn");
     }
 
     #[test]
@@ -2646,7 +2933,7 @@ mod tests {
     }
 
     #[test]
-    fn click_selects_the_row_under_the_pointer() {
+    fn click_opens_the_row_under_the_pointer() {
         let mut app = fold_app();
         app.apply_filter_sort();
         let items = app.build_items(100);
@@ -2658,75 +2945,14 @@ mod tests {
             .find_map(|(i, it)| it.session.map(|s| (i as u16 + 2, s)))
             .expect("a session row");
         let out = handle_mouse(&mut app, click(row), &items, Instant::now());
-        assert_eq!(out, KeyOutcome::Continue, "one click selects, never opens");
+        assert!(
+            matches!(out, KeyOutcome::Open(_)),
+            "one click opens, like Enter"
+        );
         assert_eq!(app.order[app.sel], want);
         assert!(
             app.header_park.is_none(),
             "clicking a session leaves headers"
-        );
-    }
-
-    #[test]
-    fn double_click_opens_but_two_slow_clicks_do_not() {
-        let mut app = fold_app();
-        app.apply_filter_sort();
-        let items = app.build_items(100);
-        lay_out(&mut app, &items, 0, 20);
-        let row = items
-            .iter()
-            .position(|it| it.session.is_some())
-            .expect("a session row") as u16;
-        let t0 = Instant::now();
-        handle_mouse(&mut app, click(row), &items, t0);
-        let fast = handle_mouse(
-            &mut app,
-            click(row),
-            &items,
-            t0 + Duration::from_millis(200),
-        );
-        assert!(
-            matches!(fast, KeyOutcome::Open(_)),
-            "quick second click opens"
-        );
-
-        // Same row, but too slow to be one gesture.
-        let mut app = fold_app();
-        app.apply_filter_sort();
-        lay_out(&mut app, &items, 0, 20);
-        handle_mouse(&mut app, click(row), &items, t0);
-        let slow = handle_mouse(
-            &mut app,
-            click(row),
-            &items,
-            t0 + Duration::from_millis(900),
-        );
-        assert_eq!(slow, KeyOutcome::Continue);
-    }
-
-    #[test]
-    fn double_click_needs_the_same_row() {
-        let mut app = fold_app();
-        app.apply_filter_sort();
-        let items = app.build_items(100);
-        lay_out(&mut app, &items, 0, 20);
-        let rows: Vec<u16> = items
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| it.session.is_some())
-            .map(|(i, _)| i as u16)
-            .collect();
-        let t0 = Instant::now();
-        handle_mouse(&mut app, click(rows[0]), &items, t0);
-        let out = handle_mouse(
-            &mut app,
-            click(rows[1]),
-            &items,
-            t0 + Duration::from_millis(50),
-        );
-        assert_eq!(
-            out,
-            KeyOutcome::Continue,
-            "moving between rows is not a double click"
         );
     }
 

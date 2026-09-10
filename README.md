@@ -63,7 +63,7 @@ working with the last mirror + local sessions.
 | `H` / `L` | fold / unfold all groups |
 | `?` | shortcut overlay, also in the TUI footer (`?`/`Esc`/`q` closes it) |
 | `Enter` | **open**: attach to the running tmux session, or spawn `pi --session <file>` in a new tmux window (on a header: toggle fold). Remote sessions focus the terminal tab already holding that host's ssh (see below) |
-| `d` or `Ctrl+D` | toggle the right-hand detail pane (off by default) |
+| `d` or `Ctrl+D` | toggle the bottom detail pane (off by default) |
 | `p` or `Ctrl+P` | hide/show last user prompt on a second line under each row |
 | `r` / `R` | rescan (cache-aware) / full rescan |
 | `Backspace` | delete the last search-filter character (even when search is not focused) |
@@ -73,8 +73,7 @@ working with the last mirror + local sessions.
 | Mouse | Action |
 | --- | --- |
 | wheel | scroll the selection (3 rows per notch) |
-| click | select a row; on a group header, fold or unfold it |
-| double-click | open, same as `Enter` |
+| click | open the row, same as `Enter`; on a group header, fold or unfold it |
 | right-click a row | show details for it; the same row again hides them, another row keeps the pane up |
 | click `sort:` / `group:` / `filter:` in the header | cycle that setting |
 | click the search row (or `/ search`) | focus search |
@@ -105,7 +104,11 @@ Group headers (project, day, and host modes) show session count and the
 newest activity in the group. Day buckets use local dates; within a
 group, rows keep the active sort's order. In host mode local sorts first,
 then remotes by recency. In day mode rows show clock time (`2:04p`);
-otherwise they show age (`312m`).
+otherwise they show age (`312m`). Rows are laid out for the current
+terminal width: on narrow terminals the project column shrinks away first,
+so age and tmux/host badges stay visible; the header and footer wrap onto
+more lines instead of running off the edge, and group headers truncate with
+an ellipsis.
 
 ## How it works
 
@@ -186,7 +189,7 @@ active_secs = 120
 [ui]
 # grouping on launch: "day" (default), "project", "flat", or "host"
 group = "day"
-# show the right-hand detail pane on launch (default: false; `d` toggles)
+# show the bottom detail pane on launch (default: false; `d` toggles)
 detail = false
 # terminal whose tabs are focused when opening a remote session
 terminal = "Ghostty"

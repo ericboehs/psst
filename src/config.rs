@@ -13,7 +13,7 @@
 //! [ui]
 //! # grouping on launch: "day" (default), "project", "flat", or "host"
 //! group = "day"
-//! # show the right-hand detail pane on launch (default: false; toggle with Ctrl+D)
+//! # show the bottom detail pane on launch (default: false; toggle with Ctrl+D)
 //! detail = false
 //! # terminal whose tabs are focused when opening a remote session
 //! terminal = "Ghostty"
@@ -197,7 +197,7 @@ impl Config {
         &self.group
     }
 
-    /// Whether the right-hand detail pane is shown on launch (default: false).
+    /// Whether the bottom detail pane is shown on launch (default: false).
     pub fn detail_default(&self) -> bool {
         self.detail
     }
