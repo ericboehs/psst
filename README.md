@@ -38,6 +38,8 @@ psst                  # TUI (local + configured hosts)
 psst .                # TUI, only this project (git root, else cwd; any dir works the same)
 psst --list           # plain table with a host column (pipe-friendly)
 psst --json           # JSON array (same rows as --list; each row has "host")
+psst --local --json   # local sessions only; never syncs or probes configured hosts
+psst --local --open ID # exact local session ID (or absolute JSONL path); open + focus without a TUI
 psst --refresh        # rebuild the metadata cache from scratch (re-mirrors hosts)
 psst --debug-running  # print detected pi processes + tmux targets (local + hosts)
 psst --debug-focus    # print terminal tabs and which host each one holds
@@ -48,6 +50,29 @@ Remote sessions carry a magenta `[coop]` badge, show up in the header as
 `coop:11`, match `coop` in `/` search, and open over ssh (see below).
 When a host is unreachable its error appears in the header and `psst` keeps
 working with the last mirror + local sessions.
+
+### Local web/launcher handoff
+
+`--local` removes configured hosts before any discovery, cached-host loading,
+refresh, or detection. It also works with the TUI and `--list`. The normal
+metadata cache can still be updated; browsing does not modify session JSONL.
+
+`psst --local --open ID` accepts an **exact** discovered local session ID or
+absolute file path. Ambiguous IDs and unknown files fail rather than opening
+something similar. This command cannot be combined with list/debug/refresh/scope
+options and currently requires `--local`.
+
+The command reuses the TUI's opening planner and delegates terminal focus to
+`tmux-focus` from [agent-notify](https://github.com/ericboehs/agent-notify).
+An attached local tmux client is required. A running session's existing target
+is focused; a stopped session gets a new resume window in the most recently
+active client's tmux session. A running agent without a known tmux target is
+rejected rather than duplicated. No prompts are sent.
+
+Ghostty is the default (`[ui] terminal` overrides it). Its tab hop needs macOS
+Accessibility permission and remains best-effort: success means a handoff was
+requested, not that the operating system verified focus. Custom `[resume]`
+commands retain their existing, trusted shell-template semantics.
 
 ### Keys
 
@@ -166,10 +191,12 @@ an ellipsis.
 - **Working without the hook**: hosts lacking agent-link summaries (gfew runs
   `pi-claude-link` instead; coop has neither) report no `thinking`/`tool`
   status, so psst falls back to subtree %CPU (process plus descendants, so
-  `tool:bash` children count): ≥5% reads working. Idle nodes sit at exactly
-  0.0% across samples while a streaming agent holds ~9-11% sustained, and a
-  stale `idle` cache entry loses to live CPU. The detail pane shows the
-  reading (`working pid 80608 @ code:1 (heuristic) · cpu 9%`).
+  `tool:bash` children count): ≥5% reads working. This is a heuristic, not proof
+  of an active agent turn: CPU readings can linger after work ends, and a
+  background dev server can remain busy indefinitely. Explicit `idle` status
+  therefore wins over CPU (while tmux unread activity is still preserved).
+  The detail pane shows the reading
+  (`working pid 80608 @ code:1 (heuristic) · cpu 9%`).
 - **Cache**: parsed metadata is cached at `~/.cache/psst/cache.json`, keyed by
   host+path+mtime+size, so rescans only reparse changed files. Files ≥5MB
   additionally persist fold state (lines folded + parent→child counts), so a

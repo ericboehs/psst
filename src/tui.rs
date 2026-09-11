@@ -1021,7 +1021,11 @@ impl App {
 
     /// Build the open action for the selected session.
     pub fn open_selected(&self) -> Option<OpenAction> {
-        let s = self.selected()?;
+        self.open_session(self.selected()?)
+    }
+
+    /// Shared action planner for TUI selection and explicit CLI handoff.
+    pub fn open_session(&self, s: &SessionMeta) -> Option<OpenAction> {
         let inside = std::env::var("TMUX").is_ok();
         // Remote sessions live in their host's terminal tab; local ones use
         // tmux directly.
@@ -1043,12 +1047,16 @@ impl App {
             }
             // running without a tmux target: fall through to a fresh resume window
         }
-        let command = self
-            .config
-            .resume_command()
-            .replace("{file}", &s.path.to_string_lossy())
-            .replace("{id}", &s.id)
-            .replace("{cwd}", &s.cwd);
+        // Default resumes must preserve spaces and shell metacharacters in paths.
+        // Custom templates retain their existing, user-configured shell semantics.
+        let command = if self.config.resume_command() == "pi --session {file}" {
+            format!("pi --session '{}'", s.path.to_string_lossy().replace('\'', "'\\''"))
+        } else {
+            self.config.resume_command()
+                .replace("{file}", &s.path.to_string_lossy())
+                .replace("{id}", &s.id)
+                .replace("{cwd}", &s.cwd)
+        };
         match host_cfg {
             Some(h) => Some(OpenAction::SshFocusNew {
                 focus: self.tab_focus_for(h),

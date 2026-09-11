@@ -31,12 +31,10 @@ pub struct TmuxTarget {
 }
 
 /// Subtree %CPU (process plus descendants) at or above which a session
-/// counts as working. Idle pi nodes sit at exactly 0.0% sample after sample;
-/// a streaming agent holds mid-to-high single digits and up (observed 9-11%
-/// sustained on a working session), tool children spike far higher. Kept low
-/// on purpose: ps %CPU is a decaying/lifetime average, so this also catches
-/// "just finished a burst" rather than only mid-token instants. A stale
-/// "idle" cache entry loses to live CPU — same as a fresh hook event.
+/// counts as working when no recognized hook status is available.
+/// This is only a heuristic: ps reports a decaying/lifetime average, and
+/// long-lived background servers can stay busy after the agent finishes.
+/// CPU must never override an explicit idle status.
 pub const CPU_WORKING_PCT: f64 = 5.0;
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,8 +117,8 @@ fn is_prompt_status(st: &str) -> bool {
 }
 
 /// Running + ask/confirm/input → prompt; thinking/other tools → working;
-/// hot CPU (no hook status on this host) → working; tmux `@special_activity`
-/// → unread; otherwise waiting on you.
+/// hot CPU (no recognized hook status) → working; tmux `@special_activity`
+/// → unread; otherwise waiting. Explicit idle bypasses CPU, not unread.
 pub fn live_mark(hit: Option<&RunningHit>) -> LiveMark {
     match hit {
         None => LiveMark::Exited,
@@ -130,7 +128,7 @@ pub fn live_mark(hit: Option<&RunningHit>) -> LiveMark {
                 LiveMark::Prompt
             } else if st == "thinking" || st.starts_with("tool") {
                 LiveMark::Working
-            } else if h.cpu >= CPU_WORKING_PCT {
+            } else if st != "idle" && h.cpu >= CPU_WORKING_PCT {
                 LiveMark::Working
             } else if h.tmux.as_ref().is_some_and(|t| t.attention) {
                 LiveMark::Unread
@@ -1317,6 +1315,37 @@ mod tests {
     }
 
     #[test]
+    fn idle_status_wins_over_background_cpu_and_preserves_unread() {
+        let mut hit = RunningHit {
+            pid: 7,
+            cpu: 80.0,
+            tmux: None,
+            direct: true,
+            summary: None,
+            status: Some("thinking".into()),
+            peer_name: None,
+        };
+        assert_eq!(live_mark(Some(&hit)), LiveMark::Working);
+        // The turn ends, but a dev server remains busy in pi's process tree.
+        hit.status = Some("idle".into());
+        assert_eq!(live_mark(Some(&hit)), LiveMark::Waiting);
+        hit.tmux = Some(TmuxTarget {
+            session: "fictional".into(),
+            window: Some(1),
+            attention: true,
+        });
+        assert_eq!(live_mark(Some(&hit)), LiveMark::Unread);
+        // The next genuine tool call is active, even with zero sampled CPU.
+        hit.cpu = 0.0;
+        hit.status = Some("tool:bash".into());
+        assert_eq!(live_mark(Some(&hit)), LiveMark::Working);
+        hit.status = Some("tool:input".into());
+        assert_eq!(live_mark(Some(&hit)), LiveMark::Prompt);
+        hit.status = Some("idle".into());
+        assert_eq!(live_mark(Some(&hit)), LiveMark::Unread);
+    }
+
+    #[test]
     fn etime_parses() {
         assert_eq!(parse_etime("05:22"), Some(5 * 60 + 22));
         assert_eq!(parse_etime("01:02:03"), Some(3600 + 120 + 3));
@@ -1445,9 +1474,9 @@ mod tests {
             peer_name: None,
         };
         assert_eq!(live_mark(Some(&h)), LiveMark::Working);
-        // Stale "idle" loses to live CPU.
+        // An explicit idle status is not a CPU fallback case.
         h.status = Some("idle".into());
-        assert_eq!(live_mark(Some(&h)), LiveMark::Working);
+        assert_eq!(live_mark(Some(&h)), LiveMark::Waiting);
         // A blocking prompt still wins: the user must answer.
         h.status = Some("tool:ask".into());
         assert_eq!(live_mark(Some(&h)), LiveMark::Prompt);

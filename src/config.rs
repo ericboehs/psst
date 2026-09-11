@@ -213,6 +213,12 @@ impl Config {
         self.mouse
     }
 
+    /// Restrict all discovery, refresh, and focus paths to this machine.
+    pub fn local_only(mut self) -> Self {
+        self.hosts.clear();
+        self
+    }
+
     /// Remote hosts from `[hosts.<name>]` tables, sorted by name.
     pub fn hosts(&self) -> &[HostConfig] {
         &self.hosts
@@ -254,6 +260,17 @@ tab = "gfe box"
             Some("/data/sessions")
         );
         assert_eq!(fc.hosts["gfe"].tab.as_deref(), Some("gfe box"));
+    }
+
+    #[test]
+    fn local_only_removes_hosts_but_preserves_preferences() {
+        let cfg = Config::with_hosts_for_test(vec![HostConfig {
+            name: "fixture".into(), ssh_target: "never-connect".into(),
+            sessions_dir: None, tab: None,
+        }]).local_only();
+        assert!(cfg.hosts().is_empty());
+        assert_eq!(cfg.terminal(), "Ghostty");
+        assert_eq!(cfg.resume_command(), "pi --session {file}");
     }
 
     #[test]
