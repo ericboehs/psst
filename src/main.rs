@@ -95,11 +95,20 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "--refresh" => parsed.refresh = true,
             "--debug-running" => parsed.debug_running = true,
             "--debug-focus" => parsed.debug_focus = true,
+            "-V" | "--version" => {
+                outln!(
+                    "psst {} ({})",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("PSST_GIT_SHA")
+                );
+                std::process::exit(0);
+            }
             "-h" | "--help" => {
                 outln!(
                     "psst — pi session switcher for tmux\n\n\
                      usage: psst [.] [--list] [--json] [--refresh] [--debug-running] [--debug-focus]\n\n\
                      .                 only this project (git root, else cwd)\n\
+                     -V, --version     print the version and the git commit it was built from\n\
                      --list            plain table (host column; pipe-friendly)\n\
                      --json            JSON array (implies list; adds host)\n\
                      --local           local sessions only; never contacts configured hosts\n\

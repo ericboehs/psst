@@ -44,6 +44,7 @@ psst --refresh        # rebuild the metadata cache from scratch (re-mirrors host
 psst --debug-running  # print detected pi processes + tmux targets (local + hosts)
 psst --debug-focus    # print terminal tabs and which host each one holds
 psst --help           # usage
+psst --version        # version and the git commit it was built from
 ```
 
 Remote sessions carry a magenta `[coop]` badge, show up in the header as
