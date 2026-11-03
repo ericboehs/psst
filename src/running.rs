@@ -53,6 +53,10 @@ pub struct PiProc {
     pub session_arg: Option<String>,
     /// `-c` / `--continue` on the cmdline: owns the newest session in cwd.
     pub continue_flag: bool,
+    /// Session file the process reports owning (pi-agent-link summary cache,
+    /// local only). Exact, so it beats every cwd heuristic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<PathBuf>,
     /// Epoch seconds when the process started (`now - etime`), if known.
     pub started_at: Option<i64>,
     /// tmux target resolved via parent chain.
@@ -562,6 +566,7 @@ pub fn detect() -> Vec<PiProc> {
             cmd: cmd.clone(),
             session_arg: session_arg_from_cmd(cmd),
             continue_flag: continue_flag_from_cmd(cmd),
+            session_file: None,
             started_at: *started_at,
             tmux,
         });
@@ -701,6 +706,7 @@ pub fn detect_remote(ssh_target: &str, host_name: &str) -> anyhow::Result<Vec<Pi
             cmd: cmd.clone(),
             session_arg: session_arg_from_cmd(cmd),
             continue_flag: continue_flag_from_cmd(cmd),
+            session_file: None,
             started_at: *started_at,
             tmux,
         });
@@ -772,6 +778,7 @@ pub(crate) fn parse_enrichment(out: &str) -> (HashMap<u32, String>, HashMap<u32,
                                 name: non_empty(&v, "name"),
                                 summary: non_empty(&v, "summary"),
                                 status: non_empty(&v, "status"),
+                                session_file: None,
                             },
                         );
                     } else if let Some(n) = non_empty(&v, "name") {
@@ -812,6 +819,8 @@ pub struct CacheFields {
     name: Option<String>,
     summary: Option<String>,
     status: Option<String>,
+    /// Session file the pid owns (local cache only; remote leaves None).
+    session_file: Option<PathBuf>,
 }
 
 /// Unique peer name from `~/.claude/sessions/<pid>.json` (pi-agent-link writes
@@ -899,6 +908,7 @@ fn summary_cache_lookup(pids: &[u32]) -> HashMap<u32, CacheFields> {
                 name: get("name"),
                 summary: get("summary"),
                 status: get("status"),
+                session_file: get("sessionFile").map(PathBuf::from),
             },
         );
     }
@@ -1017,6 +1027,14 @@ fn match_one_host(
 
     let mut unmatched: Vec<&PiProc> = Vec::new();
     for p in procs {
+        // 0. exact match from the session file the process reports
+        if let Some(f) = &p.session_file {
+            if let Some(s) = sessions.iter().find(|s| &s.path == f) {
+                if claim(&mut *hits, &mut claimed, s, p, true) {
+                    continue;
+                }
+            }
+        }
         // 1. exact match from --session arg
         if let Some(arg) = &p.session_arg {
             let found = if arg.ends_with(".jsonl") {
@@ -1098,6 +1116,26 @@ pub fn map_running(
     if procs.is_empty() || sessions.is_empty() {
         return hits;
     }
+    // Local summary cache, read once: its sessionFile pins pid -> session
+    // exactly (several pi in one cwd otherwise reshuffle every refresh), and
+    // the same entries enrich the hits below.
+    let local_proc_pids: Vec<u32> = procs
+        .iter()
+        .filter(|p| p.host == LOCAL_HOST)
+        .map(|p| p.pid)
+        .collect();
+    let cache = summary_cache_lookup(&local_proc_pids);
+    let procs: Vec<PiProc> = procs
+        .iter()
+        .map(|p| {
+            let mut p = p.clone();
+            if p.host == LOCAL_HOST && p.session_file.is_none() {
+                p.session_file = cache.get(&p.pid).and_then(|c| c.session_file.clone());
+            }
+            p
+        })
+        .collect();
+    let procs = procs.as_slice();
     // Partition both sides by host.
     let mut hosts: HashSet<&str> = HashSet::new();
     for p in procs {
@@ -1128,7 +1166,6 @@ pub fn map_running(
         .map(|(_, h)| h.pid)
         .collect();
     if !local_pids.is_empty() {
-        let cache = summary_cache_lookup(&local_pids);
         let registry = registry_peer_names(&local_pids);
         for (k, h) in hits.iter_mut().filter(|(k, _)| k.host == LOCAL_HOST) {
             let _ = k;
@@ -1226,6 +1263,7 @@ mod tests {
             serde_json::json!({
                 "pid": live_pid, "name": "pi-x", "status": "thinking",
                 "summary": "▸ do the thing", "updatedAt": now,
+                "sessionFile": "/tmp/s/x.jsonl",
             })
             .to_string(),
         )
@@ -1248,6 +1286,7 @@ mod tests {
                 name: Some("pi-x".to_string()),
                 summary: Some("▸ do the thing".to_string()),
                 status: Some("thinking".to_string()),
+                session_file: Some(PathBuf::from("/tmp/s/x.jsonl")),
             })
         );
         assert!(!got.contains_key(&999999));
@@ -1424,6 +1463,7 @@ mod tests {
                 name: Some("pi-x".to_string()),
                 summary: Some("s".to_string()),
                 status: Some("thinking".to_string()),
+                session_file: None,
             })
         );
     }
@@ -1615,6 +1655,7 @@ mod tests {
             cmd: "pi".to_string(),
             session_arg: None,
             continue_flag: false,
+            session_file: None,
             started_at: None,
             tmux: None,
         }
@@ -1642,6 +1683,30 @@ mod tests {
             mtime: 100,
             size: 10,
         }
+    }
+
+    #[test]
+    fn reported_session_file_pins_same_cwd_procs() {
+        // Three pi in one cwd: without sessionFile, step 3 hands out files by
+        // mtime, which reshuffles as they write. The reported file wins.
+        let mut sessions = vec![
+            sess_for("local", "a", "/home"),
+            sess_for("local", "b", "/home"),
+            sess_for("local", "c", "/home"),
+        ];
+        sessions[0].mtime = 300; // newest file, but owned by pid 3
+        sessions[1].mtime = 200;
+        sessions[2].mtime = 100;
+        let mut procs: Vec<PiProc> = (1..=3).map(|p| proc_for("local", p, "/home")).collect();
+        procs[0].session_file = Some(sessions[2].path.clone());
+        procs[1].session_file = Some(sessions[1].path.clone());
+        procs[2].session_file = Some(sessions[0].path.clone());
+        let mut hits = HashMap::new();
+        match_one_host(&procs, &sessions, 120, &mut hits);
+        assert_eq!(hits[&sessions[0].key()].pid, 3);
+        assert_eq!(hits[&sessions[1].key()].pid, 2);
+        assert_eq!(hits[&sessions[2].key()].pid, 1);
+        assert!(hits.values().all(|h| h.direct));
     }
 
     #[test]

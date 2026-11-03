@@ -81,7 +81,7 @@ commands retain their existing, trusted shell-template semantics.
 | `/` | focus search (then type anything, including `j`/`k`; Esc unfocuses). Running sessions also match `active`/`running` (plus `working`, `waiting`, `prompt`, …). |
 | `f` | cycle list filter: all → named → active |
 | `g` or `Tab` | cycle grouping: flat → project → day → host |
-| `s` or `Ctrl+S` | cycle sort: activity → tmux |
+| `s` or `Ctrl+S` | cycle sort: activity → tmux. Working sessions hold their row until they go idle (or you press `r`), so the list does not jump while agents run |
 | `↑`/`↓` or `k`/`j`, PgUp/PgDn, Home/End | navigate rows — group headers are stops too (arrows/PgUp/PgDn/Home/End work while searching; `j`/`k` type into search when focused) |
 | `J` / `K` | next / previous group (project/day/host; no-op when flat) |
 | `h` / `l` | fold / unfold the current group |

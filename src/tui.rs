@@ -227,6 +227,10 @@ pub struct App {
     /// last frame drawn.
     hotspots: Vec<HotZone>,
     list_top: u16,
+    /// Sort timestamp per session, frozen while it is working so a busy
+    /// session holds its row instead of hopping as its file grows. Updated
+    /// whenever the session is not working; r/R/^R clear it.
+    sort_ts: HashMap<SessionKey, i64>,
 }
 
 /// One rendered row: a session (index into `sessions`) or a group header.
@@ -354,6 +358,7 @@ impl App {
         let mut app = App {
             sessions: Vec::new(),
             running: HashMap::new(),
+            sort_ts: HashMap::new(),
             order: Vec::new(),
             sel: 0,
             filter: String::new(),
@@ -390,6 +395,37 @@ impl App {
     /// Lookup helper so call sites never forget the host qualifier.
     fn hit_for(&self, s: &SessionMeta) -> Option<&RunningHit> {
         self.running.get(&s.key())
+    }
+
+    /// Timestamp used for ordering and day buckets: the frozen value while
+    /// the session is working, else its last prompt/activity.
+    fn ts(&self, i: usize) -> i64 {
+        let s = &self.sessions[i];
+        self.sort_ts
+            .get(&s.key())
+            .copied()
+            .unwrap_or_else(|| s.last_user_or_activity())
+    }
+
+    /// Refresh frozen sort timestamps: working sessions keep theirs (or take
+    /// the current one on first sight); everyone else tracks live.
+    fn update_sort_ts(&mut self) {
+        let mut next = HashMap::with_capacity(self.sessions.len());
+        for s in &self.sessions {
+            let k = s.key();
+            let working = live_mark(self.running.get(&k)) == LiveMark::Working;
+            let ts = match self.sort_ts.get(&k) {
+                Some(&t) if working => t,
+                _ => s.last_user_or_activity(),
+            };
+            next.insert(k, ts);
+        }
+        self.sort_ts = next;
+    }
+
+    /// Drop frozen timestamps so the next sort uses live values.
+    pub fn unfreeze_sort(&mut self) {
+        self.sort_ts.clear();
     }
 
     /// The `[hosts.<name>]` entry backing a session, or `None` when local.
@@ -615,6 +651,7 @@ impl App {
     }
 
     fn apply_filter_sort(&mut self) {
+        self.update_sort_ts();
         let f = self.filter.to_lowercase();
         let mut idx: Vec<usize> = (0..self.sessions.len())
             .filter(|&i| {
@@ -664,7 +701,7 @@ impl App {
 
         match self.sort {
             Sort::Activity => {
-                idx.sort_by_key(|&i| std::cmp::Reverse(self.sessions[i].last_user_or_activity()));
+                idx.sort_by_key(|&i| std::cmp::Reverse(self.ts(i)));
             }
             Sort::Tmux => {
                 idx.sort_by(|&a, &b| {
@@ -677,13 +714,13 @@ impl App {
                                     .map(|t| t.session.clone())
                                     .unwrap_or_default(),
                                 h.tmux.as_ref().and_then(|t| t.window).unwrap_or(0),
-                                std::cmp::Reverse(self.sessions[i].last_user_or_activity()),
+                                std::cmp::Reverse(self.ts(i)),
                             ),
                             None => (
                                 1u8,
                                 String::new(),
                                 0,
-                                std::cmp::Reverse(self.sessions[i].last_user_or_activity()),
+                                std::cmp::Reverse(self.ts(i)),
                             ),
                         }
                     };
@@ -764,7 +801,7 @@ impl App {
             }
             Group::Day => {
                 let today = chrono::Local::now().date_naive();
-                let ts = self.sessions[i].last_user_or_activity();
+                let ts = self.ts(i);
                 let date = chrono::DateTime::from_timestamp(ts, 0)
                     .unwrap_or_default()
                     .with_timezone(&chrono::Local)
@@ -917,7 +954,7 @@ impl App {
                 groups.sort_by_key(|(host, v)| {
                     let newest = v
                         .iter()
-                        .map(|&pos| self.sessions[self.order[pos]].last_user_or_activity())
+                        .map(|&pos| self.ts(self.order[pos]))
                         .max()
                         .unwrap_or(0);
                     (
@@ -938,7 +975,7 @@ impl App {
                 groups.sort_by_key(|(_, v)| {
                     std::cmp::Reverse(
                         v.iter()
-                            .map(|&pos| self.sessions[self.order[pos]].last_user_or_activity())
+                            .map(|&pos| self.ts(self.order[pos]))
                             .max()
                             .unwrap_or(0),
                     )
@@ -950,7 +987,7 @@ impl App {
                 let today = chrono::Local::now().date_naive();
                 let mut buckets: HashMap<chrono::NaiveDate, Vec<usize>> = HashMap::new();
                 for (pos, &i) in self.order.iter().enumerate() {
-                    let ts = self.sessions[i].last_user_or_activity();
+                    let ts = self.ts(i);
                     let date = chrono::DateTime::from_timestamp(ts, 0)
                         .unwrap_or_default()
                         .with_timezone(&chrono::Local)
@@ -1238,7 +1275,7 @@ impl App {
     fn push_group(&self, items: &mut Vec<Item>, label: String, members: Vec<usize>, w: usize) {
         let newest = members
             .iter()
-            .map(|&i| self.sessions[i].last_user_or_activity())
+            .map(|&i| self.ts(i))
             .max()
             .unwrap_or(0);
         let folded = self.collapsed.contains(&label);
@@ -2098,10 +2135,12 @@ pub(crate) fn handle_key(
         }
         (KeyCode::Char('r'), _) => {
             app.status = "rescanned".into();
+            app.unfreeze_sort();
             return KeyOutcome::Refresh(false);
         }
         (KeyCode::Char('R'), _) => {
             app.status = "full rescan (cache rebuilt)".into();
+            app.unfreeze_sort();
             return KeyOutcome::Refresh(true);
         }
         (KeyCode::Backspace, _) => {
@@ -2483,6 +2522,7 @@ mod tests {
             collapsed: HashSet::new(),
             header_park: None,
             show_help: false,
+            sort_ts: HashMap::new(),
         }
     }
 
@@ -2572,6 +2612,57 @@ mod tests {
             },
         );
         app
+    }
+
+    fn hit(status: &str) -> RunningHit {
+        RunningHit {
+            pid: 1,
+            cpu: 0.0,
+            tmux: None,
+            direct: true,
+            summary: None,
+            status: Some(status.into()),
+            peer_name: None,
+        }
+    }
+
+    #[test]
+    fn working_sessions_hold_their_row_until_idle() {
+        let mut app = fold_app();
+        app.group = Group::Flat;
+        app.apply_filter_sort();
+        let names = |a: &App| -> Vec<String> {
+            a.order.iter().map(|&i| a.sessions[i].id.clone()).collect()
+        };
+        assert_eq!(names(&app), ["a2", "b1", "c1", "a1"]);
+
+        // c1 starts working and its file grows: it stays put.
+        let c1 = app.sessions.iter().position(|s| s.id == "c1").unwrap();
+        app.running.insert(app.sessions[c1].key(), hit("thinking"));
+        app.apply_filter_sort();
+        app.sessions[c1].last_activity = Some(5000);
+        app.sessions[c1].last_user = Some(5000);
+        app.apply_filter_sort();
+        assert_eq!(names(&app), ["a2", "b1", "c1", "a1"]);
+
+        // Goes idle: it moves to its live position.
+        app.running.insert(app.sessions[c1].key(), hit("idle"));
+        app.apply_filter_sort();
+        assert_eq!(names(&app), ["c1", "a2", "b1", "a1"]);
+    }
+
+    #[test]
+    fn refresh_key_unfreezes_working_sessions() {
+        let mut app = fold_app();
+        app.group = Group::Flat;
+        app.apply_filter_sort();
+        let c1 = app.sessions.iter().position(|s| s.id == "c1").unwrap();
+        app.running.insert(app.sessions[c1].key(), hit("thinking"));
+        app.apply_filter_sort();
+        app.sessions[c1].last_user = Some(5000);
+        app.unfreeze_sort();
+        app.apply_filter_sort();
+        assert_eq!(app.sessions[app.order[0]].id, "c1");
     }
 
     #[test]
