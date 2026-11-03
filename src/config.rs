@@ -266,9 +266,12 @@ tab = "gfe box"
     #[test]
     fn local_only_removes_hosts_but_preserves_preferences() {
         let cfg = Config::with_hosts_for_test(vec![HostConfig {
-            name: "fixture".into(), ssh_target: "never-connect".into(),
-            sessions_dir: None, tab: None,
-        }]).local_only();
+            name: "fixture".into(),
+            ssh_target: "never-connect".into(),
+            sessions_dir: None,
+            tab: None,
+        }])
+        .local_only();
         assert!(cfg.hosts().is_empty());
         assert_eq!(cfg.terminal(), "Ghostty");
         assert_eq!(cfg.resume_command(), "pi --session {file}");

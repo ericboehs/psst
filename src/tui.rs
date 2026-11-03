@@ -719,12 +719,7 @@ impl App {
                                 h.tmux.as_ref().and_then(|t| t.window).unwrap_or(0),
                                 std::cmp::Reverse(self.ts(i)),
                             ),
-                            None => (
-                                1u8,
-                                String::new(),
-                                0,
-                                std::cmp::Reverse(self.ts(i)),
-                            ),
+                            None => (1u8, String::new(), 0, std::cmp::Reverse(self.ts(i))),
                         }
                     };
                     key(a).cmp(&key(b))
