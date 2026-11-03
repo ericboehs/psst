@@ -179,6 +179,9 @@ pub struct TabFocus {
     pub tags: Vec<String>,
 }
 
+/// The detail pane's message cache: (host-qualified key, mtime, turns).
+type RecentCache = (SessionKey, i64, Vec<(String, String)>);
+
 pub struct App {
     pub sessions: Vec<SessionMeta>,
     pub running: HashMap<SessionKey, RunningHit>,
@@ -219,7 +222,7 @@ pub struct App {
     pub show_help: bool,
     /// Detail pane messages: (host-qualified key, mtime, turns). Recomputed
     /// when the selection moves or the file grows.
-    recent_cache: Option<(SessionKey, i64, Vec<(String, String)>)>,
+    recent_cache: Option<RecentCache>,
     /// Screen row (offset from `list_top`) to item index, as of the last
     /// frame drawn. Clicks are resolved against this.
     row_map: Vec<Option<usize>>,

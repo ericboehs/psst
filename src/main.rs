@@ -823,7 +823,7 @@ mod tests {
 
     #[test]
     fn json_idle_session_row() {
-        let sessions = vec![meta("a", "/proj/a", 1000)];
+        let sessions = [meta("a", "/proj/a", 1000)];
         let refs: Vec<&SessionMeta> = sessions.iter().collect();
         let v = sessions_json(&refs, &std::collections::HashMap::new());
         let row = &v.as_array().unwrap()[0];
@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn json_running_session_prefers_peer_and_tmux() {
-        let sessions = vec![meta("a", "/proj/a", 1000)];
+        let sessions = [meta("a", "/proj/a", 1000)];
         let refs: Vec<&SessionMeta> = sessions.iter().collect();
         let hits = std::collections::HashMap::from([(sessions[0].key(), hit("pi-x-1"))]);
         let v = sessions_json(&refs, &hits);
@@ -870,7 +870,7 @@ mod tests {
 
     #[test]
     fn list_text_has_header_and_rows() {
-        let sessions = vec![meta("a", "/proj/a", 1000)];
+        let sessions = [meta("a", "/proj/a", 1000)];
         let refs: Vec<&SessionMeta> = sessions.iter().collect();
         let out = list_text(&refs, &std::collections::HashMap::new());
         let mut lines = out.lines();
@@ -887,7 +887,7 @@ mod tests {
     fn list_text_shows_remote_host() {
         let mut m = meta("a", "/home/agent", 1000);
         m.host = "coop".to_string();
-        let sessions = vec![m];
+        let sessions = [m];
         let refs: Vec<&SessionMeta> = sessions.iter().collect();
         let out = list_text(&refs, &std::collections::HashMap::new());
         assert!(out.lines().nth(1).unwrap().contains("coop"));

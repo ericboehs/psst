@@ -130,9 +130,10 @@ pub fn live_mark(hit: Option<&RunningHit>) -> LiveMark {
             let st = h.status.as_deref().unwrap_or("");
             if is_prompt_status(st) {
                 LiveMark::Prompt
-            } else if st == "thinking" || st.starts_with("tool") {
-                LiveMark::Working
-            } else if st != "idle" && h.cpu >= CPU_WORKING_PCT {
+            } else if st == "thinking"
+                || st.starts_with("tool")
+                || (st != "idle" && h.cpu >= CPU_WORKING_PCT)
+            {
                 LiveMark::Working
             } else if h.tmux.as_ref().is_some_and(|t| t.attention) {
                 LiveMark::Unread
@@ -180,7 +181,7 @@ pub fn looks_like_pi(cmd: &str) -> bool {
 pub(crate) fn parse_ps_table(ps_out: &str, now: i64) -> HashMap<u32, (u32, String, Option<i64>)> {
     let mut table: HashMap<u32, (u32, String, Option<i64>)> = HashMap::new();
     for line in ps_out.lines() {
-        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 4 {
             continue;
         }
@@ -231,7 +232,7 @@ pub(crate) fn parse_tmux_panes(
 pub(crate) fn parse_ps_cpu(out: &str) -> HashMap<u32, f64> {
     let mut map = HashMap::new();
     for line in out.lines() {
-        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 2 {
             continue;
         }
@@ -1110,7 +1111,7 @@ fn match_one_host(
                     if delta > active_secs {
                         continue;
                     }
-                    if best.map_or(true, |(_, d)| delta < d) {
+                    if best.is_none_or(|(_, d)| delta < d) {
                         best = Some((s, delta));
                     }
                 }
@@ -1234,7 +1235,7 @@ pub fn map_running(
             hits.values().filter_map(|h| h.peer_name.clone()).collect();
         let mut unnamed: Vec<SessionKey> = hits
             .iter()
-            .filter(|(_, h)| h.peer_name.as_ref().map_or(true, |n| n.is_empty()))
+            .filter(|(_, h)| h.peer_name.as_ref().is_none_or(|n| n.is_empty()))
             .map(|(k, _)| k.clone())
             .collect();
         unnamed.sort_by_key(|k| {

@@ -227,9 +227,10 @@ impl Config {
     /// Test helper: build a config with the given remote hosts.
     #[cfg(test)]
     pub fn with_hosts_for_test(hosts: Vec<HostConfig>) -> Config {
-        let mut cfg = Config::default();
-        cfg.hosts = hosts;
-        cfg
+        Config {
+            hosts,
+            ..Config::default()
+        }
     }
 }
 

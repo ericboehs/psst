@@ -436,6 +436,10 @@ pub(crate) fn parse_full(raw: &str, path: &Path, mtime: i64, size: u64, host: &s
 /// persisted child counts keep branch points exact too. Returns `None` when
 /// the file doesn't look like a pure append (fewer lines than skipped, or a
 /// second `session` header in the tail) — the caller must reparse fully.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "base meta plus the file identity (path, mtime, size, host), as the full parse gets"
+)]
 pub(crate) fn parse_tail(
     base: &SessionMeta,
     base_counts: &HashMap<String, u32>,
