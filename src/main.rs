@@ -22,6 +22,36 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// `print!` that exits quietly when stdout's reader goes away
+/// (`psst --list | head`). Rust ignores SIGPIPE, so `print!` would panic
+/// with "failed printing to stdout: Broken pipe" instead.
+macro_rules! out {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        if let Err(e) = write!(std::io::stdout().lock(), $($arg)*) {
+            exit_on_closed_stdout(e);
+        }
+    }};
+}
+
+/// `println!` counterpart of [`out!`].
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        if let Err(e) = writeln!(std::io::stdout().lock(), $($arg)*) {
+            exit_on_closed_stdout(e);
+        }
+    }};
+}
+
+fn exit_on_closed_stdout(e: std::io::Error) -> ! {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        std::process::exit(0);
+    }
+    eprintln!("psst: writing to stdout: {e}");
+    std::process::exit(1);
+}
+
 #[derive(Debug)]
 struct Args {
     list: bool,
@@ -66,7 +96,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "--debug-running" => parsed.debug_running = true,
             "--debug-focus" => parsed.debug_focus = true,
             "-h" | "--help" => {
-                println!(
+                outln!(
                     "psst — pi session switcher for tmux\n\n\
                      usage: psst [.] [--list] [--json] [--refresh] [--debug-running] [--debug-focus]\n\n\
                      .                 only this project (git root, else cwd)\n\
@@ -109,7 +139,7 @@ fn scoped<'a>(sessions: &'a [SessionMeta], scope: Option<&Path>) -> Vec<&'a Sess
 type Hits = HashMap<SessionKey, running::RunningHit>;
 
 fn print_list(sessions: &[&SessionMeta], hits: &Hits) {
-    print!("{}", list_text(sessions, hits));
+    out!("{}", list_text(sessions, hits));
 }
 
 fn list_text(sessions: &[&SessionMeta], hits: &Hits) -> String {
@@ -139,7 +169,7 @@ fn list_text(sessions: &[&SessionMeta], hits: &Hits) -> String {
 }
 
 fn print_json(sessions: &[&SessionMeta], hits: &Hits) {
-    println!(
+    outln!(
         "{}",
         serde_json::to_string_pretty(&sessions_json(sessions, hits))
             .unwrap_or_else(|_| "[]".into())
@@ -217,13 +247,13 @@ fn main() -> Result<()> {
                 Err(e) => eprintln!("psst: {}: {}", h.name, e),
             }
         }
-        println!("pi processes: {}", serde_json::to_string_pretty(&procs)?);
+        outln!("pi processes: {}", serde_json::to_string_pretty(&procs)?);
         // SessionKey serializes as a struct; JSON map keys must be strings.
         let hits_dbg: HashMap<String, &running::RunningHit> = hits
             .iter()
             .map(|(k, v)| (format!("{}:{}", k.host, k.path.to_string_lossy()), v))
             .collect();
-        println!("hits: {}", serde_json::to_string_pretty(&hits_dbg)?);
+        outln!("hits: {}", serde_json::to_string_pretty(&hits_dbg)?);
         return Ok(());
     }
 
@@ -259,8 +289,8 @@ fn main() -> Result<()> {
 /// each input is printed rather than inferred.
 fn print_focus_debug(cfg: &config::Config) {
     let app = cfg.terminal();
-    println!("terminal:   {}", app);
-    println!(
+    outln!("terminal:   {}", app);
+    outln!(
         "tmux-focus: {}",
         psst::focus::tmux_focus_bin()
             .map(|p| p.display().to_string())
@@ -268,23 +298,23 @@ fn print_focus_debug(cfg: &config::Config) {
     );
     let titles = psst::focus::tab_titles(app);
     if titles.is_empty() {
-        println!(
+        outln!(
             "tabs:       none visible (not macOS, {app} not running, or no Accessibility grant)"
         );
     } else {
-        println!("tabs:");
+        outln!("tabs:");
         for t in &titles {
-            println!("  {}", t);
+            outln!("  {}", t);
         }
     }
     if cfg.hosts().is_empty() {
-        println!("hosts:      none configured");
+        outln!("hosts:      none configured");
     }
     for h in cfg.hosts() {
         let tags = psst::focus::host_tags(&h.name, &h.ssh_target, h.tab.as_deref());
         match psst::focus::match_tab(&titles, &tags) {
-            Some(tag) => println!("{}: focuses tab matching {:?}", h.name, tag),
-            None => println!(
+            Some(tag) => outln!("{}: focuses tab matching {:?}", h.name, tag),
+            None => outln!(
                 "{}: no matching tab — opens a new ssh window (tried: {})",
                 h.name,
                 tags.join(", ")
@@ -390,7 +420,7 @@ fn perform_handoff(action: tui::OpenAction, terminal: &str) -> Result<()> {
     let st = Command::new(focus).args([&target, terminal]).status()?;
     if !st.success() { bail!("tmux-focus failed; the resume window may already exist"); }
     // tmux-focus's accessibility hop is best-effort; do not claim focus was verified.
-    println!("Terminal handoff requested.");
+    outln!("Terminal handoff requested.");
     Ok(())
 }
 
