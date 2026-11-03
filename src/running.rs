@@ -683,8 +683,15 @@ pub fn detect_remote(ssh_target: &str, host_name: &str) -> anyhow::Result<Vec<Pi
         "echo '===PSST-TMUX==='; tmux list-panes -a -F '#{pane_pid}\t#{pane_id}\t#{session_name}\t#{window_index}\t#{@special_activity}' 2>/dev/null || true; echo '===PSST-PROBE==='; ",
     );
     script.push_str(&remote_probe_script(&pi_pids));
-    script.push_str("; echo '===PSST-CPU==='; ps -axo pid=,pcpu=");
+    script.push_str("; echo '===PSST-CPU==='; ps -axo pid=,pcpu=; ");
+    // Summary files carry sessionFile, which pins pid -> session exactly
+    // (same as local); read them here so matching can use them.
+    script.push_str(&remote_summaries_script(&pi_pids));
     let sections = split_sections(&ssh_run(ssh_target, &script).unwrap_or_default());
+    let (_, remote_summaries) = parse_enrichment(&format!(
+        "===PSST-SUMMARIES===\n{}",
+        sections.get("SUMMARIES").map(String::as_str).unwrap_or("")
+    ));
     let empty = String::new();
     let (panes, panes_by_id) = parse_tmux_panes(sections.get("TMUX").unwrap_or(&empty));
     let probe = parse_remote_probe(sections.get("PROBE").unwrap_or(&empty));
@@ -706,7 +713,9 @@ pub fn detect_remote(ssh_target: &str, host_name: &str) -> anyhow::Result<Vec<Pi
             cmd: cmd.clone(),
             session_arg: session_arg_from_cmd(cmd),
             continue_flag: continue_flag_from_cmd(cmd),
-            session_file: None,
+            session_file: remote_summaries
+                .get(&pid)
+                .and_then(|c| c.session_file.clone()),
             started_at: *started_at,
             tmux,
         });
@@ -734,17 +743,24 @@ pub fn fetch_remote_enrichment(
             pid = pid
         ));
     }
-    script.push_str("echo '===PSST-SUMMARIES==='; ");
+    script.push_str(&remote_summaries_script(pids));
+    let Ok(out) = ssh_run(ssh_target, &script) else {
+        return empty;
+    };
+    parse_enrichment(&out)
+}
+
+/// `===PSST-SUMMARIES===` section: each pid's agent-link summary file on the
+/// remote, one `PID:<pid>` line plus its single-line JSON.
+fn remote_summaries_script(pids: &[u32]) -> String {
+    let mut script = String::from("echo '===PSST-SUMMARIES==='; ");
     for pid in pids {
         script.push_str(&format!(
             "echo PID:{pid}; cat ~/.cache/agent-link/summaries/{pid}.json 2>/dev/null || cat \"$XDG_CACHE_HOME/agent-link/summaries/{pid}.json\" 2>/dev/null; echo; ",
             pid = pid
         ));
     }
-    let Ok(out) = ssh_run(ssh_target, &script) else {
-        return empty;
-    };
-    parse_enrichment(&out)
+    script
 }
 
 /// Parse [`fetch_remote_enrichment`] output: `===PSST-NAMES===` /
@@ -778,7 +794,7 @@ pub(crate) fn parse_enrichment(out: &str) -> (HashMap<u32, String>, HashMap<u32,
                                 name: non_empty(&v, "name"),
                                 summary: non_empty(&v, "summary"),
                                 status: non_empty(&v, "status"),
-                                session_file: None,
+                                session_file: non_empty(&v, "sessionFile").map(PathBuf::from),
                             },
                         );
                     } else if let Some(n) = non_empty(&v, "name") {
@@ -915,15 +931,39 @@ fn summary_cache_lookup(pids: &[u32]) -> HashMap<u32, CacheFields> {
     out
 }
 
-/// Reap cache files whose pid is no longer alive. Files fresher than 120s are
-/// kept: a just-started pi may not appear in our ps snapshot yet.
+/// Reap cache files whose pid is no longer alive. Throttled to once a
+/// minute (the 1s tick calls this); one `ps` lists every live pid, so a pi
+/// that [`detect`] does not recognize (subagent, odd cmdline) keeps its file.
 fn prune_summary_cache(live: &HashSet<u32>) {
-    let dir = match summary_cache_dir() {
-        Some(d) => d,
-        None => return,
+    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    {
+        let mut last = LAST
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    let Some(dir) = summary_cache_dir() else {
+        return;
     };
-    let now = chrono::Utc::now().timestamp();
-    let Ok(rd) = std::fs::read_dir(&dir) else {
+    // Without a pid list we cannot tell dead from alive: skip, never guess.
+    let ps = run_out("ps", &["-axo", "pid="]);
+    let mut alive: HashSet<u32> = ps.lines().filter_map(|l| l.trim().parse().ok()).collect();
+    if alive.is_empty() {
+        return;
+    }
+    alive.extend(live);
+    prune_summary_dir(&dir, &alive, chrono::Utc::now().timestamp());
+}
+
+/// Remove `<pid>.json` files whose pid is not in `alive` and that have not
+/// been updated for 120s (a just-started pi may race the ps snapshot).
+/// `updatedAt` is epoch ms from pi-agent-link; seconds are accepted too.
+fn prune_summary_dir(dir: &Path, alive: &HashSet<u32>, now: i64) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for f in rd.flatten() {
@@ -934,13 +974,14 @@ fn prune_summary_cache(live: &HashSet<u32>) {
         let Ok(fpid) = pid_str.parse::<u32>() else {
             continue;
         };
-        if live.contains(&fpid) {
+        if alive.contains(&fpid) {
             continue;
         }
         let updated: i64 = std::fs::read_to_string(f.path())
             .ok()
             .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
             .and_then(|v| v.get("updatedAt").and_then(|u| u.as_i64()))
+            .map(|u| if u > 100_000_000_000 { u / 1000 } else { u })
             .unwrap_or(0);
         if now - updated > 120 {
             let _ = std::fs::remove_file(f.path());
@@ -1278,6 +1319,18 @@ mod tests {
             serde_json::json!({ "summary": "new", "updatedAt": now }).to_string(),
         )
         .unwrap();
+        // pi-agent-link writes epoch ms; stale ms files must go too, fresh
+        // ms files must stay.
+        std::fs::write(
+            dir.join("333.json"),
+            serde_json::json!({ "updatedAt": (now - 9999) * 1000 }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("444.json"),
+            serde_json::json!({ "updatedAt": now * 1000 }).to_string(),
+        )
+        .unwrap();
 
         let got = summary_cache_lookup(&[live_pid, 999999]);
         assert_eq!(
@@ -1291,13 +1344,21 @@ mod tests {
         );
         assert!(!got.contains_key(&999999));
 
-        // Prune: stale 111.json goes, fresh 222.json stays despite dead pid.
-        let mut live = HashSet::new();
-        live.insert(live_pid);
-        prune_summary_cache(&live);
+        // Prune: stale dead files go (seconds or ms), fresh ones stay despite
+        // a dead pid, and an alive pid keeps its file however old.
+        std::fs::write(
+            dir.join("555.json"),
+            serde_json::json!({ "updatedAt": (now - 9999) * 1000 }).to_string(),
+        )
+        .unwrap();
+        let alive: HashSet<u32> = [live_pid, 555].into_iter().collect();
+        prune_summary_dir(&dir, &alive, now);
         assert!(dir.join(format!("{}.json", live_pid)).exists());
         assert!(!dir.join("111.json").exists());
         assert!(dir.join("222.json").exists());
+        assert!(!dir.join("333.json").exists());
+        assert!(dir.join("444.json").exists());
+        assert!(dir.join("555.json").exists());
 
         if let Some(h) = prev_home {
             std::env::set_var("HOME", h);
@@ -1453,7 +1514,8 @@ mod tests {
     #[test]
     fn enrichment_routes_names_and_summaries() {
         let out = "===PSST-NAMES===\nPID:11\n{\"name\":\"pi-x\"}\nPID:12\n{}\n\
-                       ===PSST-SUMMARIES===\nPID:11\n{\"name\":\"pi-x\",\"status\":\"thinking\",\"summary\":\"s\"}\n";
+                       ===PSST-SUMMARIES===\nPID:11\n{\"name\":\"pi-x\",\"status\":\"thinking\",\"summary\":\"s\"}\n\
+                       PID:12\n{\"sessionFile\":\"/home/agent/s.jsonl\"}\n";
         let (names, summaries) = parse_enrichment(out);
         assert_eq!(names.get(&11).map(|s| s.as_str()), Some("pi-x"));
         assert!(!names.contains_key(&12));
@@ -1465,6 +1527,10 @@ mod tests {
                 status: Some("thinking".to_string()),
                 session_file: None,
             })
+        );
+        assert_eq!(
+            summaries.get(&12).and_then(|c| c.session_file.clone()),
+            Some(PathBuf::from("/home/agent/s.jsonl"))
         );
     }
 
