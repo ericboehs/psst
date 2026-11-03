@@ -3,13 +3,19 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Tests run in parallel threads of one process, and macOS's clock ticks in
+/// microseconds, so pid + time alone can hand two fixtures the same HOME.
+static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "psst-cli-{}-{}",
+            "psst-cli-{}-{}-{}",
             std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
