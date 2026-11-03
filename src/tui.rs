@@ -1085,9 +1085,13 @@ impl App {
         // Default resumes must preserve spaces and shell metacharacters in paths.
         // Custom templates retain their existing, user-configured shell semantics.
         let command = if self.config.resume_command() == "pi --session {file}" {
-            format!("pi --session '{}'", s.path.to_string_lossy().replace('\'', "'\\''"))
+            format!(
+                "pi --session '{}'",
+                s.path.to_string_lossy().replace('\'', "'\\''")
+            )
         } else {
-            self.config.resume_command()
+            self.config
+                .resume_command()
                 .replace("{file}", &s.path.to_string_lossy())
                 .replace("{id}", &s.id)
                 .replace("{cwd}", &s.cwd)
@@ -1158,14 +1162,8 @@ impl App {
         } else {
             Some(format!(" [{}]", s.host))
         };
-        let trailing: usize = tmux_s
-            .as_ref()
-            .map(|t| t.chars().count())
-            .unwrap_or(0)
-            + host_s
-                .as_ref()
-                .map(|h| h.chars().count())
-                .unwrap_or(0);
+        let trailing: usize = tmux_s.as_ref().map(|t| t.chars().count()).unwrap_or(0)
+            + host_s.as_ref().map(|h| h.chars().count()).unwrap_or(0);
         let mut title_w = (w / 2).max(32);
         let mut proj_w = (w / 6).max(10);
         if 4 + title_w + 1 + proj_w + 1 + age_w + trailing > w {
@@ -1271,11 +1269,7 @@ impl App {
 
     /// Header row + member rows for one group.
     fn push_group(&self, items: &mut Vec<Item>, label: String, members: Vec<usize>, w: usize) {
-        let newest = members
-            .iter()
-            .map(|&i| self.ts(i))
-            .max()
-            .unwrap_or(0);
+        let newest = members.iter().map(|&i| self.ts(i)).max().unwrap_or(0);
         let folded = self.collapsed.contains(&label);
         let header = format!(
             "{} {}  {} sessions · last {}",
@@ -1753,8 +1747,7 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
         let suffix = format!("  ({} shown)", app.order.len());
         // A long query on a narrow terminal keeps its tail (what was just
         // typed) plus the cursor visible, instead of scrolling them off.
-        let mut budget =
-            (filterbar.width as usize).saturating_sub(1 + suffix.chars().count());
+        let mut budget = (filterbar.width as usize).saturating_sub(1 + suffix.chars().count());
         if app.search_focus {
             budget = budget.saturating_sub(1); // the ▏ cursor
         }
@@ -1764,10 +1757,7 @@ fn ui(f: &mut Frame, app: &mut App, items: &[Item], list_state: &mut ListState) 
             q = if budget == 0 {
                 String::new()
             } else {
-                format!(
-                    "…{}",
-                    q.chars().skip(n - (budget - 1)).collect::<String>()
-                )
+                format!("…{}", q.chars().skip(n - (budget - 1)).collect::<String>())
             };
         }
         if app.search_focus {
@@ -2591,7 +2581,8 @@ mod tests {
 
     fn live_remote_app() -> App {
         let mut app = fold_app();
-        app.sessions.push(fake_remote("r1", "/home/agent/work", 3000));
+        app.sessions
+            .push(fake_remote("r1", "/home/agent/work", 3000));
         let key = app.sessions.last().unwrap().key();
         app.running.insert(
             key,
@@ -2710,8 +2701,8 @@ mod tests {
         // The phone case: at 48 columns the old single-line bars ran off
         // the edge (sort:activit…, no group/filter/hosts, no tmux badges).
         // Render a real frame and read back the cells.
-        use ratatui::Terminal;
         use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
         let mut app = live_remote_app();
         app.apply_filter_sort();
         let items = app.build_items(48);
@@ -2743,8 +2734,7 @@ mod tests {
         assert_eq!(trunc_line(line.clone(), 20).width(), 11);
         let cut = trunc_line(line, 8);
         assert_eq!(cut.width(), 8);
-        let texts: Vec<&str> =
-            cut.spans.iter().map(|s| s.content.as_ref()).collect();
+        let texts: Vec<&str> = cut.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(texts, vec!["hello ", "w…"]);
         assert_eq!(cut.spans[1].style, Style::default().fg(Color::Red));
     }
@@ -2830,10 +2820,7 @@ mod tests {
     fn flow_packs_chunks_and_tracks_zones() {
         let chunks = vec![
             Chunk::plain([Span::raw(" psst ")]),
-            Chunk::hot(
-                Hotspot::Sort,
-                [Span::raw("sort:"), Span::raw("activity")],
-            ),
+            Chunk::hot(Hotspot::Sort, [Span::raw("sort:"), Span::raw("activity")]),
             Chunk::hot(Hotspot::Quit, [Span::raw("q quit")]),
         ];
         // 6 + 3 + 13 + 3 + 6 = 31 fits: one line, separators glued between.
@@ -2866,10 +2853,7 @@ mod tests {
     fn flow_wraps_between_chunks_not_inside_them() {
         let chunks = vec![
             Chunk::plain([Span::raw(" psst ")]),
-            Chunk::hot(
-                Hotspot::Sort,
-                [Span::raw("sort:"), Span::raw("activity")],
-            ),
+            Chunk::hot(Hotspot::Sort, [Span::raw("sort:"), Span::raw("activity")]),
             Chunk::hot(Hotspot::Quit, [Span::raw("q quit")]),
         ];
         // " psst " + sort:activity = 22 fits in 25, but q quit would need

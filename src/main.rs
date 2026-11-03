@@ -122,8 +122,15 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             }
         }
     }
-    if parsed.open.is_some() && (!parsed.local || parsed.list || parsed.json || parsed.refresh
-        || parsed.debug_running || parsed.debug_focus || parsed.scope.is_some()) {
+    if parsed.open.is_some()
+        && (!parsed.local
+            || parsed.list
+            || parsed.json
+            || parsed.refresh
+            || parsed.debug_running
+            || parsed.debug_focus
+            || parsed.scope.is_some())
+    {
         bail!("use --local --open ID|PATH alone; handoff is local-only");
     }
     Ok(parsed)
@@ -226,10 +233,16 @@ fn main() -> Result<()> {
         let app = tui::App::new(cfg, None);
         let session = exact_local_session(&app.sessions, selector)?;
         // Never resume a second copy of a process that has no known tmux home.
-        if app.running.get(&session.key()).is_some_and(|h| h.tmux.is_none()) {
+        if app
+            .running
+            .get(&session.key())
+            .is_some_and(|h| h.tmux.is_none())
+        {
             bail!("session is running without a known tmux target; open it manually");
         }
-        let action = app.open_session(session).ok_or_else(|| anyhow::anyhow!("no open action"))?;
+        let action = app
+            .open_session(session)
+            .ok_or_else(|| anyhow::anyhow!("no open action"))?;
         return perform_handoff(action, app.config.terminal());
     }
     // Answered before the archive scan: "where would Enter send me" has
@@ -380,8 +393,10 @@ fn load_sessions(
 
 /// Exact matching only: no fuzzy names, prefix UUIDs, arbitrary files, or remotes.
 fn exact_local_session<'a>(sessions: &'a [SessionMeta], selector: &str) -> Result<&'a SessionMeta> {
-    let matches: Vec<_> = sessions.iter().filter(|s| s.is_local()
-        && (s.id == selector || s.path == Path::new(selector))).collect();
+    let matches: Vec<_> = sessions
+        .iter()
+        .filter(|s| s.is_local() && (s.id == selector || s.path == Path::new(selector)))
+        .collect();
     match matches.as_slice() {
         [s] => Ok(s),
         [] => bail!("local session not found; refresh the session list"),
@@ -393,32 +408,60 @@ fn exact_local_session<'a>(sessions: &'a [SessionMeta], selector: &str) -> Resul
 /// and agent-notify's tmux-focus, but do not attempt an interactive tmux attach.
 fn perform_handoff(action: tui::OpenAction, terminal: &str) -> Result<()> {
     use anyhow::Context;
-    let focus = psst::focus::tmux_focus_bin().context("install tmux-focus from agent-notify first")?;
+    let focus =
+        psst::focus::tmux_focus_bin().context("install tmux-focus from agent-notify first")?;
     let out = Command::new("tmux")
         .args(["list-clients", "-F", "#{client_activity}|#{session_id}"])
-        .output().context("reading local tmux clients")?;
-    if !out.status.success() { bail!("open a local tmux client in your terminal first"); }
+        .output()
+        .context("reading local tmux clients")?;
+    if !out.status.success() {
+        bail!("open a local tmux client in your terminal first");
+    }
     let clients = String::from_utf8_lossy(&out.stdout);
-    let session = clients.lines().filter_map(|l| l.split_once('|'))
+    let session = clients
+        .lines()
+        .filter_map(|l| l.split_once('|'))
         .filter_map(|(age, id)| age.parse::<u64>().ok().map(|age| (age, id)))
-        .max_by_key(|(age, _)| *age).map(|(_, id)| id)
+        .max_by_key(|(age, _)| *age)
+        .map(|(_, id)| id)
         .context("open a local tmux client in your terminal first")?;
     let target = match action {
         tui::OpenAction::TmuxAttach { target, .. } => target,
-        tui::OpenAction::TmuxNew { cwd, name, command, .. } => {
-            let out = Command::new("tmux").args([
-                "new-window", "-d", "-P", "-F", "#{pane_id}", "-t", session,
-                "-c", &cwd, "-n", &name, &command,
-            ]).output().context("creating resume window")?;
-            if !out.status.success() { bail!("tmux could not create a resume window"); }
+        tui::OpenAction::TmuxNew {
+            cwd, name, command, ..
+        } => {
+            let out = Command::new("tmux")
+                .args([
+                    "new-window",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-t",
+                    session,
+                    "-c",
+                    &cwd,
+                    "-n",
+                    &name,
+                    &command,
+                ])
+                .output()
+                .context("creating resume window")?;
+            if !out.status.success() {
+                bail!("tmux could not create a resume window");
+            }
             let pane = String::from_utf8(out.stdout)?.trim().to_string();
-            if !pane.starts_with('%') { bail!("tmux did not return a pane target"); }
+            if !pane.starts_with('%') {
+                bail!("tmux did not return a pane target");
+            }
             pane
         }
         _ => bail!("noninteractive handoff is local-only"),
     };
     let st = Command::new(focus).args([&target, terminal]).status()?;
-    if !st.success() { bail!("tmux-focus failed; the resume window may already exist"); }
+    if !st.success() {
+        bail!("tmux-focus failed; the resume window may already exist");
+    }
     // tmux-focus's accessibility hop is best-effort; do not claim focus was verified.
     outln!("Terminal handoff requested.");
     Ok(())
@@ -804,9 +847,12 @@ mod tests {
         assert!(args.local && args.json);
         let args = parse_args_from(["--local", "--open", "abc"].map(String::from)).unwrap();
         assert_eq!(args.open.as_deref(), Some("abc"));
-        for argv in [vec!["--open"], vec!["--open", "a"],
+        for argv in [
+            vec!["--open"],
+            vec!["--open", "a"],
             vec!["--local", "--open", "a", "--json"],
-            vec!["--local", "--open", "--refresh"]] {
+            vec!["--local", "--open", "--refresh"],
+        ] {
             assert!(parse_args_from(argv.into_iter().map(String::from)).is_err());
         }
         let mut sessions = vec![meta("abc", "/fixture", 1), meta("remote", "/fixture", 1)];
@@ -818,7 +864,12 @@ mod tests {
         sessions.push(meta("abc", "/other", 2));
         sessions[2].path = "/tmp/other.jsonl".into();
         assert!(exact_local_session(&sessions, "abc").is_err());
-        assert_eq!(exact_local_session(&sessions, "/tmp/other.jsonl").unwrap().cwd, "/other");
+        assert_eq!(
+            exact_local_session(&sessions, "/tmp/other.jsonl")
+                .unwrap()
+                .cwd,
+            "/other"
+        );
     }
 
     #[test]
